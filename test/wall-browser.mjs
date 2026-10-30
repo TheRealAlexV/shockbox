@@ -15,6 +15,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { launchChrome, CHROME } from './lib/chrome.mjs';
+import { probeGl, glLine } from './lib/gl-probe.mjs';
 
 // Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
 const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
@@ -130,7 +131,10 @@ async function main() {
   const { devtools, stop: stopChrome } = await launchChrome({
     size: [1280, 720],
     profilePrefix: 'sb-chrome-',
-    extraArgs: ['--disable-gpu'],
+    // The engine needs a real WebGL2 context. `--disable-gpu` tells Chrome not to bother with one,
+    // which leaves a headless runner that has no device with nothing to fall back to; ask for
+    // SwiftShader explicitly instead, the same way handfx-visual does.
+    extraArgs: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
   });
   const c = await cdp(devtools);
   const consoleLines = [];
@@ -163,6 +167,7 @@ async function main() {
     ok('page mounts the engine', Boolean(mounted), mounted ? `view=${mounted}` : 'LEDWALL_INSTANCE never appeared');
     if (!mounted) {
       console.log(`     console:\n       ${consoleLines.slice(-20).join('\n       ') || '(none)'}`);
+      console.log(`     ${glLine(await probeGl(c))}`);
       throw new Error('engine did not mount');
     }
 
