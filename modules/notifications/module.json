@@ -1,0 +1,24 @@
+{
+  "id": "notifications",
+  "title": "Notifications",
+  "version": "1.0.0",
+  "order": 20,
+  "icon": "bell",
+  "description": "Toasts on the phone strip: stack from the top, slide in, auto-close. Messages come from the shared pool.",
+  "channels": ["notifications"],
+  "mount": "routes.js",
+  "ui": {
+    "pane": "ui/pane.js",
+    "style": "ui/pane.css"
+  },
+  "settings": {
+    "style": { "type": "enum", "default": "ios", "values": ["ios", "android", "win11", "macos"], "label": "Look" },
+    "height": { "type": "number", "default": 76, "min": 48, "max": 160, "integer": true, "label": "Height (px)" },
+    "autoCloseMs": { "type": "number", "default": 12000, "min": 0, "max": 120000, "integer": true, "label": "Auto-close (ms, 0 = never)" },
+    "sound": { "type": "boolean", "default": true, "label": "Sound" },
+    "volume": { "type": "number", "default": 0.6, "min": 0, "max": 1, "label": "Volume" }
+  },
+  "pages": [
+    { "route": "/notify", "title": "Notification overlay", "file": "overlay/index.html" }
+  ]
+}

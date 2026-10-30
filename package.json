@@ -1,0 +1,17 @@
+{
+  "name": "shockbox",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ShockBox \u2014 one served app, plugin modules for OBS stream features (LED wall, notifications, alerts, hand FX).",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs --port 8973 --state ./state-dev",
+    "test": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/api-smoke.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs && node test/wall-browser.mjs",
+    "test:wall": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs"
+  }
+}

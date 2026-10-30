@@ -1,0 +1,36 @@
+# ---- ShockBox: never commit live state, models, captures or secrets ----
+
+# operator state (wall pool, notifications messages, settings, logs)
+state/
+state-dev/
+*.log
+*.log.1
+logs/
+
+# one-time adopted legacy data
+**/.backups/
+
+# local config (contains the obs-websocket password on the rig)
+config.json
+config.local.json
+
+# hand FX models and captures (large, and some are licensed per-machine)
+modules/handfx/models/*
+!modules/handfx/models/.gitkeep
+captures/
+*.mp4
+*.webm
+
+# builds
+node_modules/
+public/assets/
+public/index.html
+.vite/
+dist/
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

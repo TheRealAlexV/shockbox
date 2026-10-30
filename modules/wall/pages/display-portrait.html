@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LED wall — dedicated 9:16 source</title>
+<!--
+  Kept, currently unused: the 9:16 view is a fence inside the 16:9 surface, so OBS only loads
+  display.html. This page stays for a future dedicated portrait source. Served under /wall/ so
+  the classic scripts resolve relative to the same engine directory.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; object-fit: contain; }
+  #diag, #bench {
+    position: fixed; font: 12px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    color: #9ef; text-shadow: 0 0 3px #000, 0 1px 2px #000;
+    background: rgba(0, 0, 0, 0.55); padding: 6px 9px; border-radius: 5px;
+    pointer-events: none; white-space: pre; display: none; z-index: 10;
+  }
+  #diag { left: 10px; top: 10px; }
+  #bench { left: 10px; bottom: 10px; color: #cfc; }
+</style>
+</head>
+<body>
+<canvas id="wall"></canvas>
+<div id="diag"></div>
+<div id="bench"></div>
+<script>window.LEDWALL_PAGE = { ratio: '9:16', view: 'portrait', title: 'LED Wall Portrait' };</script>
+<script src="../../config.js"></script>
+<script src="../../presets/presets.js"></script>
+<script src="../../sim.js"></script>
+<script src="../../grade.js"></script>
+<script src="../../engine.js"></script>
+<script src="../../boot.js"></script>
+</body>
+</html>

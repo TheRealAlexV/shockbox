@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<base href="/mod/wall/engine/">
+<title>LED wall — 16:9</title>
+<!--
+  The one wall source OBS loads. A 1280x720 render surface; 9:16 is a fence inside it, not a
+  second source (see ENGINE-API.md §View). In ShockBox server mode the live settings come from
+  /api/wall/render and follow the control pane's snapshot frames; the query string below is
+  only the fallback look used before the first pull lands.
+-->
+<style>
+  html, body { margin: 0; padding: 0; width: 1280px; height: 720px; overflow: hidden; background: #000; }
+  #wall { display: block; width: 1280px; height: 720px; }
+  #diag { position: absolute; left: 8px; top: 8px; color: #0f0; font: 11px monospace; white-space: pre; display: none; }
+</style>
+</head>
+<body>
+<canvas id="wall" width="1280" height="720"></canvas>
+<div id="diag"></div>
+<script>window.LEDWALL_PAGE = { ratio: '16:9', view: 'landscape' };</script>
+<script src="config.js"></script>
+<script src="sim.js"></script>
+<script src="grade.js"></script>
+<script src="presets/presets.js"></script>
+<script src="engine.js"></script>
+<script src="boot.js"></script>
+</body>
+</html>

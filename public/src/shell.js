@@ -1,0 +1,645 @@
+// ShockBox admin shell — entry point (public/src/shell.js).
+//
+// ---------------------------------------------------------------------------
+// PANE CONTRACT (stable; wall and handfx panes are written against this later)
+// ---------------------------------------------------------------------------
+// A module can point at a pane with `ui.pane` in its module.json (path relative to the
+// module dir). The shell loads it as `/mod/<module-id>/<ui.pane>` and calls:
+//
+//   export async function render(container, ctx) -> (cleanup? | void)
+//
+//   container  an empty <div class="pane-slot"> that the pane owns. It may re-render inside
+//              it at will. The shell replaces the container's content when the module changes.
+//   ctx        {
+//     module     the record from GET /api/modules ({id,title,settings,ui,pages,...});
+//                `settings` there is the schema map ({key:{type,label,min,max,step,values,help,value}})
+//                captured at pane selection — re-read it from GET /api/modules when you need fresh.
+//     api        fetch wrapper from api.js: api.get/post/patch/put/del(path, body?) — every
+//                call throws ApiError with .status and .message on failure, so a failed action
+//                can never be rendered as a success.
+//     settings   the module's settings map (same shape as module.settings) as last fetched;
+//                call ctx.refresh() after a PATCH to pick up the new values.
+//     events     subscribe(channelOrNull, fn) -> unsubscribe. fn gets {event, data} for
+//                `event:`-style frames and {seq,channel,cmd,args,view} for command frames.
+//                channel null = every channel on the one shared EventSource.
+//     refresh    async () -> re-fetches /api/modules and /api/modules/:id/state; resolves to
+//                {module, state} and also refreshes ctx.settings in place.
+//     ui         shared helpers from ui.js: el, text, fmtWhen, settingsForm, toast, drawIcon…
+//   }
+//
+// Returning a function from render() registers a cleanup callback for when the pane is left.
+// Optional: `export const style` is unused (module styles are loaded from ui.style by the shell).
+// ---------------------------------------------------------------------------
+
+import { createApi } from './api.js';
+import { el, clear, frag } from './ui.js';
+import { startDrawer } from './drawer.js';
+import { installToasts, toast } from './toast.js';
+import { renderSettingsForm } from './settings-form.js';
+
+const api = createApi('/');
+const root = document.getElementById('app');
+const railList = document.getElementById('rail-list');
+const paneEl = document.getElementById('pane');
+const titleEl = document.getElementById('topbar-title');
+const subEl = document.getElementById('topbar-sub');
+const statusEl = document.getElementById('topbar-status');
+
+/** one shared EventSource for every channel; subscribers multiplex on it */
+const bus = createBus();
+
+const state = {
+  modules: [],
+  health: null,
+  coreSettings: null,
+  route: null, // {kind:'module'|'messages'|'core', id}
+  current: null, // {signature, cleanup, controller}
+  loadedStyles: new Map(),
+  poolTypes: [],
+  poolTags: [],
+  poolCounts: null,
+};
+
+/* ---------------------------------------------------------------- event bus */
+
+function createBus() {
+  const subs = new Set();
+  let es = null;
+  let retry = 0;
+  let statusCb = null;
+
+  function dispatch(payload) {
+    for (const fn of [...subs]) {
+      try {
+        fn(payload);
+      } catch (err) {
+        console.error('event subscriber threw', err);
+      }
+    }
+  }
+
+  function connect() {
+    if (es) es.close();
+    es = new EventSource('/events');
+    es.onopen = () => {
+      retry = 0;
+      statusCb?.('open');
+    };
+    es.onerror = () => {
+      statusCb?.('down');
+      // EventSource retries by itself; we only track the state for the status strip.
+    };
+    es.onmessage = () => {};
+    // One listener per channel: the server names the channel in `event:`, so a named listener
+    // is the only way to receive them. `hello` carries boot info; any other frame is normalised.
+    const onNamed = (name) => (ev) => {
+      let data;
+      try {
+        data = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (data && data.reset === true) {
+        dispatch({ reset: true, channel: name, data });
+        return;
+      }
+      if (data && data.channel) dispatch(data);
+      else dispatch({ event: name, channel: name, data });
+    };
+    es.addEventListener('hello', (ev) => {
+      try {
+        dispatch({ hello: true, data: JSON.parse(ev.data) });
+      } catch {
+        /* ignore */
+      }
+    });
+    // Catch-all: cannot see arbitrary named events, so the shell subscribes to the channels it
+    // knows about (core + every module channel from /api/modules) plus a few fixed ones.
+    const names = new Set(['pool', 'core', 'notifications', 'dialogs', 'sound', 'settings', 'layout']);
+    for (const m of state.modules) for (const c of m.channels || []) names.add(c);
+    for (const name of names) es.addEventListener(name, onNamed(name));
+    retry++;
+  }
+
+  return {
+    connect,
+    subscribe(fn) {
+      subs.add(fn);
+      return () => subs.delete(fn);
+    },
+    onStatus(fn) {
+      statusCb = fn;
+    },
+    get connected() {
+      return es ? es.readyState === 1 : false;
+    },
+  };
+}
+
+/* --------------------------------------------------------------------- rail */
+
+const ICONS = {
+  bell: 'M4 11a4 4 0 0 1 4-4h0a4 4 0 0 1 4 4v3l1.2 1.6H2.8L4 14zM6.6 15.6a1.6 1.6 0 0 0 2.8 0',
+  window: 'M2.6 2.6h10.8v10.8H2.6zM2.6 5.4h10.8',
+  wall: 'M2 3h12v10H2zM2 8h12M6 3v10M10 3v10',
+  hand: 'M5 8V4.6a.9.9 0 0 1 1.8 0V8V3.6a.9.9 0 0 1 1.8 0V8V4.2a.9.9 0 0 1 1.8 0V8v-.8a.9.9 0 0 1 1.8 0v4.2a3.4 3.4 0 0 1-3.4 3.4h-.9A3.9 3.9 0 0 1 5 11z',
+  list: 'M3 4h10M3 8h10M3 12h10',
+  sliders: 'M3 4h10M3 12h10M6 4v3M10 12V9',
+  dot: 'M8 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z',
+};
+
+function iconSvg(name) {
+  const d = ICONS[name] || ICONS.dot;
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('width', '16');
+  svg.setAttribute('height', '16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', d);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.3');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(path);
+  return svg;
+}
+
+function statusTone(status) {
+  if (status === 'up') return 'ok';
+  if (status === 'failed') return 'bad';
+  return 'warn';
+}
+
+function renderRail() {
+  clear(railList);
+  const items = frag();
+  for (const m of state.modules) {
+    const btn = el('a', { class: 'rail-item', href: `#/${m.id}` });
+    btn.dataset.id = m.id;
+    btn.dataset.status = statusTone(m.status);
+    const ic = el('span', { class: 'rail-icon' });
+    ic.appendChild(iconSvg(m.icon || 'dot'));
+    const label = el('span', { class: 'rail-text' });
+    label.appendChild(el('span', { class: 'rail-title', text: m.title || m.id }));
+    label.appendChild(el('span', { class: 'rail-id mono', text: m.id }));
+    const dot = el('span', { class: 'dot', 'data-tone': statusTone(m.status) });
+    btn.append(ic, label, dot);
+    btn.title = m.status === 'up' ? `${m.title} — up${m.version ? ` v${m.version}` : ''}` : `${m.title} — ${m.status}${m.error ? `: ${m.error}` : ''}`;
+    if (m.status === 'failed') btn.setAttribute('aria-description', m.error || 'failed');
+    items.appendChild(btn);
+  }
+  // Messages is a core pane, not a module: it sits below the module rows, set apart.
+  const divider = el('div', { class: 'rail-sep', role: 'separator' });
+  const msg = el('a', { class: 'rail-item rail-item-core', href: '#/messages' });
+  msg.dataset.id = 'messages';
+  const ic = el('span', { class: 'rail-icon' });
+  ic.appendChild(iconSvg('list'));
+  const label = el('span', { class: 'rail-text' });
+  label.appendChild(el('span', { class: 'rail-title', text: 'Messages' }));
+  label.appendChild(el('span', { class: 'rail-id mono', text: 'pool' }));
+  const count = el('span', { class: 'rail-count mono', id: 'rail-pool-count', text: state.poolCounts ? String(state.poolCounts.all ?? 0) : '–' });
+  msg.append(ic, label, count);
+  msg.title = 'Shared message pool (used by notifications and alerts)';
+  items.append(divider, msg);
+  railList.appendChild(items);
+  markActiveRail();
+}
+
+function markActiveRail() {
+  const id = state.route ? state.route.id : null;
+  for (const a of railList.querySelectorAll('.rail-item')) {
+    a.classList.toggle('is-active', a.dataset.id === id);
+    if (a.dataset.id === id) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  }
+}
+
+/* ------------------------------------------------------------------- router */
+
+function parseHash() {
+  const raw = location.hash.replace(/^#\/?/, '');
+  const [pathPart, query = ''] = raw.split('?');
+  const id = decodeURIComponent(pathPart || '').trim();
+  const params = new URLSearchParams(query);
+  if (!id) return { kind: 'module', id: null, params };
+  if (id === 'messages') return { kind: 'messages', id: 'messages', params };
+  return { kind: 'module', id, params };
+}
+
+async function navigate() {
+  const route = parseHash();
+  state.route = route;
+  markActiveRail();
+
+  if (!route.id) {
+    // Pick the first up module, else Messages.
+    const first = state.modules.find((m) => m.status === 'up') || state.modules[0];
+    const target = first ? first.id : 'messages';
+    if (location.hash !== `#/${target}`) {
+      location.replace(`#/${target}`);
+      return;
+    }
+  }
+
+  const signature = route.kind === 'messages' ? 'messages' : `module:${route.id}`;
+  if (state.current && state.current.signature === signature) return;
+
+  // tear down the previous pane
+  if (state.current) {
+    try {
+      state.current.cleanup?.();
+    } catch (err) {
+      console.error('pane cleanup failed', err);
+    }
+    state.current.controller?.abort();
+    state.current = null;
+  }
+
+  const controller = new AbortController();
+  const slot = el('div', { class: 'pane-slot', id: 'pane-slot' });
+  clear(paneEl);
+  paneEl.appendChild(slot);
+  state.current = { signature, controller, cleanup: null };
+
+  try {
+    if (route.kind === 'messages') {
+      titleEl.textContent = 'Messages';
+      subEl.textContent = 'shared pool';
+      statusEl.replaceChildren();
+      const mod = await import('./panes/messages.js');
+      const cleanup = await mod.render(slot, makeCtx({ id: 'messages', title: 'Messages', settings: {} }, null, controller.signal));
+      if (state.current?.signature === signature) state.current.cleanup = cleanup || null;
+      return;
+    }
+
+    const m = state.modules.find((x) => x.id === route.id);
+    if (!m) {
+      titleEl.textContent = route.id || 'unknown';
+      subEl.textContent = '';
+      slot.appendChild(notFoundPane(route.id));
+      return;
+    }
+    titleEl.textContent = m.title || m.id;
+    subEl.replaceChildren(
+      el('span', { class: 'mono', text: m.id }),
+      m.version ? el('span', { class: 'mono dim', text: `v${m.version}` }) : el('span', { class: 'dim', text: '' }),
+      el('span', { class: 'dot', 'data-tone': statusTone(m.status) }),
+    );
+    renderPanes(m, slot, controller.signal, signature);
+  } catch (err) {
+    titleEl.textContent = 'error';
+    clear(paneEl);
+    paneEl.appendChild(errorPane(err));
+  }
+}
+
+async function renderPanes(m, slot, signal, signature) {
+  if (m.status !== 'up') {
+    slot.appendChild(failedModulePane(m));
+    return;
+  }
+  // Prefer the pane this UI ships for known modules; otherwise the module's own ui.pane;
+  // otherwise the generic settings fallback. A broken pane never breaks the shell.
+  const known = { notifications: './panes/notifications.js', dialogs: './panes/alerts.js' }[m.id];
+  let mod = null;
+  let source = null;
+  if (known) {
+    try {
+      mod = await import(known);
+      source = known;
+    } catch (err) {
+      console.error(`pane ${known} failed`, err);
+    }
+  }
+  if (!mod && m.ui && m.ui.pane) {
+    const panePath = `/mod/${m.id}/${m.ui.pane.replace(/^\/+/, '')}`;
+    if (await paneExists(panePath)) {
+      try {
+        mod = await import(/* @vite-ignore */ panePath);
+        source = m.ui.pane;
+        await loadStyleFor(m);
+      } catch (err) {
+        console.error(`module pane ${m.ui.pane} failed to load`, err);
+        mod = null;
+      }
+    }
+  }
+  if (!mod) {
+    const fallback = await import('./panes/generic.js');
+    mod = fallback;
+    source = 'fallback';
+  }
+  if (signal.aborted) return;
+  try {
+    const cleanup = await mod.render(slot, makeCtx(m, source, signal));
+    if (state.current?.signature === signature && typeof cleanup === 'function') state.current.cleanup = cleanup;
+  } catch (err) {
+    console.error('pane render failed', err);
+    clear(slot);
+    slot.appendChild(errorPane(err, `pane for ${m.id} (${source})`));
+  }
+}
+
+/** A module's ui.pane is only imported when the file is actually served: modules declare the
+ *  path before the file exists (wall, handfx), and an import of a 404 surfaces as a console
+ *  error that looks like a broken shell. */
+async function paneExists(path) {
+  for (const method of ['HEAD', 'GET']) {
+    try {
+      const res = await fetch(path, { method, headers: { accept: 'text/javascript' } });
+      if (res.ok) return true;
+      if (res.status !== 405) return false;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+async function loadStyleFor(m) {
+  if (!m.ui || !m.ui.style) return;
+  const href = `/mod/${m.id}/${m.ui.style.replace(/^\/+/, '')}`;
+  if (state.loadedStyles.has(href)) return;
+  state.loadedStyles.set(href, 'loading');
+  await new Promise((resolve) => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    link.onload = () => {
+      state.loadedStyles.set(href, 'ok');
+      resolve();
+    };
+    link.onerror = () => {
+      state.loadedStyles.delete(href);
+      console.warn(`pane style missing: ${href}`);
+      resolve();
+    };
+    document.head.appendChild(link);
+  });
+}
+
+/* ---------------------------------------------------------------- pane ctx */
+
+function makeCtx(m, source, signal) {
+  const events = {
+    subscribe(channel, fn) {
+      return bus.subscribe((p) => {
+        if (channel && p.channel && p.channel !== channel) return;
+        fn(p);
+      });
+    },
+  };
+  const ctx = {
+    module: m,
+    api,
+    settings: { ...(m.settings || {}) },
+    events,
+    signal,
+    refresh: async () => {
+      const mods = await api.get('/api/modules');
+      const fresh = (mods.modules || []).find((x) => x.id === m.id);
+      if (fresh) {
+        m.settings = fresh.settings || {};
+        m.status = fresh.status;
+        ctx.settings = { ...m.settings };
+        Object.assign(m, fresh);
+      }
+      let st = null;
+      try {
+        const r = await api.get(`/api/modules/${encodeURIComponent(m.id)}/state`);
+        st = r.state;
+      } catch {
+        st = null; // a module may legitimately have no state endpoint
+      }
+      return { module: m, state: st };
+    },
+    renderSettings: (container, opts = {}) =>
+      renderSettingsForm(container, {
+        settings: opts.settings || ctx.settings,
+        signal,
+        onSave: async (patch) => {
+          const out = await api.patch(`/api/${m.id}/settings`, patch);
+          if (out && out.settings) {
+            ctx.settings = { ...out.settings };
+            m.settings = out.settings;
+          }
+          return out;
+        },
+      }),
+    paneSource: source,
+  };
+  return ctx;
+}
+
+/* ---------------------------------------------------------------- fragments */
+
+function notFoundPane(id) {
+  const box = el('div', { class: 'pane-slot' });
+  box.append(
+    el('div', { class: 'fallback-note' },
+      el('span', { class: 'dot', 'data-tone': 'warn' }),
+      el('span', {}, el('strong', { text: 'No module at this address. ' }),
+        el('span', { text: `${id || 'The hash is empty'}. The rail comes from GET /api/modules — pick a module there.` })),
+    ),
+  );
+  return box;
+}
+
+function failedModulePane(m) {
+  const box = el('div', { class: 'pane-slot' });
+  box.append(
+    el('div', { class: 'pane-head' },
+      el('div', { class: 'pane-title-wrap' },
+        el('h1', { class: 'pane-title', text: `${m.title || m.id} failed to load` }),
+        el('p', { class: 'pane-desc', text: 'The module threw while the server was loading it. Every other module stays up.' }),
+      ),
+      el('div', { class: 'pane-head-status' }, el('span', { class: 'dot', 'data-tone': 'bad' }), el('span', { text: 'failed' })),
+    ),
+    el('section', { class: 'panel' },
+      el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'error' })),
+      el('pre', { class: 'state-pre', text: m.error || 'no error message reported' }),
+    ),
+    el('div', { class: 'control-bar' },
+      el('button', { class: 'btn', type: 'button', text: 'Reload page', onclick: () => location.reload() }),
+      el('span', { class: 'control-hint', text: 'fix it on disk, restart the server, then reload' }),
+    ),
+  );
+  return box;
+}
+
+function errorPane(err, what) {
+  const box = el('div', { class: 'pane-slot' });
+  box.append(
+    el('div', { class: 'pane-head' },
+      el('div', { class: 'pane-title-wrap' },
+        el('h1', { class: 'pane-title', text: what || 'Something went wrong' }),
+      ),
+      el('div', { class: 'pane-head-status' }, el('span', { class: 'dot', 'data-tone': 'bad' }), el('span', { text: 'error' })),
+    ),
+    el('section', { class: 'panel' },
+      el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'detail' })),
+      el('pre', { class: 'state-pre', text: err?.stack || err?.message || String(err) }),
+    ),
+    el('div', { class: 'control-bar' },
+      el('button', { class: 'btn', type: 'button', text: 'Retry', onclick: () => location.reload() }),
+    ),
+  );
+  return box;
+}
+
+/* -------------------------------------------------------------- top status */
+
+function renderTopStatus() {
+  const h = state.health;
+  statusEl.replaceChildren();
+  if (!h) return;
+  const up = Object.values(h.modules || {}).filter((s) => s === 'up').length;
+  const total = Object.keys(h.modules || {}).length;
+  const failed = total - up;
+  statusEl.append(
+    el('span', { class: 'chip', title: 'Modules up' },
+      el('span', { class: 'dot', 'data-tone': failed ? 'warn' : 'ok' }),
+      el('span', { class: 'mono', text: `${up}/${total}` }),
+      el('span', { class: 'chip-label', text: failed ? `mods · ${failed} failed` : 'modules' }),
+    ),
+    el('span', { class: 'chip', title: 'SSE stream state' },
+      el('span', { class: 'dot', 'data-tone': bus.connected ? 'ok' : 'bad', id: 'sse-dot' }),
+      el('span', { class: 'chip-label', id: 'sse-label', text: bus.connected ? 'live' : 'reconnecting' }),
+    ),
+    el('span', { class: 'chip', title: 'OBS websocket state' },
+      el('span', { class: 'dot', 'data-tone': h.obs?.state === 'open' || h.obs?.state === 'connected' ? 'ok' : h.obs?.state === 'off' ? 'idle' : 'warn' }),
+      el('span', { class: 'chip-label', text: 'obs' }),
+      el('span', { class: 'mono dim', text: h.obs?.state || 'off' }),
+      h.obs?.scene ? el('span', { class: 'mono', text: h.obs.scene }) : '',
+    ),
+    el('span', { class: 'chip', title: 'Uptime' },
+      el('span', { class: 'chip-label', text: 'up' }),
+      el('span', { class: 'mono', text: fmtUptime(h.uptime) }),
+    ),
+  );
+}
+
+function updateSseStatus() {
+  const dot = document.getElementById('sse-dot');
+  const label = document.getElementById('sse-label');
+  if (dot) dot.dataset.tone = bus.connected ? 'ok' : 'bad';
+  if (label) label.textContent = bus.connected ? 'live' : 'reconnecting';
+}
+
+function fmtUptime(sec) {
+  const s = Number(sec) || 0;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h) return `${h}h ${String(m).padStart(2, '0')}m`;
+  return `${m}m ${String(s % 60).padStart(2, '0')}s`;
+}
+
+/* -------------------------------------------------------------------- boot */
+
+async function loadModules() {
+  const r = await api.get('/api/modules');
+  state.modules = r.modules || [];
+}
+
+async function loadPoolMeta() {
+  try {
+    const r = await api.get('/api/pools');
+    state.poolTypes = r.types || [];
+    state.poolTags = r.tags || [];
+    state.poolCounts = r.counts || null;
+    const c = document.getElementById('rail-pool-count');
+    if (c && r.counts) c.textContent = String(r.counts.all ?? 0);
+  } catch {
+    /* the pool pane reports its own errors */
+  }
+}
+
+async function loadHealth() {
+  try {
+    state.health = await api.get('/health');
+    renderTopStatus();
+  } catch (err) {
+    statusEl.replaceChildren(el('span', { class: 'chip' },
+      el('span', { class: 'dot', 'data-tone': 'bad' }), el('span', { class: 'chip-label', text: 'server unreachable' })));
+  }
+}
+
+function wireDrawer() {
+  const drawer = document.getElementById('drawer');
+  const toggle = document.getElementById('drawer-toggle');
+  const close = document.getElementById('drawer-close');
+  const setOpen = (open) => {
+    drawer.dataset.open = open ? 'true' : 'false';
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.classList.toggle('is-on', open);
+    root.dataset.drawer = open ? 'open' : 'closed';
+    if (open) drawer.start?.();
+    else drawer.stop?.();
+  };
+  const onToggle = () => setOpen(drawer.dataset.open !== 'true');
+  toggle.addEventListener('click', onToggle);
+  close.addEventListener('click', () => setOpen(false));
+  window.addEventListener('keydown', (e) => {
+    if (e.key === '`' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      onToggle();
+    }
+    if (e.key === 'Escape' && drawer.dataset.open === 'true') setOpen(false);
+  });
+  const ctl = startDrawer({
+    api,
+    bus,
+    onHealth: (h) => {
+      state.health = h;
+      renderTopStatus();
+      updateSseStatus();
+    },
+  });
+  drawer.start = ctl.start;
+  drawer.stop = ctl.stop;
+  setOpen(false);
+  return ctl;
+}
+
+async function boot() {
+  installToasts(document.getElementById('toasts'));
+  wireDrawer();
+  bus.onStatus((s) => {
+    updateSseStatus();
+    if (s === 'open') {
+      // re-sync the open pane after a reconnect
+      state.current && navigate(true);
+    }
+  });
+
+  try {
+    await loadModules();
+  } catch (err) {
+    clear(paneEl);
+    paneEl.appendChild(errorPane(err, 'Could not load /api/modules'));
+    return;
+  }
+  renderRail();
+  bus.connect();
+  loadPoolMeta();
+  loadHealth();
+  setInterval(loadHealth, 5000);
+
+  // pool changes update the rail count only; the Messages pane listens itself
+  bus.subscribe((p) => {
+    if (p.channel === 'pool') {
+      loadPoolMeta();
+    }
+  });
+
+  window.addEventListener('hashchange', () => navigate());
+  await navigate();
+}
+
+boot().catch((err) => {
+  console.error(err);
+  toast(`shell failed to start: ${err.message}`, 'error');
+});
