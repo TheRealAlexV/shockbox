@@ -13,6 +13,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
+// Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
+const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
+
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
 const CHROME = process.env.CHROME || ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'].find((p) => fs.existsSync(p));
@@ -250,8 +253,8 @@ try {
   }
 
   const r = await c.send('Page.captureScreenshot', { format: 'png' });
-  fs.writeFileSync('/tmp/opencode/pane-drag-result.png', Buffer.from(r.data, 'base64'));
-  console.log('     screenshot /tmp/opencode/pane-drag-result.png');
+  fs.writeFileSync(path.join(SCRATCH, 'pane-drag-result.png'), Buffer.from(r.data, 'base64'));
+  console.log(`     screenshot ${path.join(SCRATCH, 'pane-drag-result.png')}`);
 } catch (err) {
   ok('harness ran without throwing', false, err.message);
 } finally {

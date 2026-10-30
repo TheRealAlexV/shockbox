@@ -10,12 +10,16 @@
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
+const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-const state = fs.mkdtempSync('/tmp/opencode/sb-ratio-');
+const state = fs.mkdtempSync(path.join(SCRATCH, 'sb-ratio-'));
 const port = 8993 + Math.floor(Math.random() * 200);
 
 const results = [];

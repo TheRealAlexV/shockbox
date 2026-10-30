@@ -15,6 +15,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
+// Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
+const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
+
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
 const argUrl = (process.argv.find((a) => a.startsWith('--url=')) || '').slice(6);
@@ -334,8 +337,8 @@ async function main() {
     chrome.kill('SIGKILL');
     srv.stop();
     await new Promise((r) => setTimeout(r, 150));
-    if (srv.log) fs.writeFileSync('/tmp/opencode/wall-browser-server.log', srv.log.join(''));
-    fs.writeFileSync('/tmp/opencode/wall-browser-console.log', consoleLines.join('\n'));
+    if (srv.log) fs.writeFileSync(path.join(SCRATCH, 'wall-browser-server.log'), srv.log.join(''));
+    fs.writeFileSync(path.join(SCRATCH, 'wall-browser-console.log'), consoleLines.join('\n'));
   }
 
   const failed = results.filter((r) => !r.pass);

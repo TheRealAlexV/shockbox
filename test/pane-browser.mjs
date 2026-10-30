@@ -19,6 +19,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
+// Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
+const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
+
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
 const argUrl = (process.argv.find((a) => a.startsWith('--url=')) || '').slice(6);
@@ -197,7 +200,7 @@ try {
   }
   await c.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
   await sleep(300);
-  await shot(c, '/tmp/opencode/pane-wall-1440.png');
+  await shot(c, path.join(SCRATCH, 'pane-wall-1440.png'));
 
   // State from the server, straight (the same document the pane paints from).
   const live = async () => fetch(`${srv.url}/api/wall/live`).then((r) => r.json());
@@ -261,7 +264,7 @@ try {
       const snap = doc.lastSnapshot?.fence?.px;
       ok('persisted snapshot matches the committed window', Boolean(snap) && snap.x === after.x, JSON.stringify(snap));
     }
-    await shot(c, '/tmp/opencode/pane-wall-dragged.png');
+    await shot(c, path.join(SCRATCH, 'pane-wall-dragged.png'));
   }
 
   // Whole wall ⇄ window through the pane's own control (`#wall-fence-on`, the window switch),

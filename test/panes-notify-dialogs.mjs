@@ -19,6 +19,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
+// Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
+const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
+
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
 const argUrl = (process.argv.find((a) => a.startsWith('--url=')) || '').slice(6);
@@ -300,7 +303,7 @@ try {
   }
   await c.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
   await sleep(400);
-  await shot(c, '/tmp/opencode/pane-notifications.png');
+  await shot(c, path.join(SCRATCH, 'pane-notifications.png'));
 
   /* ----------------------------------------- notifications: form ownership */
 
@@ -405,7 +408,7 @@ try {
   }
   await c.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
   await sleep(400);
-  await shot(c, '/tmp/opencode/pane-dialogs.png');
+  await shot(c, path.join(SCRATCH, 'pane-dialogs.png'));
 
   /* ----------------------------------------------- dialogs: form ownership */
 
