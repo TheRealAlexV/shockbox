@@ -272,6 +272,9 @@
 /* with a window on, the fence carries the dim: one veil, not two stacked on top of each other */
 .wall-surface[data-fence='on']::before { opacity: 0; }
 .wall-surface[data-fence='off']::before { opacity: 0.06; }
+/* Fence state not yet known (the pane has not read /api/wall/live): nothing dims. A cold or failed
+   first pull must not paint an unexplained black wall. */
+.wall-surface:not([data-fence])::before { opacity: 0; }
 
 .wall-surface-tag {
   display: block;

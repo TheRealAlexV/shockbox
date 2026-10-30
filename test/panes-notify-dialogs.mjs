@@ -19,6 +19,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { launchChrome, CHROME } from './lib/chrome.mjs';
+import { mountDiagnostics } from './lib/diagnostics.mjs';
 
 // Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
 const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
@@ -190,6 +191,7 @@ try {
 
   await c.send('Page.navigate', { url: `${srv.url}/#/notifications` });
   const mountedN = await c.waitFor('document.readyState === "complete" && Boolean(document.querySelector(".pane"))', 12000);
+  if (!mountedN) console.log(await mountDiagnostics(c, c.events, 'shell mount (notifications)'));
   ok('notifications route mounts in the shell', mountedN);
 
   const paneSrcN = await c.waitFor(`(async () => {
@@ -305,6 +307,7 @@ try {
   await c.send('Page.navigate', { url: `${srv.url}/#/dialogs` });
   await sleep(300);
   const mountedD = await c.waitFor('document.readyState === "complete" && Boolean(document.querySelector(".pane"))', 12000);
+  if (!mountedD) console.log(await mountDiagnostics(c, c.events, 'shell mount (dialogs)'));
   const previewD = await c.waitFor('Boolean(document.querySelector(".dg-stage .dg-desk"))', 10000);
   const oldPaneD = await c.eval('Boolean(document.querySelector(".live-card")) && !document.querySelector(".dg-desk")');
   ok('alerts pane renders (module pane, not the shell fallback)', mountedD && previewD && !oldPaneD, `desk:${previewD} old:${oldPaneD}`);

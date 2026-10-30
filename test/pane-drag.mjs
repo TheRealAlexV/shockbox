@@ -13,6 +13,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { launchChrome, CHROME } from './lib/chrome.mjs';
+import { mountDiagnostics } from './lib/diagnostics.mjs';
 
 // Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
 const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
@@ -149,7 +150,9 @@ try {
   });
 
   await c.send('Page.navigate', { url: `${srv.url}/#/wall` });
-  ok('pane mounts', await c.waitFor('Boolean(document.querySelector(".wall-surface .fence"))', 12000));
+  const paneMounted = await c.waitFor('Boolean(document.querySelector(".wall-surface .fence"))', 12000);
+  if (!paneMounted) console.log(await mountDiagnostics(c, c.events, 'wall pane mount'));
+  ok('pane mounts', paneMounted);
 
   const live = () => fetch(`${srv.url}/api/wall/live`).then((r) => r.json());
   await c.eval(`(function(){ window.__dbg=function(t,d){ (window.__log=window.__log||[]).push(t+' '+JSON.stringify(d)); }; return true; })()`);

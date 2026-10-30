@@ -19,6 +19,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { launchChrome, CHROME } from './lib/chrome.mjs';
+import { mountDiagnostics } from './lib/diagnostics.mjs';
 
 // Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
 const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
@@ -158,11 +159,19 @@ try {
 
   const url = `${srv.url}/#/wall`;
   await c.send('Page.navigate', { url });
-  const mounted = await c.waitFor('Boolean(document.querySelector(".pane, main")) && document.readyState === "complete"', 12000);
+  // `.pane` and `main` are static markup in index.html, and so is `#pane-slot`, so their presence
+  // proves nothing. The route is loaded when the shell's door-bell has left boot/loading and the
+  // rail — which only renderRail() fills from /api/modules — actually has rows.
+  const mounted = await c.waitFor(
+    'document.readyState === "complete" && Boolean(window.__shell && window.__shell.phase && window.__shell.phase !== "boot" && window.__shell.phase !== "loading") && document.querySelectorAll("#rail-list .rail-item").length > 0',
+    12000,
+  );
+  if (!mounted) console.log(await mountDiagnostics(c, c.events, 'shell mount (wall)'));
   ok('shell loads the wall route', mounted, url);
 
   // The custom pane, not the generic fallback (which has no preview surface).
   const paneReady = await c.waitFor('Boolean(document.querySelector("[data-wall-preview], .wall-preview, canvas, .preview"))', 10000);
+  if (!paneReady) console.log(await mountDiagnostics(c, c.events, 'wall preview surface'));
   const paneSrc = await c.eval('JSON.stringify(document.querySelector(".pane [data-pane-source], a[href*=\'wall\']") ? "x" : "x")').catch(() => 'x');
   const isGeneric = await c.eval('Boolean(document.body.innerText.includes("Overlay pages"))');
   ok('wall pane renders (not the generic pane)', paneReady && !isGeneric, `preview:${paneReady} generic:${isGeneric}`);

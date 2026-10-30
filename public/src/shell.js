@@ -48,6 +48,17 @@ const statusEl = document.getElementById('topbar-status');
 /** one shared EventSource for every channel; subscribers multiplex on it */
 const bus = createBus();
 
+/**
+ * The shell's own deadline for a pane's assets. A cold server or a throttled link must produce a
+ * rendered pane with a named problem inside these, never an empty slot that always "looks like
+ * still starting". Kept below every gate's mount timeout so a gate times out on a real failure
+ * only when the check itself is wrong, not because the pane was allowed to wait forever.
+ */
+const STYLE_WAIT_MS = 5000;
+const PANE_IMPORT_MS = 8000;
+const PANE_PROBE_MS = 5000;
+const MODULES_WAIT_MS = 10000;
+
 const state = {
   modules: [],
   health: null,
@@ -261,8 +272,17 @@ async function navigate() {
   const controller = new AbortController();
   const slot = el('div', { class: 'pane-slot', id: 'pane-slot' });
   clear(paneEl);
-  paneEl.appendChild(slot);
-  state.current = { signature, controller, cleanup: null };
+  // The pane is never an empty box: it says what it is waiting for, and carries a door-bell so a
+  // diagnostic can see what the shell is doing instead of inferring it from an empty DOM.
+  const loading = el('div', { class: 'pane-loading', 'data-pane-loading': signature },
+    el('div', { class: 'fallback-note' },
+      el('span', { class: 'dot', 'data-tone': 'warn' }),
+      el('span', { text: `loading ${route.kind === 'messages' ? 'messages' : route.id}…` }),
+    ),
+  );
+  paneEl.append(loading, slot);
+  state.current = { signature, controller, cleanup: null, loading };
+  window.__shell = { ready: true, route: signature, phase: 'loading', since: Date.now(), notes: [] };
 
   try {
     if (route.kind === 'messages') {
@@ -297,26 +317,47 @@ async function navigate() {
 }
 
 async function renderPanes(m, slot, signal, signature) {
+  // Whichever way this exits, the loading note goes: from here on the slot owns the screen.
+  const finish = (phase, noteList = []) => {
+    if (state.current?.signature === signature) {
+      state.current.loading?.remove();
+      window.__shell = { ...(window.__shell || {}), phase, route: signature, notes: noteList, mountedAt: Date.now() };
+    }
+  };
   if (m.status !== 'up') {
     slot.appendChild(failedModulePane(m));
+    finish('failed-module', [`module status is ${m.status}`]);
     return;
   }
   // A module's own `ui.pane` is the only pane for it. The shell keeps a generic settings pane
   // for a module that declares none, and never a second implementation of the same screen: a
   // hardcoded map outranked the module's pane and kept two of them alive unnoticed.
+  const notes = [];
   let mod = null;
   let source = null;
   if (m.ui && m.ui.pane) {
     const panePath = `/mod/${m.id}/${m.ui.pane.replace(/^\/+/, '')}`;
+    // Neither request is allowed to hold the pane hostage: a cold server or a throttled link
+    // must end in a rendered pane with a named problem, never an empty slot forever.
     if (await paneExists(panePath)) {
       try {
-        mod = await import(/* @vite-ignore */ panePath);
+        mod = await withDeadline(import(/* @vite-ignore */ panePath), PANE_IMPORT_MS, `import ${panePath}`);
         source = m.ui.pane;
-        await loadStyleFor(m);
       } catch (err) {
         console.error(`module pane ${m.ui.pane} failed to load`, err);
+        notes.push(`the pane module ${m.ui.pane} did not load (${err.message}) — showing the settings pane`);
         mod = null;
       }
+      if (mod) {
+        const style = await loadStyleFor(m);
+        if (style.ok) {
+          // The pane's own sheet is up; the loading line has done its job.
+        } else {
+          notes.push(style.why);
+        }
+      }
+    } else {
+      notes.push(`the pane module ${m.ui.pane} is not served — showing the settings pane`);
     }
   }
   if (!mod) {
@@ -327,12 +368,39 @@ async function renderPanes(m, slot, signal, signature) {
   if (signal.aborted) return;
   try {
     const cleanup = await mod.render(slot, makeCtx(m, source, signal));
+    finish(source === 'fallback' ? 'fallback' : 'mounted', notes);
+    for (const note of notes) {
+      slot.prepend(
+        el('div', { class: 'fallback-note', 'data-note': 'pane-partial' },
+          el('span', { class: 'dot', 'data-tone': 'warn' }),
+          el('span', { text: note }),
+        ),
+      );
+    }
     if (state.current?.signature === signature && typeof cleanup === 'function') state.current.cleanup = cleanup;
   } catch (err) {
     console.error('pane render failed', err);
+    finish('render-error', [err.message]);
     clear(slot);
     slot.appendChild(errorPane(err, `pane for ${m.id} (${source})`));
   }
+}
+
+/** Resolve a promise or fail it after `ms`. A gate that can hang forever is a blank shell. */
+function withDeadline(promise, ms, what) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${what} took longer than ${Math.round(ms / 1000)} s`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
 }
 
 /** A module's ui.pane is only imported when the file is actually served: modules declare the
@@ -341,7 +409,7 @@ async function renderPanes(m, slot, signal, signature) {
 async function paneExists(path) {
   for (const method of ['HEAD', 'GET']) {
     try {
-      const res = await fetch(path, { method, headers: { accept: 'text/javascript' } });
+      const res = await fetch(path, { method, headers: { accept: 'text/javascript' }, signal: AbortSignal.timeout(PANE_PROBE_MS) });
       if (res.ok) return true;
       if (res.status !== 405) return false;
     } catch {
@@ -351,23 +419,41 @@ async function paneExists(path) {
   return false;
 }
 
+/**
+ * Load a module's pane stylesheet. The <link> is not allowed to gate the pane forever: when the
+ * request stalls, the pane renders unstyled and says so. Returns 'ok' | 'missing' | 'timed out '.
+ */
 async function loadStyleFor(m) {
-  if (!m.ui || !m.ui.style) return;
+  if (!m.ui || !m.ui.style) return { ok: true };
   const href = `/mod/${m.id}/${m.ui.style.replace(/^\/+/, '')}`;
-  if (state.loadedStyles.has(href)) return;
+  if (state.loadedStyles.get(href) === 'ok') return { ok: true };
   state.loadedStyles.set(href, 'loading');
-  await new Promise((resolve) => {
+  return await new Promise((resolve) => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
     link.href = href;
+    const settle = (outcome) => {
+      clearTimeout(timer);
+      link.onload = null;
+      link.onerror = null;
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => {
+      state.loadedStyles.delete(href);
+      console.warn(`pane style still loading after ${STYLE_WAIT_MS} ms: ${href} — rendering without it`);
+      // A stalled stylesheet would still paint whenever it eventually arrived, contradicting what
+      // the pane says. Drop the request: what is on screen is what is loaded.
+      link.remove();
+      resolve({ ok: false, why: `the pane stylesheet ${m.ui.style} did not arrive within ${STYLE_WAIT_MS / 1000} s — the pane is rendered unstyled` });
+    }, STYLE_WAIT_MS);
     link.onload = () => {
       state.loadedStyles.set(href, 'ok');
-      resolve();
+      settle({ ok: true });
     };
     link.onerror = () => {
       state.loadedStyles.delete(href);
-      console.warn(`pane style missing: ${href}`);
-      resolve();
+      console.warn(`pane style failed to load: ${href}`);
+      settle({ ok: false, why: `the pane stylesheet ${m.ui.style} failed to load — the pane is rendered unstyled` });
     };
     document.head.appendChild(link);
   });
@@ -597,6 +683,7 @@ function wireDrawer() {
 }
 
 async function boot() {
+  window.__shell = { ready: false, phase: 'boot', since: Date.now(), notes: [] };
   installToasts(document.getElementById('toasts'));
   wireDrawer();
   bus.onStatus((s) => {
@@ -608,10 +695,12 @@ async function boot() {
   });
 
   try {
-    await loadModules();
+    await withDeadline(loadModules(), MODULES_WAIT_MS, 'GET /api/modules');
   } catch (err) {
+    console.error('modules failed to load', err);
     clear(paneEl);
     paneEl.appendChild(errorPane(err, 'Could not load /api/modules'));
+    window.__shell = { ...window.__shell, phase: 'no-modules', notes: [err.message] };
     return;
   }
   renderRail();
@@ -633,5 +722,6 @@ async function boot() {
 
 boot().catch((err) => {
   console.error(err);
+  window.__shell = { ...(window.__shell || {}), phase: 'boot-failed', notes: [err.message] };
   toast(`shell failed to start: ${err.message}`, 'error');
 });
