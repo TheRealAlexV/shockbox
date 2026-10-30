@@ -67,6 +67,79 @@ if (-not (Test-Path -LiteralPath $NodeExe)) {
     Write-Warning "node.exe not found at $NodeExe - the launcher will fall back to 'node' on PATH"
 }
 
+# ---- 0. stop what this install is about to replace ---------------------------
+# A copy over a live tree does not affect the running node (it already read its
+# files), so the new code only takes effect after a restart. Restarting is this
+# script's job, and it must happen here, before the copy: `schtasks /Run` on an
+# already-running task starts nothing, and stopping the task while its launcher
+# loop is still alive only respawns the old code. Stop the launcher, stop the
+# node serving our port, copy, then start (step 4).
+#
+# Both stops are scoped by evidence, never by name alone: the port's listener is
+# stopped only if its command line runs *our* server.mjs, and the launcher kill
+# skips any process that is this install or any other install's supervisor.
+function Get-ListenerPid([int]$Port) {
+    try {
+        $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
+    } catch {
+        return @()
+    }
+    return @($c | Select-Object -ExpandProperty OwningProcess -Unique)
+}
+
+function Test-IsOurs([int]$ProcId, [string]$AppDir) {
+    try {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcId" -ErrorAction Stop
+    } catch {
+        return $false
+    }
+    if (-not $p -or -not $p.CommandLine) { return $false }
+    return ($p.CommandLine -match 'server\.mjs' -and $p.CommandLine -match [regex]::Escape($AppDir))
+}
+
+Step 'stop'
+$stopped = @()
+if ($PSCmdlet.ShouldProcess("\$TaskName", 'stop')) {
+    $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        schtasks.exe /End /TN $TaskName | Out-Null
+        Note 'task ended'
+        $stopped += 'task'
+    } else {
+        Note 'no task to stop'
+    }
+
+    # The launcher loop (cmd.exe) survives the task ending, and its child node is
+    # the process holding the port. Kill the loop first, or node comes straight back.
+    $loops = Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -match 'run\.cmd' -and $_.CommandLine -match [regex]::Escape($AppDir) }
+    # Lazily-evaluated because the target's cmd may run from a copied folder whose
+    # path differs only by case (it does: 'shockbox' vs 'ShockBox').
+    foreach ($loop in @($loops)) {
+        Stop-Process -Id $loop.ProcessId -Force -ErrorAction SilentlyContinue
+        Note "stopped launcher pid $($loop.ProcessId)"
+        $stopped += "launcher $($loop.ProcessId)"
+    }
+
+    foreach ($listener in Get-ListenerPid $Port) {
+        if (Test-IsOurs $listener $AppDir) {
+            Stop-Process -Id $listener -Force -ErrorAction SilentlyContinue
+            Note "stopped server pid $listener (port $Port)"
+            $stopped += "server $listener"
+        } elseif ($listener -eq 4) {
+            Write-Warning "port $Port is held by the HTTP.sys service (pid 4), not ShockBox - leaving it"
+        } else {
+            $line = (Get-CimInstance Win32_Process -Filter "ProcessId = $listener" -ErrorAction SilentlyContinue).CommandLine
+            Write-Warning "port $Port is held by pid $listener which is not this install ($line) - leaving it; the start below will report EADDRINUSE"
+        }
+    }
+
+    if ($stopped.Count -eq 0) { Note 'nothing was running' }
+    Start-Sleep -Milliseconds 700
+} else {
+    Note "schtasks /End /TN $TaskName ; stop the run.cmd launcher and the node serving $Port"
+}
+
 # ---- 1. directories ----------------------------------------------------------
 # state\ and logs\ are created here as well as by run.cmd, so the first copy
 # never races the first start for them, and -WhatIf still describes the full set.
@@ -143,7 +216,31 @@ if ($PSCmdlet.ShouldProcess("\$TaskName", 'start now')) {
     schtasks.exe /Run /TN $TaskName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "schtasks /run failed with exit code $LASTEXITCODE" }
     Note 'started'
-    Note "health: http://127.0.0.1:$Port/health  (give it a few seconds)"
+    # Wait for the new process to own the port, and say which pid it is: a start
+    # that comes up on the *old* code (or not at all) must be visible here, not
+    # discovered an hour later from a health endpoint that never changed.
+    $newPid = $null
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 500
+        $cand = Get-ListenerPid $Port
+        if ($cand.Count -gt 0) { $newPid = $cand[0]; break }
+    }
+    if ($null -eq $newPid) {
+        Write-Warning "nothing is listening on $Port after 15s - check $Target\logs\launcher-*.log and shockbox-*.log"
+    } else {
+        Note "listening on $Port as pid $newPid"
+        if ($stopped -contains "server $newPid") {
+            Write-Warning "pid $newPid is a process this install just stopped - the old server came back"
+        }
+        try {
+            $h = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 5
+            Note ("health: ok, modules " + (($h.modules.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))
+            if ($h.pid -ne $newPid) { Write-Warning "health reports pid $($h.pid) but port $Port is held by $newPid" }
+        } catch {
+            Write-Warning "health did not answer: $($_.Exception.Message)"
+        }
+    }
+    Note "logs:   $Target\logs"
     Note "logs:   $Target\logs"
 } else {
     Note "schtasks /Run /TN $TaskName"
