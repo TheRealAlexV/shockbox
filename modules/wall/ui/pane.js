@@ -456,8 +456,8 @@ export async function render(container, ctx) {
 
   /* --- status strip ------------------------------------------------------- */
 
-  const onlineLand = statusItem('landscape');
-  const onlinePort = statusItem('portrait');
+  // One served 16:9 page draws both ratios, so there is one page to be online (2026-10-29).
+  const onlineLand = statusItem('render');
   const sceneOut = el('span', { class: 'mono', text: '—' });
   const forcingOut = el('span', { class: 'mono dim', text: '' });
   const seqOut = el('span', { class: 'mono dim', text: '' });
@@ -466,8 +466,8 @@ export async function render(container, ctx) {
 
   const strip = el('div', { class: 'wall-status' },
     el('div', { class: 'wall-status-row' },
-      el('span', { class: 'look-label', text: 'Pages' }),
-      onlineLand, onlinePort,
+      el('span', { class: 'look-label', text: 'Page' }),
+      onlineLand,
     ),
     el('div', { class: 'wall-status-row' },
       el('span', { class: 'look-label', text: 'Scene' }),
@@ -491,7 +491,7 @@ export async function render(container, ctx) {
     return el('span', { class: 'wall-online', dataset: { view: label } }, dot('idle'), el('span', { text: label }));
   }
   function paintOnline() {
-    for (const [node, up] of [[onlineLand, online.landscape], [onlinePort, online.portrait]]) {
+    for (const [node, up] of [[onlineLand, online.landscape]]) {
       node.dataset.on = String(up);
       node.replaceChildren(dot(up ? 'ok' : 'idle', up ? 'reporting' : 'no heartbeat'), el('span', { text: node.dataset.view }));
       node.append(el('span', { class: 'wall-online-state mono', text: up ? 'live' : 'offline' }));

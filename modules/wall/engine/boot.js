@@ -22,6 +22,10 @@
   var PAGE = window.LEDWALL_PAGE || {};
   var RATIO = PAGE.ratio === '9:16' ? '9:16' : '16:9';
   var VIEW = PAGE.view === 'portrait' ? 'portrait' : 'landscape';
+  // The 16:9 page draws BOTH view blocks: landscape is the whole picture, portrait is the 9:16
+  // fence inside it (2026-10-29). So the serving page reports as landscape; a ?view=portrait
+  // on this page means 'start with the fence layout', which the render settings carry because
+  // the window is a mod-8 fence rectangle. The dedicated 9:16 page keeps its own VIEW.
 
   var qs = new URLSearchParams(location.search);
   var DEFAULTS = window.LEDWALL_DEFAULTS || {};

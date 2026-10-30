@@ -246,12 +246,39 @@ async function shutdown(sig) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+// An exception handler that logs is only safe while logging cannot itself throw. Both of these
+// guard against a logging storm turning one failure into an infinite one: an EPIPE from a closed
+// stdout used to re-enter here through `log.error` and write a stack trace per iteration.
+const FATAL_WINDOW_MS = 60_000;
+const FATAL_MAX = 100;
+let fatal = { at: 0, count: 0 };
+
+function onFatal(kind, err) {
+  const now = Date.now();
+  if (now - fatal.at > FATAL_WINDOW_MS) fatal = { at: now, count: 0 };
+  fatal.at = now;
+  if (++fatal.count > FATAL_MAX) {
+    // Too many in a minute: stop writing and leave. A repeating uncaught error is not survivable.
+    try {
+      process.stderr.write(`shockbox: ${fatal.count} fatal errors in a minute, exiting\n`);
+    } catch {
+      /* stderr gone */
+    }
+    process.exit(1);
+  }
+  try {
+    log.error(`${kind}: ${err && err.stack ? err.stack : err}`);
+  } catch {
+    /* ignore */
+  }
+}
+
 process.on('uncaughtException', (err) => {
-  log.error(`uncaught: ${err.stack || err.message}`);
+  // EPIPE on stdout/stderr is the launcher's pipe closing, not an app fault: ignore it.
+  if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) return;
+  onFatal('uncaught', err);
 });
-process.on('unhandledRejection', (err) => {
-  log.error(`unhandled rejection: ${err && err.stack ? err.stack : err}`);
-});
+process.on('unhandledRejection', (err) => onFatal('unhandled rejection', err));
 
 main().catch((err) => {
   log.error(`startup failed: ${err.stack || err.message}`);
