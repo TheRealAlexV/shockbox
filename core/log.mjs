@@ -1,18 +1,22 @@
 // One append log, per-module prefix. Ring buffer for the UI, file append for after-the-fact.
+//
+// `file` overrides the log file's path; `dir` is where `shockbox.log` goes when it is not given
+// (the state directory by default, or `--log-dir`). Rotation stays: one previous file, 4 MB.
 
 import fs from 'node:fs';
 import path from 'node:path';
 
 const RING_MAX = 500;
 
-export function createLog({ dir, console: toConsole = true } = {}) {
+export function createLog({ dir, file: filePath = null, console: toConsole = true } = {}) {
   const ring = [];
   let file = null;
 
-  if (dir) {
+  const target = filePath || (dir ? path.join(dir, 'shockbox.log') : null);
+  if (target) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      file = path.join(dir, 'shockbox.log');
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      file = target;
       // Rotate once at boot if the file is over 4 MB; keeps one previous, no timers.
       try {
         const st = fs.statSync(file);

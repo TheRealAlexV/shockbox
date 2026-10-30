@@ -4,6 +4,7 @@
 //   node server.mjs                 # normal
 //   SHOCKBOX_PORT=8973 node server.mjs
 //   EP_COMPAT=1 node server.mjs     # additionally serve the popups' legacy port 8787
+//   node server.mjs --log-dir D     # log file in D instead of the state directory
 //
 // Config resolution order: CLI flag > env > config.json next to this file > default.
 
@@ -47,6 +48,10 @@ const cfg = readConfig();
 const PORT = Number(arg('port', process.env.SHOCKBOX_PORT || process.env.PORT || cfg.port || 8972));
 const HOST = arg('host', process.env.SHOCKBOX_HOST || cfg.host || '127.0.0.1');
 const STATE_DIR = path.resolve(arg('state', process.env.SHOCKBOX_STATE || cfg.stateDir || path.join(HERE, 'state')));
+// Where the process writes its own log file. The launcher redirects stdout/stderr to dated files
+// next to it; this is the same stream, written straight to a file with the log ring behind
+// /api/log. Defaults to the state directory, so a plain `node server.mjs` is unchanged.
+const LOG_DIR = path.resolve(arg('log-dir', process.env.SHOCKBOX_LOG_DIR || cfg.logDir || STATE_DIR));
 // Where the notification / alert tone clips live. Rig default; overridable for tests and for a
 // checkout on another machine. Handed to the modules through the context; core does not read it.
 const SOUNDS_DIR = path.resolve(arg('sounds', process.env.SHOCKBOX_SOUNDS || cfg.soundsDir || 'C:\\OBS\\Sounds\\SoundBoard'));
@@ -57,11 +62,16 @@ const OBS_PASSWORD = cfg.obs?.password || '';
 const OBS_ENABLED = cfg.obs?.enabled !== false;
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
-const log = createLog({ dir: STATE_DIR });
+// The launcher writes stdout/stderr to `shockbox-YYYY-MM-DD.log` beside this; the app's own log
+// file uses the same dated name so one day is one log, and the rotation stays as the fallback
+// for a long-running day (`shockbox-YYYY-MM-DD.log.1`).
+const LOG_FILE = path.join(LOG_DIR, `shockbox-${new Date().toISOString().slice(0, 10)}.log`);
+const log = createLog({ dir: LOG_DIR, file: LOG_FILE });
 const root = log.scope('core');
 
 log.info(`ShockBox ${VERSION} — pid ${process.pid}, node ${process.version}`);
 log.info(`state ${STATE_DIR}`);
+log.info(`log ${LOG_DIR}`);
 log.info(`public ${PUBLIC_DIR}`);
 
 const events = createEvents({ log: log.scope('events') });
