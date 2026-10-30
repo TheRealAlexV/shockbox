@@ -15,10 +15,24 @@ Every front end is served by ShockBox itself. Adding a feature is adding a folde
 ## Run
 
 ```bash
-node server.mjs                      # http://127.0.0.1:8972
+node server.mjs                      # http://127.0.0.1:8972 — admin shell at /#/wall
 SHOCKBOX_PORT=8973 node server.mjs --state ./state-dev
-node --test test/                    # unit + contract tests
+npm test                             # every gate: unit, contract, and real-browser checks
 ```
+
+`npm test` runs the gates in order and exits non-zero on the first failure:
+
+| gate | what it proves |
+|---|---|
+| `test/ratio.mjs` | the scene-forced ratio state machine (entry, leave, restore, reconnect) |
+| `test/ratio-commands.mjs` | `ratio.toggle` / `ratio.force16x9` are answered by the server, not forwarded to a page |
+| `test/api-smoke.mjs` | core routes ahead of module routes, the shared pool, `/events` channels, module assets |
+| `test/pane-browser.mjs` | the wall admin pane in headless Chrome: real pointer drag, controls that write the schema, no console errors |
+| `test/pane-drag.mjs` | the drag gesture end to end: window moves, snaps to whole cells, commits to the state file, grip keeps 9:16 |
+| `test/wall-browser.mjs` | the render page in headless Chrome: engine mounts, bus commands land, the 9:16 fence reaches the shader, frames animate |
+
+They boot their own server and their own Chrome on free ports — no rig, no OBS and no
+`state/` needed, so they are safe to run while the live server is up.
 
 On the rig it runs as the scheduled task `ShockBox-Server` via `ShockBox.cmd start`.
 
@@ -28,10 +42,10 @@ On the rig it runs as the scheduled task `ShockBox-Server` via `ShockBox.cmd sta
 server.mjs            process entry: config, listeners, shutdown
 core/                 registry, events, store, settings, obs client, http server — no module knowledge
 modules/<id>/         module.json + server.js + ui/ + pages/ + its own data directory under state/
-public/               admin shell (built), shell assets
+public/               admin shell: rail, hash router, settings form, health drawer (no build step)
 state/<id>/           live data, outside the code tree, never in git
 docs/                 ARCHITECTURE.md and one CONTRACT-*.md per module
-test/                 node --test suites, including the migrated popup contract tests
+test/                 the gates above — plain node scripts, each booting what it needs
 ```
 
 ## Licence
