@@ -1,0 +1,111 @@
+{
+  "id": "handfx",
+  "title": "Hand FX",
+  "version": "1.0.0",
+  "order": 40,
+  "icon": "hand",
+  "description": "Hand tracking and layered WebGL2 effects for the stream: fireball on an open palm, lightning between arched fingertips, plus spark ring, ember rise and smoke veil. Tracking runs in the page; the server only owns what the operator sets and the command bus.",
+  "channels": ["handfx"],
+  "mount": "server.js",
+  "ui": {
+    "pane": "ui/pane.js",
+    "style": "ui/pane.css"
+  },
+  "settings": {
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "label": "Effects on (a page that loads with this off runs, but draws nothing until enabled)",
+      "group": "general"
+    },
+    "mirror": {
+      "type": "boolean",
+      "default": true,
+      "label": "Mirror the picture (selfie view — the default for a camera pointed at the operator)",
+      "group": "general"
+    },
+    "sensitivity": {
+      "type": "number",
+      "default": 1,
+      "min": 0.4,
+      "max": 2,
+      "step": 0.05,
+      "label": "Tracking sensitivity",
+      "help": "Scales detection/tracking confidence: higher finds hands in dim or partial view and fires gestures sooner, with more false positives.",
+      "group": "tracking"
+    },
+    "deviceId": {
+      "type": "string",
+      "default": "",
+      "maxLength": 128,
+      "label": "Camera device id (empty = first camera)",
+      "help": "Device ids are shown per browser origin; copy one from the pane's device list.",
+      "group": "tracking"
+    },
+    "resolution": {
+      "type": "enum",
+      "default": "720p",
+      "values": ["480p", "720p", "1080p"],
+      "label": "Camera resolution",
+      "group": "tracking"
+    },
+    "debugOverlay": {
+      "type": "boolean",
+      "default": false,
+      "label": "Draw camera + landmarks on the overlay page",
+      "help": "On: the camera picture and the 21 landmarks are drawn under the effects (setup). Off: effects only.",
+      "group": "tracking"
+    },
+    "effects": {
+      "type": "array",
+      "items": "string",
+      "default": ["fireball", "lightning", "sparkring", "embers", "smoke"],
+      "label": "Effect order (enabled effects, in cycling order)",
+      "help": "Ids from the effect registry. An empty list is allowed: nothing is drawn.",
+      "group": "effects"
+    },
+    "intensity": {
+      "type": "object",
+      "default": {
+        "fireball": 1,
+        "lightning": 1,
+        "sparkring": 1,
+        "embers": 1,
+        "smoke": 1
+      },
+      "label": "Per-effect intensity",
+      "help": "Per-effect multipliers (0–2), merged onto the defaults. Keys the pane knows: the registry's effect ids.",
+      "group": "effects"
+    },
+    "nextGesture": {
+      "type": "enum",
+      "default": "bothFingertips",
+      "values": ["bothFingertips", "palmTouch", "bothPalmsUp", "fist"],
+      "label": "‘Next effect’ gesture",
+      "help": "The same two-hand gesture as lightning would race it, so the next-effect gesture must differ: touch two index fingertips to step the effect list.",
+      "group": "effects"
+    },
+    "bufferScroll": {
+      "type": "number",
+      "default": 0.35,
+      "min": 0,
+      "max": 1.5,
+      "step": 0.05,
+      "label": "Effect travel from the bottom edge",
+      "help": "How far upward an effect rises from a palm near the bottom of the frame, in field heights.",
+      "group": "effects"
+    }
+  },
+  "pages": [
+    {
+      "route": "/handfx",
+      "title": "Hand FX overlay",
+      "file": "pages/overlay.html",
+      "headers": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Resource-Policy": "cross-origin"
+      }
+    }
+  ]
+}

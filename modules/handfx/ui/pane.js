@@ -1,0 +1,612 @@
+// Hand FX admin pane.
+//
+// What the operator sets here is the server's (`PATCH /api/handfx/settings`): enable, effect order
+// and per-effect intensity, mirror, sensitivity, camera device, resolution, debug overlay, the
+// "next effect" gesture and the effect travel. What the pane shows about tracking is honest by
+// construction:
+//
+//   · the camera is one document's to hold. If the overlay page has it, this pane lists the hands
+//     and gestures the overlay reports on the bus (`handfx` → the `page` event) and says
+//     "camera held by the overlay" — it does not open a second stream
+//   · if the overlay is not tracking, the pane's own preview asks for the camera on the operator's
+//     explicit click. Denied, held elsewhere, insecure origin and "model failed" are all named
+//   · with no camera and no overlay it shows "synthetic replay" on request: a scripted hand that
+//     goes through the real classifier, labelled as synthetic everywhere it appears
+//   · the effect registry is the union of the server's ids and this build's implementations; a
+//     setting naming an effect this build cannot draw is shown as such, not silently dropped
+//
+// The pane lives off the shell's own tokens (public/src/shell.css) and a small pane.css.
+
+import { el, clear, actionButton } from '/src/ui.js';
+import { syntheticHands } from '../pages/js/engine/tracker.js';
+import { classify as classifyPose, Motion } from '../pages/js/engine/gestures.js';
+
+
+export async function render(container, ctx) {
+  const { api, events, signal } = ctx;
+  const root = el('div', { class: 'hfx' });
+  container.append(root);
+
+  const s = {
+    status: null, // /api/handfx/status
+    settings: {}, // plain values from the settings describe
+    deviceList: [],
+    streaming: false,
+    streamError: null,
+    camera: 'off', // off | asking | on | denied | held | error | insecure
+    devices: 'idle', // idle | listing | denied | error
+    page: null, // last honest status line from the overlay
+    live: new Map(), // effect id -> {startedAt, hands, gesture} (from the overlay's reports)
+    synthetic: false,
+    log: [],
+  };
+
+  let stream = null;
+  let videoEl = null;
+  let stopStream = () => {};
+
+  /* -------------------------------------------------------------- data */
+
+  async function refresh() {
+    s.status = await api.get('/api/handfx/status');
+    s.settings = Object.fromEntries(Object.entries(s.status.settings || {}).map(([k, d]) => [k, d.value]));
+    return s.status;
+  }
+
+  async function patch(key, value) {
+    const before = s.settings[key];
+    const res = await api.patch('/api/handfx/settings', { [key]: value });
+    s.settings = Object.fromEntries(Object.entries(res.settings || {}).map(([k, d]) => [k, d.value]));
+    if (Array.isArray(res.changed) && !res.changed.includes(key)) {
+      push(`“${key}” did not change on the server (sent ${JSON.stringify(value)})`, 'warn');
+    }
+    return { before, res };
+  }
+
+  async function bus(cmd, args) {
+    const res = await api.post('/api/handfx/cmd', { cmd, args });
+    push(`${cmd} → accepted by the server (seq ${res.seq ?? '—'})`, 'ok');
+    return res;
+  }
+
+  function push(text, tone = 'info') {
+    s.log.unshift({ at: Date.now(), text, tone });
+    s.log = s.log.slice(0, 6);
+    renderLog();
+  }
+
+  function renderLog() {
+    const box = root.querySelector('.hfx-log');
+    if (!box) return;
+    clear(box);
+    if (!s.log.length) {
+      box.append(el('div', { class: 'hfx-log-empty', text: 'no commands yet' }));
+      return;
+    }
+    for (const row of s.log) {
+      const t = new Date(row.at).toTimeString().slice(0, 8);
+      box.append(
+        el('div', { class: 'hfx-log-row', 'data-tone': row.tone }, el('span', { class: 'mono hfx-log-t', text: t }), el('span', { text: row.text })),
+      );
+    }
+  }
+
+  /* -------------------------------------------------------------- camera */
+
+  function secureText() {
+    if (window.isSecureContext) return null;
+    return `This page is served from ${location.origin}, which is not a secure context. A browser only allows the camera on https, http://localhost or http://127.0.0.1 — open the pane there.`;
+  }
+
+  async function listDevices() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      s.devices = 'error';
+      return;
+    }
+    if (!window.isSecureContext) {
+      s.devices = 'insecure';
+      return;
+    }
+    s.devices = 'listing';
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      s.deviceList = all.filter((d) => d.kind === 'videoinput');
+      // Labels are blank until this origin has permission; say so rather than showing blanks.
+      s.devices = s.deviceList.some((d) => d.label) ? 'ok' : 'unlabelled';
+    } catch {
+      s.devices = 'error';
+    }
+    if (root.isConnected) render();
+  }
+
+  async function startPreview(deviceId) {
+    stopPreview();
+    const insecure = secureText();
+    if (insecure) {
+      s.camera = 'insecure';
+      s.streamError = insecure;
+      render();
+      return;
+    }
+    s.camera = 'asking';
+    s.streamError = null;
+    render();
+    try {
+      const res = s.settings.resolution || '720p';
+      const size = { '480p': [640, 480], '720p': [1280, 720], '1080p': [1920, 1080] }[res] || [1280, 720];
+      const constraints = { video: { width: { ideal: size[0] }, height: { ideal: size[1] } }, audio: false };
+      const want = deviceId || s.settings.deviceId;
+      if (want) constraints.video.deviceId = { exact: want };
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      s.camera = 'on';
+      await listDevices();
+    } catch (err) {
+      s.camera = /NotAllowed|Security/i.test(err.name || '') ? 'denied' : /NotReadable|Abort/i.test(err.name || '') ? 'held' : 'error';
+      s.streamError = err.message || err.name;
+      push(`camera: ${s.camera} — ${s.streamError}`, 'bad');
+    }
+    render();
+  }
+
+  function stopPreview() {
+    if (stream) for (const t of stream.getTracks()) t.stop();
+    stream = null;
+    if (s.camera !== 'held') s.camera = 'off';
+    if (videoEl) {
+      videoEl.srcObject = null;
+      videoEl = null;
+    }
+  }
+
+  /* -------------------------------------------------------------- effects */
+
+  function registry() {
+    const served = (s.status && s.status.effects) || [];
+    return served.map((e) => ({ ...e, known: ['fireball', 'lightning', 'sparkring', 'embers', 'smoke'].includes(e.id) }));
+  }
+
+  function effectEnabled(id) {
+    return (s.settings.effects || []).includes(id);
+  }
+
+  async function toggleEffect(id) {
+    const on = effectEnabled(id);
+    const all = registry().map((e) => e.id);
+    let next;
+    if (on) next = (s.settings.effects || []).filter((x) => x !== id);
+    else next = all.filter((x) => effectEnabled(x) || x === id);
+    try {
+      await patch('effects', next);
+      push(`${id} ${on ? 'off' : 'on'} — effect list: ${next.join(', ') || '(empty)'}`, 'ok');
+    } catch (err) {
+      push(`effect list refused: ${err.message}`, 'bad');
+    }
+    render();
+  }
+
+  async function moveEffect(id, dir) {
+    const list = (s.settings.effects || []).slice();
+    const i = list.indexOf(id);
+    if (i < 0) return;
+    const j = i + dir;
+    if (j < 0 || j >= list.length) return;
+    [list[i], list[j]] = [list[j], list[i]];
+    try {
+      await patch('effects', list);
+    } catch (err) {
+      push(`order refused: ${err.message}`, 'bad');
+    }
+    render();
+  }
+
+  async function setIntensity(id, value) {
+    const intensity = { ...(s.settings.intensity || {}), [id]: value };
+    try {
+      await patch('intensity', intensity);
+    } catch (err) {
+      push(`intensity refused: ${err.message}`, 'bad');
+    }
+  }
+
+  /* -------------------------------------------------------------- overlay state */
+
+  function pageSummary() {
+    const p = s.page;
+    if (!p) return { tone: 'idle', text: 'no status from the overlay yet — open it and press Start (or Synthetic) there' };
+    const age = Date.now() - (p.at || 0);
+    if (age > 8000) return { tone: 'warn', text: `overlay last reported ${Math.round(age / 1000)}s ago (closed, or its tab is asleep)` };
+    if (p.error) return { tone: 'bad', text: `overlay: ${p.error}` };
+    if (p.tracking) return { tone: 'ok', text: `overlay tracking · ${p.hands} hand${p.hands === 1 ? '' : 's'} · ${p.gesture || 'none'} · effect ${p.effect || '—'}` };
+    return { tone: 'idle', text: 'overlay open, not tracking' };
+  }
+
+  /* -------------------------------------------------------------- render */
+
+  function render() {
+    clear(root);
+    const status = s.status;
+    const reg = registry();
+    const enabled = s.settings.enabled !== false;
+    const insecure = secureText();
+    const page = pageSummary();
+
+    root.append(header(status, reg, page, enabled));
+
+    if (insecure) root.append(banner(insecure, 'bad'));
+    else if (!window.crossOriginIsolated) root.append(banner('This tab is not cross-origin isolated (COOP/COEP). The overlay page is served isolated; the pane only reads status.', 'warn'));
+    if (status && (!status.runtime || !status.runtime.vendored)) {
+      root.append(banner('The MediaPipe runtime is not vendored. The overlay will report “model failed”; see modules/handfx/vendor/README.md.', 'bad'));
+    }
+    if (status && status.model && !status.model.local) {
+      root.append(banner(`No local model file: the overlay downloads hand_landmarker.task once from ${status.model.url} and caches it in Cache Storage.`, 'info'));
+    }
+
+    const body = el('div', { class: 'hfx-body' });
+    body.append(previewCard(), sideColumn(reg, enabled));
+    root.append(body);
+    root.append(effectsCard(reg), footer(reg));
+    renderLog();
+  }
+
+  function header(status, reg, page, enabled) {
+    const list = (s.settings.effects || []).filter((id) => reg.some((e) => e.id === id));
+    const bar = el('div', { class: 'hfx-head' });
+    bar.append(
+      el('div', { class: 'hfx-head-left' },
+        el('span', { class: 'hfx-title', text: 'Hand FX' }),
+        el('span', { class: 'hfx-dot', 'data-tone': enabled ? 'ok' : 'idle' }),
+        el('span', { class: 'hfx-state', text: enabled ? 'effects on' : 'effects off' }),
+        el('span', { class: 'hfx-sep' }),
+        el('span', { class: 'hfx-list', text: `list: ${list.join(' › ') || '(empty — nothing is drawn)'}` }),
+      ),
+      el('div', { class: 'hfx-head-right' },
+        actionButton({ label: '◀ effect.prev', variant: 'btn-quiet btn-sm', run: () => bus('effect.prev'), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+        actionButton({ label: 'effect.next ▶', variant: 'btn-quiet btn-sm', run: () => bus('effect.next'), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+        actionButton({ label: 'reload page', variant: 'btn-quiet btn-sm', run: () => bus('reload'), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+      ),
+    );
+    const strip = el('div', { class: 'hfx-strip' },
+      el('span', { class: 'hfx-pill', 'data-tone': enabled ? 'ok' : 'warn' }, `effects ${enabled ? 'enabled' : 'disabled'}`),
+      el('span', { class: 'hfx-pill', 'data-tone': s.settings.mirror !== false ? 'info' : 'idle' }, `mirror ${s.settings.mirror !== false ? 'on' : 'off'}`),
+      el('span', { class: 'hfx-pill', 'data-tone': window.isSecureContext ? 'ok' : 'bad' }, window.isSecureContext ? 'secure context' : 'insecure origin'),
+      el('span', { class: 'hfx-pill', 'data-tone': window.crossOriginIsolated ? 'ok' : 'warn' }, window.crossOriginIsolated ? 'cross-origin isolated' : 'not isolated (pane)'),
+      el('span', { class: 'hfx-pill', 'data-tone': page.tone }, page.text),
+    );
+    return el('div', { class: 'hfx-hero' }, bar, strip);
+  }
+
+  function banner(text, tone) {
+    return el('div', { class: 'hfx-banner', 'data-tone': tone, text });
+  }
+
+  function previewCard() {
+    const card = el('section', { class: 'panel hfx-preview' });
+    const head = el('div', { class: 'panel-head' },
+      el('span', { class: 'panel-title', text: 'Preview' }),
+      el('span', { class: 'panel-hint mono', 'data-hfx-preview-state': s.camera }),
+    );
+    const stage = el('div', { class: 'hfx-stage', 'data-state': s.camera });
+    const cam = el('video', { class: 'hfx-video', autoplay: true, muted: true, playsInline: true });
+    cam.muted = true;
+    const lm = document.createElement('canvas');
+    lm.className = 'hfx-landmarks';
+    const hud = el('div', { class: 'hfx-hud' });
+    stage.append(cam, lm, hud);
+    videoEl = cam;
+
+    const note = el('div', { class: 'hfx-preview-note' });
+    if (s.camera === 'on') note.append(el('span', { class: 'hfx-note ok', text: 'camera live in this pane' }));
+    else if (s.camera === 'asking') note.append(el('span', { class: 'hfx-note', text: 'waiting for the permission prompt…' }));
+    else if (s.camera === 'denied') note.append(el('span', { class: 'hfx-note bad', text: 'camera permission denied — allow it for this origin and try again' }));
+    else if (s.camera === 'held') note.append(el('span', { class: 'hfx-note bad', text: 'camera held by another app or tab (the overlay, OBS, a call) — stop it there first' }));
+    else if (s.camera === 'insecure') note.append(el('span', { class: 'hfx-note bad', text: 'camera needs a secure origin (127.0.0.1 / localhost / https)' }));
+    else if (s.camera === 'error') note.append(el('span', { class: 'hfx-note bad', text: s.streamError || 'camera error' }));
+    else {
+      const page = pageSummary();
+      if (page.tone === 'ok') note.append(el('span', { class: 'hfx-note', text: 'the overlay is tracking; its picture stays in its page (one camera, one document)' }));
+      else note.append(el('span', { class: 'hfx-note', text: 'no camera here. The preview opens it on your click only; nothing is captured before that.' }));
+    }
+    note.append(
+      actionButton({ label: s.camera === 'on' ? 'Stop preview' : 'Start preview', variant: 'btn btn-sm hfx-preview-btn', run: async () => (s.camera === 'on' ? stopPreview() : startPreview()), onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
+      actionButton({ label: s.synthetic ? 'Stop synthetic' : 'Synthetic', variant: 'btn btn-sm', run: async () => { s.synthetic = !s.synthetic; s.syntheticAt = performance.now(); synthMotion.push(null, performance.now()); }, onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
+    );
+    card.append(head, stage, el('div', { class: 'panel-body hfx-preview-body' }, note));
+
+    // After the DOM is in place: attach the live stream and start the landmark loop.
+    queueMicrotask(() => {
+      if (!videoEl) return;
+      if (stream) videoEl.srcObject = stream;
+      drawLandmarks();
+    });
+    return card;
+  }
+
+  function sideColumn(reg, enabled) {
+    const col = el('div', { class: 'hfx-side' });
+    col.append(trackingCard(), cameraCard(), lookCard());
+    return col;
+  }
+
+  function trackingCard() {
+    const card = el('section', { class: 'panel' });
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Tracking' })));
+    const body = el('div', { class: 'panel-body hfx-fields' });
+    body.append(
+      row('effects enabled', switchControl('enabled', s.settings.enabled !== false, async (v) => { await patch('enabled', v); if (v) await bus('tracking.toggle').catch(() => {}); })),
+      row('mirror', switchControl('mirror', s.settings.mirror !== false, async (v) => patch('mirror', v))),
+      row('debug overlay', switchControl('debugOverlay', s.settings.debugOverlay === true, async (v) => patch('debugOverlay', v))),
+      row('sensitivity', sliderControl('sensitivity', s.settings.sensitivity ?? 1, 0.4, 2, 0.05, (v) => patch('sensitivity', v))),
+      row('travel', sliderControl('bufferScroll', s.settings.bufferScroll ?? 0.35, 0, 1.5, 0.05, (v) => patch('bufferScroll', v))),
+      row('next-effect gesture', selectControl('nextGesture', s.settings.nextGesture || 'bothFingertips', (s.status?.settings?.nextGesture?.values) || ['bothFingertips', 'palmTouch', 'bothPalmsUp', 'fist'], (v) => patch('nextGesture', v))),
+      row('resolution', selectControl('resolution', s.settings.resolution || '720p', (s.status?.settings?.resolution?.values) || ['480p', '720p', '1080p'], (v) => patch('resolution', v))),
+    );
+    card.append(body);
+    return card;
+  }
+
+  function cameraCard() {
+    const card = el('section', { class: 'panel' });
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Camera' })));
+    const body = el('div', { class: 'panel-body hfx-fields' });
+    const list = el('div', { class: 'hfx-devices' });
+    if (s.devices === 'insecure') list.append(el('div', { class: 'hfx-note bad', text: 'device list unavailable: insecure origin' }));
+    else if (!s.deviceList.length) list.append(el('div', { class: 'hfx-note', text: s.devices === 'unlabelled' ? 'camera found, name hidden until this origin has permission' : 'no camera listed yet — press Refresh' }));
+    else {
+      for (const d of s.deviceList) {
+        const chosen = (s.settings.deviceId || '') === d.deviceId || (!s.settings.deviceId && d.deviceId === s.deviceList[0].deviceId);
+        const b = el('button', { type: 'button', class: 'hfx-dev', 'data-chosen': chosen ? 'true' : 'false', title: d.label || d.deviceId });
+        b.append(el('span', { class: 'hfx-dev-name', text: d.label || `camera ${d.deviceId.slice(0, 8) || '?'}` }), el('span', { class: 'hfx-dev-id mono', text: d.deviceId ? d.deviceId.slice(0, 10) : '' }));
+        b.addEventListener('click', async () => {
+          await patch('deviceId', d.deviceId || '');
+          if (s.camera === 'on') await startPreview(d.deviceId);
+          else render();
+        });
+        list.append(b);
+      }
+    }
+    body.append(
+      el('div', { class: 'hfx-row' }, el('span', { class: 'hfx-label', text: 'device' }), list),
+      el('div', { class: 'hfx-row hfx-actions' },
+        actionButton({ label: 'Refresh list', variant: 'btn btn-sm', run: listDevices, onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+        actionButton({ label: 'Clear device', variant: 'btn btn-quiet btn-sm', run: () => patch('deviceId', ''), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+      ),
+      el('p', { class: 'hfx-help', text: 'The camera opens only on Start preview (or the overlay’s own Start). One document holds the camera at a time; the overlay holds it while it is tracking.' }),
+    );
+    card.append(body);
+    return card;
+  }
+
+  function lookCard() {
+    const card = el('section', { class: 'panel' });
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Overlay' }), el('span', { class: 'panel-hint mono', text: (s.status && s.status.page) || '/handfx' })));
+    const body = el('div', { class: 'panel-body' });
+    const link = el('a', { class: 'gen-link hfx-open', href: (s.status && s.status.page) || '/handfx', target: '_blank', rel: 'noopener' },
+      el('span', { class: 'gen-link-title', text: 'Open the overlay page' }), el('span', { class: 'gen-link-go', text: 'open ↗', 'aria-hidden': 'true' }));
+    body.append(link, el('p', { class: 'hfx-help', text: 'In OBS, add this URL as a Browser Source at the canvas size. The page hides its controls in OBS; ?controls=1 shows them.' }));
+    card.append(body);
+    return card;
+  }
+
+  function effectsCard(reg) {
+    const card = el('section', { class: 'panel hfx-effects' });
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Effect registry' }), el('span', { class: 'panel-hint', text: `${(s.settings.effects || []).length} in the list of ${reg.length}` })));
+    const grid = el('div', { class: 'hfx-effect-grid' });
+    for (const e of reg) {
+      const on = effectEnabled(e.id);
+      const intensity = Number((s.settings.intensity || {})[e.id] ?? 1);
+      const live = s.live.get(e.id);
+      const tile = el('div', { class: 'hfx-effect', 'data-on': on ? 'true' : 'false', 'data-known': e.known ? 'true' : 'false' });
+      const top = el('div', { class: 'hfx-effect-top' });
+      top.append(
+        el('span', { class: 'hfx-effect-name', text: e.title || e.id }),
+        el('span', { class: 'hfx-effect-id mono', text: e.id }),
+        live ? el('span', { class: 'hfx-pill', 'data-tone': 'ok', text: 'live' }) : null,
+        e.known ? null : el('span', { class: 'hfx-pill', 'data-tone': 'bad', text: 'not in this build' }),
+      );
+      const mid = el('div', { class: 'hfx-effect-meta' },
+        el('span', { class: 'hfx-note', text: e.gesture ? `gesture: ${e.gesture}` : '' }),
+        el('span', { class: 'hfx-note mono', text: e.from ? `port: ${e.from}` : '' }),
+      );
+      const controls = el('div', { class: 'hfx-effect-controls' },
+        switchControl(`fx-${e.id}`, on, async () => toggleEffect(e.id), { disabled: !e.known }),
+        el('span', { class: 'hfx-sep' }),
+        actionButton({ label: 'earlier', title: 'move earlier in the list', variant: 'btn btn-sm', run: () => moveEffect(e.id, -1), onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
+        actionButton({ label: 'later', title: 'move later in the list', variant: 'btn btn-sm', run: () => moveEffect(e.id, 1), onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
+      );
+      const slider = sliderControl(`intensity-${e.id}`, intensity, 0, 2, 0.05, (v) => setIntensity(e.id, v), { disabled: !e.known || !on });
+      controls.append(slider);
+      tile.append(top, mid, controls);
+      grid.append(tile);
+    }
+    card.append(grid);
+    return card;
+  }
+
+  function footer(reg) {
+    const card = el('section', { class: 'panel hfx-footer' });
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Bus' }), el('span', { class: 'panel-hint mono', text: (s.status && s.status.cmds ? s.status.cmds.join(' · ') : '') })));
+    const body = el('div', { class: 'panel-body hfx-footer-body' });
+    const log = el('div', { class: 'hfx-log' });
+    body.append(el('p', { class: 'hfx-help', text: 'Commands go to the page over the handfx channel; the page reports the effect it reached. A deck key sends the same POST /api/handfx/cmd.' }), log);
+    card.append(body);
+    return card;
+  }
+
+  /* -------------------------------------------------------------- controls */
+
+  function row(label, control) {
+    return el('div', { class: 'hfx-row' }, el('span', { class: 'hfx-label', text: label }), control);
+  }
+
+  function switchControl(id, value, onChange, opts = {}) {
+    const input = el('input', { type: 'checkbox', id, disabled: opts.disabled ? true : undefined });
+    input.checked = Boolean(value);
+    input.addEventListener('change', async () => {
+      input.disabled = true;
+      try {
+        await onChange(input.checked);
+      } catch (err) {
+        input.checked = !input.checked;
+        push(`“${id}”: ${err.message}`, 'bad');
+      }
+      input.disabled = false;
+      render();
+    });
+    return el('label', { class: 'switch hfx-switch' }, input, el('span', { class: 'switch-track' }));
+  }
+
+  function sliderControl(id, value, min, max, step, onChange, opts = {}) {
+    const wrap = el('span', { class: 'hfx-slider' });
+    const range = el('input', { type: 'range', id: `set-${id}`, min, max, step, value: String(value), disabled: opts.disabled ? true : undefined });
+    const num = el('span', { class: 'mono hfx-slider-value', text: Number(value).toFixed(2) });
+    range.addEventListener('input', () => {
+      num.textContent = Number(range.value).toFixed(2);
+    });
+    range.addEventListener('change', async () => {
+      try {
+        const out = await onChange(Number(range.value));
+        if (out && out.before !== undefined && Number(out.before) === Number(range.value)) num.textContent = Number(range.value).toFixed(2);
+      } catch (err) {
+        push(`“${id}”: ${err.message}`, 'bad');
+      }
+    });
+    wrap.append(range, num);
+    return wrap;
+  }
+
+  function selectControl(id, value, values, onChange) {
+    const sel = el('select', { class: 'hfx-select', id });
+    for (const v of values) {
+      const o = el('option', { value: v, text: v });
+      if (v === value) o.selected = true;
+      sel.append(o);
+    }
+    sel.addEventListener('change', async () => {
+      try {
+        await onChange(sel.value);
+        render();
+      } catch (err) {
+        push(`“${id}”: ${err.message}`, 'bad');
+        render();
+      }
+    });
+    return sel;
+  }
+
+  /* -------------------------------------------------------------- landmark loop */
+
+  let landmarkRaf = 0;
+  function drawLandmarks() {
+    cancelAnimationFrame(landmarkRaf);
+    const canvas = root.querySelector('.hfx-landmarks');
+    if (!canvas) return;
+    const ctx2d = canvas.getContext('2d');
+    const tick = () => {
+      const stageEl = canvas.parentElement;
+      const w = (canvas.width = stageEl.clientWidth);
+      const h = (canvas.height = stageEl.clientHeight);
+      ctx2d.clearRect(0, 0, w, h);
+      const p = s.page;
+      const fresh = p && Date.now() - (p.at || 0) < 6000;
+      if (s.camera === 'on' && videoEl && videoEl.videoWidth) {
+        // The pane draws its own landmarks when it holds the camera (same 21-point skeleton);
+        // there is no detector in the pane, so it shows the picture only and says so in the HUD.
+        ctx2d.font = '11px ui-monospace, monospace';
+        ctx2d.fillStyle = 'rgba(255,255,255,.75)';
+        ctx2d.fillText('preview only — detection runs in the overlay', 8, h - 8);
+      } else if (fresh && p.tracking) {
+        ctx2d.font = '11px ui-monospace, monospace';
+        ctx2d.fillStyle = 'rgba(255,255,255,.75)';
+        ctx2d.fillText(`overlay reports: ${p.hands} hand${p.hands === 1 ? '' : 's'} · ${p.gesture || 'none'}`, 8, h - 8);
+      }
+      if (s.synthetic && s.camera !== 'on') drawSynthetic(ctx2d, w, h);
+      else synthMotion.push(null, performance.now());
+      landmarkRaf = requestAnimationFrame(tick);
+    };
+    landmarkRaf = requestAnimationFrame(tick);
+  }
+
+  const synthMotion = new Motion();
+  function drawSynthetic(c2d, w, h) {
+    if (!s.syntheticAt) s.syntheticAt = performance.now();
+    const t = (performance.now() - s.syntheticAt) / 1000;
+    const hands = syntheticHands(t);
+    const centre = hands.length ? { x: hands[0].landmarks[9].x, y: hands[0].landmarks[9].y } : null;
+    const mv = synthMotion.push(centre, performance.now());
+    const result = classifyPose(hands, { swipe: mv });
+    s.syntheticReading = result.gesture;
+    c2d.save();
+    c2d.font = '11px ui-monospace, monospace';
+    c2d.fillStyle = 'rgba(242,193,78,.9)';
+    c2d.fillText(`SYNTHETIC REPLAY — not a camera, not tracking · ${result.gesture}`, 8, 16);
+    const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+    for (const hand of hands) {
+      const lm = hand.landmarks;
+      c2d.strokeStyle = hand.handedness === 'Right' ? 'rgba(111,179,255,.85)' : 'rgba(177,140,255,.85)';
+      c2d.lineWidth = 2;
+      c2d.beginPath();
+      for (const [a, b] of CONN) {
+        c2d.moveTo(lm[a].x * w, lm[a].y * h);
+        c2d.lineTo(lm[b].x * w, lm[b].y * h);
+      }
+      c2d.stroke();
+      c2d.fillStyle = 'rgba(255,255,255,.85)';
+      for (const p of lm) {
+        c2d.beginPath();
+        c2d.arc(p.x * w, p.y * h, 2.4, 0, Math.PI * 2);
+        c2d.fill();
+      }
+    }
+    c2d.restore();
+  }
+
+  /* -------------------------------------------------------------- wiring */
+
+  const unsub = events.subscribe('handfx', (msg) => {
+    if (!msg) return;
+    // The overlay's honest status line is `events.emit('handfx', 'page', {...})`, which reaches
+    // the bus as `{event: 'page', channel: 'handfx', data}` (a command frame carries `cmd`).
+    if (msg.event === 'page') {
+      const data = msg.data || {};
+      s.page = data;
+      if (data.effect) {
+        if (!s.live.has(data.effect)) s.live.set(data.effect, { startedAt: Date.now(), hands: data.hands, gesture: data.gesture });
+      }
+      render();
+      return;
+    }
+    // Any command can have changed the document (mirror.toggle writes it), and the pane's own
+    // controls rendered from the old values would then lie: re-read rather than guess.
+    if (msg.cmd) scheduleRefresh();
+  });
+
+  let refreshTimer = 0;
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => refresh().then(render).catch(() => {}), 150);
+  }
+
+  try {
+    await refresh();
+  } catch (err) {
+    root.append(banner(`Cannot read /api/handfx/status: ${err.message}`, 'bad'));
+    return () => unsub();
+  }
+  await listDevices();
+  render();
+
+  signal.addEventListener('abort', () => {
+    cancelAnimationFrame(landmarkRaf);
+    clearTimeout(refreshTimer);
+    stopPreview();
+    unsub();
+  });
+
+  return () => {
+    cancelAnimationFrame(landmarkRaf);
+    clearTimeout(refreshTimer);
+    stopPreview();
+    unsub();
+  };
+}
+

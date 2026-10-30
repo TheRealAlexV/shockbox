@@ -1,0 +1,227 @@
+/* Hand FX pane.
+ *
+ * Composed from the shell's tokens (public/src/shell.css): same hairlines, same mono micro-labels,
+ * same accent, same .panel chrome. This file only names the handfx-specific blocks: the preview
+ * stage (camera + landmark canvas + HUD), the effect registry grid and the honest-state pills.
+ *
+ * The stage keeps a 16:9 box so a 720p camera is neither stretched nor letterboxed off the frame;
+ * it never claims to show what the overlay sees, because one camera can only belong to one page.
+ */
+
+.hfx { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+.hfx-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: var(--hair) solid var(--line);
+  background: var(--bg-1);
+}
+
+.hfx-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.hfx-head-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 320px; }
+.hfx-head-right { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.hfx-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+.hfx-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-4); flex: 0 0 auto; }
+.hfx-dot[data-tone='ok'] { background: var(--ok); box-shadow: 0 0 6px rgba(73, 209, 138, 0.6); }
+.hfx-dot[data-tone='idle'] { background: var(--fg-4); }
+.hfx-state { font-size: 11px; color: var(--fg-2); white-space: nowrap; }
+.hfx-sep { width: 1px; height: 14px; background: var(--line-2); flex: 0 0 auto; margin: 0 2px; }
+.hfx-list {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hfx-strip { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.hfx-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border: var(--hair) solid var(--line-2);
+  background: var(--bg-2);
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.hfx-pill[data-tone='ok'] { color: var(--ok); border-color: rgba(73, 209, 138, 0.4); }
+.hfx-pill[data-tone='warn'] { color: var(--warn); border-color: rgba(242, 193, 78, 0.4); }
+.hfx-pill[data-tone='bad'] { color: var(--bad); border-color: rgba(255, 93, 106, 0.45); }
+.hfx-pill[data-tone='info'] { color: var(--info); border-color: rgba(111, 179, 255, 0.35); }
+
+.hfx-banner {
+  padding: 8px 12px;
+  border: var(--hair) solid var(--line-2);
+  border-left: 2px solid var(--warn);
+  background: rgba(242, 193, 78, 0.06);
+  color: var(--fg-2);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.hfx-banner[data-tone='bad'] { border-left-color: var(--bad); background: rgba(255, 93, 106, 0.07); color: #ff8b94; }
+.hfx-banner[data-tone='info'] { border-left-color: var(--info); background: rgba(111, 179, 255, 0.06); }
+
+.hfx-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+}
+.hfx-side { display: flex; flex-direction: column; min-width: 0; position: sticky; top: 0; }
+
+/* ------------------------------------------------------------------ preview */
+
+.hfx-preview > .panel-body { padding: 10px 12px 12px; }
+
+.hfx-stage {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background:
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 8px),
+    var(--bg);
+  border-bottom: var(--hair) solid var(--line);
+  overflow: hidden;
+}
+.hfx-stage[data-state='on'] { background: var(--bg); }
+
+.hfx-video,
+.hfx-landmarks {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.hfx-video { object-fit: cover; transform: scaleX(-1); opacity: 0; }
+.hfx-stage[data-state='on'] .hfx-video { opacity: 1; }
+.hfx-landmarks { z-index: 2; pointer-events: none; }
+
+.hfx-hud {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  z-index: 3;
+  display: flex;
+  gap: 6px;
+}
+.hfx-preview-body { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.hfx-preview-body .hfx-note { flex: 1 1 260px; }
+.hfx-preview-btn { min-width: 104px; }
+
+.hfx-note { font-size: 10.5px; line-height: 1.45; color: var(--fg-3); }
+.hfx-note.ok { color: var(--ok); }
+.hfx-note.bad { color: var(--bad); }
+
+/* ------------------------------------------------------------------ side cards */
+
+.hfx-fields { display: flex; flex-direction: column; gap: 9px; }
+.hfx-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.hfx-label {
+  flex: 0 0 96px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.hfx-actions { flex-wrap: wrap; }
+.hfx-switch { flex: 0 0 auto; }
+.hfx-slider { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
+.hfx-slider input[type='range'] { flex: 1 1 auto; min-width: 60px; accent-color: var(--accent); }
+.hfx-slider-value { font-size: 10px; color: var(--fg-3); flex: 0 0 30px; text-align: right; }
+.hfx-select {
+  height: 24px;
+  min-width: 0;
+  flex: 1 1 auto;
+  border: var(--hair) solid var(--line-2);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 11px;
+  padding: 0 6px;
+}
+.hfx-help { margin: 2px 0 0; font-size: 10px; line-height: 1.5; color: var(--fg-4); }
+
+.hfx-devices { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-width: 0; }
+.hfx-dev {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  border: var(--hair) solid var(--line);
+  background: var(--bg);
+  color: var(--fg-2);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+.hfx-dev:hover { border-color: var(--line-3); color: var(--fg); }
+.hfx-dev[data-chosen='true'] { border-color: var(--accent); color: var(--fg); background: var(--accent-soft); }
+.hfx-dev-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
+.hfx-dev-id { font-size: 9px; color: var(--fg-4); flex: 0 0 auto; max-width: 70px; overflow: hidden; text-overflow: ellipsis; }
+
+.hfx-open { display: inline-flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; }
+
+/* ------------------------------------------------------------------ registry */
+
+.hfx-effect-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1px;
+  background: var(--line);
+}
+.hfx-effect {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-1);
+  min-width: 0;
+}
+.hfx-effect[data-on='false'] { background: var(--bg); }
+.hfx-effect[data-on='false'] .hfx-effect-name { color: var(--fg-3); }
+.hfx-effect[data-known='false'] { box-shadow: inset 2px 0 0 var(--bad); }
+.hfx-effect-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.hfx-effect-name { font-size: 12px; color: var(--fg); }
+.hfx-effect-id { font-size: 9.5px; color: var(--fg-4); }
+.hfx-effect-meta { display: flex; flex-direction: column; gap: 2px; }
+.hfx-effect-meta .hfx-note { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hfx-effect-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* ------------------------------------------------------------------ bus log */
+
+.hfx-log { display: flex; flex-direction: column; gap: 2px; max-height: 92px; overflow: hidden; }
+.hfx-log-row {
+  display: flex;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--fg-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hfx-log-row[data-tone='ok'] { color: var(--fg-2); }
+.hfx-log-row[data-tone='warn'] { color: var(--warn); }
+.hfx-log-row[data-tone='bad'] { color: var(--bad); }
+.hfx-log-t { color: var(--fg-4); flex: 0 0 auto; }
+.hfx-log-empty { font-size: 10px; color: var(--fg-4); }
+
+@media (max-width: 1180px) {
+  .hfx-body { grid-template-columns: minmax(0, 1fr); }
+  .hfx-side { position: static; }
+}

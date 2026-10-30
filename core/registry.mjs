@@ -120,8 +120,12 @@ export async function loadRegistry({ modulesDir, stateDir, ctx, log }) {
         // A page that loads classic scripts relative to itself (`<script src="sim.js">`) also
         // claims its URL as a directory for those files, so no second route per file is needed.
         // `static` names the directory, relative to the module (default: the page's own).
-        staticDir: p.file && !p.prefix ? (p.static ? path.join(dir, p.static) : path.dirname(path.join(dir, p.file))) : null,
+        staticDir: p.file && !p.prefix ? (p.static ? path.join(dir, p.static) : path.dirname(path.join(dir, p.file))) : dir,
         prefix: Boolean(p.prefix),
+        // Response headers this page (and its sibling files) must be served with — the shape is
+        // generic: a module that needs cross-origin isolation declares COOP/COEP here and core
+        // serves them without knowing which module asked. Shape-validated by the HTTP server.
+        headers: p.headers && typeof p.headers === 'object' ? p.headers : null,
       }));
       entry.status = 'up';
       log.info(`module ${id} v${manifest.version || '?'} up (${entry.routes.length} routes, ${entry.pages.length} pages)`);

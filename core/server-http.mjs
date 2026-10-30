@@ -105,7 +105,45 @@ function applyCors(res) {
   res.setHeader('access-control-max-age', '600');
 }
 
-export function serveFile(res, file, { cache = 'no-store', method = 'GET' } = {}) {
+/**
+ * Headers a module asks a page (and the page's sibling files) to be served with — generic, so a
+ * module that needs cross-origin isolation declares COOP/COEP and core never names it:
+ * A page declares them in its module.json entry,
+ * `"headers": {"cross-origin-embedder-policy": "require-corp"}`; they apply to the page file and
+ * to its sibling files (its scripts, styles), and `GET /api/<id>/routes` reports them per page.
+ * Core validates the shape and refuses what it writes itself; it never knows who asked.
+ */
+export function cleanHeaders(headers) {
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return null;
+  const out = {};
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = String(rawName).toLowerCase();
+    const value = String(rawValue ?? '');
+    // A module may not override framing/CORS/body bookkeeping: those are the server's.
+    if (!/^[a-z0-9-]+$/.test(name)) continue;
+    if (CORE_HEADERS.has(name)) continue;
+    if (/[\r\n]/.test(value)) continue;
+    out[name] = value;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+const CORE_HEADERS = new Set([
+  'content-type',
+  'content-length',
+  'cache-control',
+  'access-control-allow-origin',
+  'access-control-allow-methods',
+  'access-control-allow-headers',
+  'access-control-allow-credentials',
+  'access-control-expose-headers',
+  'access-control-max-age',
+  'transfer-encoding',
+  'connection',
+  'date',
+]);
+
+export function serveFile(res, file, { cache = 'no-store', method = 'GET', headers = null } = {}) {
   let st;
   try {
     st = fs.statSync(file);
@@ -115,13 +153,30 @@ export function serveFile(res, file, { cache = 'no-store', method = 'GET' } = {}
   if (!st.isFile()) return false;
   const ext = path.extname(file).toLowerCase();
   const type = MIME[ext] || 'application/octet-stream';
-  res.writeHead(200, { 'content-type': type, 'cache-control': cache, 'content-length': st.size, 'access-control-allow-origin': '*' });
+  res.writeHead(200, {
+    ...(cleanHeaders(headers) || {}),
+    'content-type': type,
+    'cache-control': cache,
+    'content-length': st.size,
+    'access-control-allow-origin': '*',
+  });
   if (method === 'HEAD') {
     res.end();
     return true;
   }
+  // `cache` is set on writeHead above: a module can make its runtime cacheable (the hand FX
+  // wasm is ~10 MB and must not be fetched per page load); `no-store` is the default.
   fs.createReadStream(file).pipe(res);
   return true;
+}
+
+/**
+ * Serve a file through a prefix a module declared (`mountPrefix` + `mountFile` on its API). The
+ * module resolves and validates the path itself — core only knows the prefix and that the module
+ * owns what is under it.
+ */
+export function serveMountFile(res, req, file, { cache = 'no-store', headers = null } = {}) {
+  return serveFile(res, file, { cache, method: req.method, headers });
 }
 
 /** Resolve a path inside root, refusing traversal and symlink escapes. */
@@ -183,7 +238,14 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
         return sendJson(res, 200, {
           ok: true,
           id: entry.id,
-          pages: entry.pages.map((x) => ({ route: x.route, title: x.title || null })),
+          pages: entry.pages.map((x) => ({
+            route: x.route,
+            title: x.title || null,
+            // The response headers core is serving this page (and its siblings) with, so a
+            // module can be checked for a cross-origin-isolation policy it declared.
+            headers: x.headers || null,
+            cache: x.cache || null,
+          })),
           routes: entry.routes.map((x) => ({ method: x.method || 'ANY', path: x.path })),
         });
       }
@@ -253,6 +315,29 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
           return undefined;
         }
       }
+      // A module that serves a directory of assets (a vendored runtime, a model) declares
+      // `mountPrefix` and `mountFile` in its API: any GET under `/api/<id>/<prefix>` is handed to
+      // `mountFile(req, res, url, filePath)` with the path after the prefix, so core needs no rule
+      // about what the files are. Anything the module returns is sent as JSON, as everywhere.
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        for (const entry of registry.entries || []) {
+          if (entry.status !== 'up') continue;
+          const prefix = entry.api && entry.api.mountPrefix;
+          if (!prefix) continue;
+          const base = `/api/${entry.id}/`;
+          if (!p.startsWith(base)) continue;
+          const head = prefix.replace(/^\/+/, '').replace(/\/+$/, '');
+          const rest = p.slice(base.length);
+          if (rest !== head && !rest.startsWith(`${head}/`)) continue;
+          const filePath = rest === head ? '' : rest.slice(head.length + 1);
+          if (!filePath) continue;
+          const handler = typeof entry.api.mountFile === 'function' ? entry.api.mountFile : null;
+          if (!handler) continue;
+          const out = await handler(req, res, url, filePath);
+          if (out !== undefined && !res.headersSent) sendJson(res, 200, out);
+          return undefined;
+        }
+      }
       const hit = registry.match(req.method, p);
       if (hit) {
         const body = req.method === 'GET' || req.method === 'HEAD' ? null : await readJson(req).catch((e) => {
@@ -267,14 +352,24 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
       // ---- module pages ----------------------------------------------------
       const page = registry.page(p);
       if (page && (req.method === 'GET' || req.method === 'HEAD')) {
-        if (page.page.file && serveFile(res, page.page.file, { cache: page.page.cache || 'no-store', method: req.method })) return undefined;
+        if (
+          page.page.file &&
+          serveFile(res, page.page.file, { cache: page.page.cache || 'no-store', method: req.method, headers: page.page.headers })
+        ) {
+          return undefined;
+        }
         return sendJson(res, 404, { ok: false, error: `page file missing for ${p}` });
       }
       // A page's sibling files (its classic scripts, images) under the page's own URL.
       const sibling = registry.pageFile ? registry.pageFile(p) : null;
-      if (sibling && (req.method === 'GET' || req.method === 'HEAD')) {
+      if (sibling && sibling.page.staticDir && (req.method === 'GET' || req.method === 'HEAD')) {
         const f = safeJoin(sibling.page.staticDir, sibling.rel);
-        if (f && serveFile(res, f, { cache: sibling.page.cache || 'no-store', method: req.method })) return undefined;
+        if (
+          f &&
+          serveFile(res, f, { cache: sibling.page.cache || 'no-store', method: req.method, headers: sibling.page.headers })
+        ) {
+          return undefined;
+        }
       }
 
       // ---- shell + shared static ------------------------------------------

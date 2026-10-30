@@ -11,7 +11,8 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "node server.mjs --port 8973 --state ./state-dev",
-    "test": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/api-smoke.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs && node test/wall-browser.mjs",
-    "test:wall": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs"
+    "test": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/api-smoke.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs && node test/wall-browser.mjs && node test/handfx-browser.mjs",
+    "test:wall": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs",
+    "test:handfx": "node test/handfx-browser.mjs"
   }
 }

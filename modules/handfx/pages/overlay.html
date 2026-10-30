@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <base href="/handfx/" />
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ShockBox · Hand FX</title>
+    <link rel="stylesheet" href="style.css" />
+    <style>
+      /* OBS renders this page at exactly the browser source size and needs a transparent
+         background: only the effects (and, in debug mode, the camera) are opaque. */
+      html,
+      body {
+        background: transparent;
+      }
+    </style>
+  </head>
+  <body data-tracking="false" data-synthetic="false" data-isolated="unknown">
+    <div id="stage">
+      <canvas id="fx"></canvas>
+    </div>
+    <div id="badge" hidden></div>
+    <div id="banner" hidden></div>
+    <div id="controls">
+      <button type="button" data-act="start" data-state="off">Start camera</button>
+      <button type="button" data-act="synthetic">Synthetic</button>
+      <button type="button" data-act="stop">Stop</button>
+    </div>
+    <script type="module" src="js/overlay/main.js"></script>
+  </body>
+</html>
