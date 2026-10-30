@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { launchChrome, CHROME } from './lib/chrome.mjs';
 
 // Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
 const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
@@ -25,7 +26,6 @@ const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
 const argUrl = (process.argv.find((a) => a.startsWith('--url=')) || '').slice(6);
-const CHROME = process.env.CHROME || ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'].find((p) => fs.existsSync(p));
 if (!CHROME) {
   console.error('panes-notify-dialogs: no chrome/chromium found (set CHROME=)');
   process.exit(2);
@@ -73,36 +73,12 @@ async function startServer() {
 }
 
 async function startChrome() {
-  const port = await freePort();
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-chrome-'));
-  const child = spawn(
-    CHROME,
-    [
-      '--headless=new',
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${profile}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-gpu',
-      '--hide-scrollbars',
-      '--window-size=1440,900',
-      'about:blank',
-    ],
-    { stdio: 'ignore' },
-  );
-  const base = `http://127.0.0.1:${port}`;
-  for (let i = 0; i < 80; i++) {
-    await sleep(150);
-    try {
-      const j = await fetch(`${base}/json/list`).then((r) => r.json());
-      const page = j.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-      if (page) return { wsUrl: page.webSocketDebuggerUrl, stop: () => child.kill('SIGKILL'), base };
-    } catch {
-      /* starting */
-    }
-  }
-  child.kill('SIGKILL');
-  throw new Error('chrome did not expose a page target');
+  const { wsUrl, stop } = await launchChrome({
+    size: [1440, 900],
+    profilePrefix: 'sb-chrome-',
+    extraArgs: ['--disable-gpu'],
+  });
+  return { wsUrl, stop };
 }
 
 function connect(wsUrl) {

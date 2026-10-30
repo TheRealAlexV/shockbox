@@ -27,11 +27,11 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { launchChrome, CHROME } from './lib/chrome.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
 const argUrl = (process.argv.find((a) => a.startsWith('--url=')) || '').slice(6);
-const CHROME = process.env.CHROME || ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'].find((p) => fs.existsSync(p));
 if (!CHROME) {
   console.error('handfx-browser: no chrome/chromium found (set CHROME=)');
   process.exit(2);
@@ -171,38 +171,20 @@ async function waitFor(c, expression, ms = 10000) {
 
 async function main() {
   const srv = await startServer();
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-chrome-'));
-  const port = await freePort();
   // Fake camera: Chrome's own test-pattern device, so getUserMedia succeeds without a real one.
   // --use-fake-ui-for-media-stream answers the permission prompt the way a person would.
-  const chrome = spawn(
-    CHROME,
-    [
-      '--headless=new',
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${profile}`,
-      '--no-first-run',
-      '--no-default-browser-check',
+  const { devtools, stop: stopChrome } = await launchChrome({
+    size: [1280, 720],
+    profilePrefix: 'sb-chrome-',
+    extraArgs: [
       '--use-angle=swiftshader',
       '--enable-unsafe-swiftshader',
       '--use-fake-device-for-media-stream',
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
-      '--window-size=1280,720',
-      'about:blank',
     ],
-    { stdio: ['ignore', 'ignore', 'ignore'] },
-  );
-  const devtools = `http://127.0.0.1:${port}`;
-  for (let i = 0; i < 50; i++) {
-    await sleep(200);
-    try {
-      await fetch(`${devtools}/json/version`);
-      break;
-    } catch {
-      /* not up yet */
-    }
-  }
+  });
+  const chromePort = new URL(devtools).port;
   const c = await cdp(devtools);
   const consoleLines = [];
   await c.send('Runtime.enable');
@@ -278,7 +260,7 @@ async function main() {
       // whatever tab is already open. `/json/new?about:blank` hands back the real target id.
       const listener = JSON.parse(await (await fetch(`${devtools}/json/new?about:blank`, { method: 'PUT' })).text());
       const listenerTarget = listener.id;
-      const listenerWs = `ws://127.0.0.1:${port}/devtools/page/${listenerTarget}`;
+      const listenerWs = `ws://127.0.0.1:${chromePort}/devtools/page/${listenerTarget}`;
       const attach = { sessionId: null };
       {
         const lws = new WebSocket(listenerWs);
@@ -834,7 +816,7 @@ async function main() {
     const pageErr = await evaluate(c, 'window.__err || null');
     ok('no uncaught page exceptions', !pageErr, pageErr || '');
   } finally {
-    chrome.kill('SIGKILL');
+    stopChrome();
     await new Promise((r) => setTimeout(r, 150));
     srv.stop();
   }

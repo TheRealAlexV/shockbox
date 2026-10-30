@@ -30,6 +30,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { launchChrome, CHROME } from './lib/chrome.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -41,7 +42,6 @@ const VERBOSE = argv.includes('--verbose');
 const STRICT = argv.includes('--strict');
 const OUT = path.resolve(argOf('--out') || fs.mkdtempSync(path.join(os.tmpdir(), 'handfx-visual-')));
 fs.mkdirSync(OUT, { recursive: true });
-const CHROME = process.env.CHROME_PATH || ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'].find((p) => fs.existsSync(p));
 
 // Thresholds. The page background is near-black and the effects are light, so a mean-luminance
 // floor catches "something drew", and the coverage floor catches "only the badge drew".
@@ -201,34 +201,18 @@ async function startServer() {
 }
 
 async function startChrome() {
-  const port = await freePort();
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'handfx-visual-chrome-'));
-  const child = spawn(CHROME, [
-    '--headless=new',
-    `--remote-debugging-port=${port}`,
-    `--user-data-dir=${profile}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--use-angle=swiftshader',
-    '--enable-unsafe-swiftshader',
-    '--use-fake-device-for-media-stream',
-    '--use-fake-ui-for-media-stream',
-    '--hide-scrollbars',
-    '--window-size=1280,720',
-    'about:blank',
-  ], { stdio: 'ignore' });
-  const devtools = `http://127.0.0.1:${port}`;
-  for (let i = 0; i < 60; i++) {
-    await sleep(200);
-    try {
-      await fetch(`${devtools}/json/version`);
-      return { devtools, child };
-    } catch {
-      /* not up yet */
-    }
-  }
-  child.kill('SIGKILL');
-  throw new Error('chrome did not expose devtools');
+  const launched = await launchChrome({
+    size: [1280, 720],
+    profilePrefix: 'handfx-visual-chrome-',
+    extraArgs: [
+      '--use-angle=swiftshader',
+      '--enable-unsafe-swiftshader',
+      '--use-fake-device-for-media-stream',
+      '--use-fake-ui-for-media-stream',
+    ],
+  });
+  // A page created by the launcher is already listed; keep the callers' { devtools, child } shape.
+  return { devtools: launched.devtools, child: launched.child, stop: launched.stop, wsUrl: launched.wsUrl };
 }
 
 async function cdpPage(devtools) {
@@ -731,7 +715,7 @@ try {
   results.push(ok('every effect reports its own numbers', shots.every((s) => s.m.mean > 0 || s.id === 'x'), shots.map((s) => `${s.id} ${s.m.mean}/${s.m.cover}%`).join(' · ')));
 } finally {
   page?.close();
-  chrome.child.kill('SIGKILL');
+  chrome.stop();
   srv.child.kill('SIGKILL');
 }
 

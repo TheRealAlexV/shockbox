@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { launchChrome, CHROME } from './lib/chrome.mjs';
 
 // Screenshots and scratch dirs go to $SHOCKBOX_SCRATCH (a per-machine convention), else the OS temp dir.
 const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
@@ -21,7 +22,6 @@ const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
 const argUrl = (process.argv.find((a) => a.startsWith('--url=')) || '').slice(6);
-const CHROME = process.env.CHROME || ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'].find((p) => fs.existsSync(p));
 if (!CHROME) {
   console.error('wall-browser: no chrome/chromium found (set CHROME=)');
   process.exit(2);
@@ -127,33 +127,11 @@ async function waitFor(c, expression, ms = 8000) {
 
 async function main() {
   const srv = await startServer();
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-chrome-'));
-  const port = await freePort();
-  const chrome = spawn(
-    CHROME,
-    [
-      '--headless=new',
-      `--remote-debugging-port=${port}`,
-      `--user-data-dir=${profile}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-gpu',
-      '--hide-scrollbars',
-      '--window-size=1280,720',
-      'about:blank',
-    ],
-    { stdio: ['ignore', 'ignore', 'ignore'] },
-  );
-  const devtools = `http://127.0.0.1:${port}`;
-  for (let i = 0; i < 50; i++) {
-    await sleep(200);
-    try {
-      await fetch(`${devtools}/json/version`);
-      break;
-    } catch {
-      /* not up yet */
-    }
-  }
+  const { devtools, stop: stopChrome } = await launchChrome({
+    size: [1280, 720],
+    profilePrefix: 'sb-chrome-',
+    extraArgs: ['--disable-gpu'],
+  });
   const c = await cdp(devtools);
   const consoleLines = [];
   await c.send('Runtime.enable');
@@ -334,7 +312,7 @@ async function main() {
     console.log(`     agent diag: ${diag}`);
   } finally {
     c.close();
-    chrome.kill('SIGKILL');
+    stopChrome();
     srv.stop();
     await new Promise((r) => setTimeout(r, 150));
     if (srv.log) fs.writeFileSync(path.join(SCRATCH, 'wall-browser-server.log'), srv.log.join(''));
