@@ -1055,6 +1055,9 @@ export class FxRenderer {
    * anchor) actually is.
    */
   render(now, view = {}) {
+    // Per-pass durations for the last frame, in ms, keyed by checkpoint name. Diagnostics only:
+    // a pass whose cost changes with the GL backend shows up here first.
+    this.passCost = {};
     if (!this.supported) return;
     const gl = this.gl;
     // A context can be lost (a GPU reset, a driver crash) without the page noticing: report it,
@@ -1070,12 +1073,22 @@ export class FxRenderer {
     this.view = view;
     // Read once per stage only when asked (the browser test sets debugGl): getError() forces a
     // pipeline sync, and a per-frame sync is exactly what a stream overlay cannot afford.
+    const tPass = { start: 0 };
     const checkpoint = (stage) => {
+      // Cost per stage, always collected (a Date.now pair is free next to a draw): a pass that
+      // changes cost with the GL backend names itself here, before anything looks wrong on screen.
+      const nowMs = performance.now();
+      if (stage === 'begin') tPass.start = nowMs;
+      else if (tPass.start) {
+        this.passCost[stage] = Math.round((nowMs - tPass.start) * 100) / 100;
+        tPass.start = nowMs;
+      }
       if (!this.debugGl) return;
       const e = gl.getError();
       if (e) this.debugLog.push(`${stage}:0x${e.toString(16)}`);
     };
     this._resize();
+    checkpoint('begin');
     checkpoint('resize');
     const t = (now - this.time0) / 1000;
     const dt = this._last ? Math.min(0.1, (now - this._last) / 1000) : 0.016;
@@ -1361,9 +1374,11 @@ export class FxRenderer {
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         return true;
       }
-      const [u, v] = toUv(c);
+      // Slime is field space (see SLIME: `vec2 p = field()`, `u_radius` a field radius); aura and
+      // portal read `field()` too, so a uv centre here put the goo half a frame to the left and
+      // its radius in uv units made it large enough to read as a veil. One space for all four.
+      set('u_center', (l) => gl.uniform2f(l, c.x * (this.w / this.h), 1 - c.y));
       const r = id === 'aura' ? handRadius * 5 : id === 'portal' ? handRadius * 6 : handRadius;
-      set('u_center', (l) => gl.uniform2f(l, u, v));
       set('u_radius', (l) => gl.uniform1f(l, r));
       energySet();
     } else if (id === 'frost') {

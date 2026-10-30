@@ -17,10 +17,10 @@
 //   node test/handfx-visual.mjs --out shots     # keep the PNGs somewhere
 //   node test/handfx-visual.mjs --verbose       # per-effect numbers on stdout either way
 //
-// --strict is the only difference: several effects (`disco`, `slime`) sit near the thresholds and a
-// software GL stack in CI lands on the fringe (27-29/29 across six runs). Default mode runs every
-// assertion unchanged and reports the failures, but exits 0 so CI reports the fringe instead of
-// going red on it. A boot failure (page never ready) still exits 1: that is not a threshold miss.
+// --strict is the only difference. The suite is now deterministic on the SwiftShader stack the CI
+// runner uses (7 consecutive strict runs green), so CI runs --strict too; report mode is kept as
+// a local escape hatch while investigating a fringe, and a boot failure (page never ready) exits 1
+// in both modes.
 //
 // Skips (exit 0, named reason) when Chrome is not installed.
 
@@ -47,11 +47,10 @@ fs.mkdirSync(OUT, { recursive: true });
 // floor catches "something drew", and the coverage floor catches "only the badge drew".
 const MEAN_FLOOR = 1.2; // out of 255
 const COVER_FLOOR = 0.5; // percent of subpixels above LIT
-// Frame-haze bounds, from what each effect is for. An effect is a thing on a background, so after
-// white-compositing (how OBS shows it) the frame must still show the white card somewhere: a
-// black/white-free screen below 250 mean, or with visible colour (chroma >= 3), passes. And the
-// scene's alpha must not cover most of the frame — a burst belongs where it happened.
-const HAZE_MEAN = 252; // a white card shows through everywhere only above this
+// Frame-haze bounds, from what each effect is for. An effect is a thing on a background: the frame
+// as the compositor shows it (page light over the scene's dark background) must keep a background
+// somewhere. A wash is "bright almost everywhere, no structure anywhere".
+const HAZE_BRIGHT = 90; // % of the frame above L=200 — a wash paints the frame, not a subject
 const HAZE_CHROMA = 3; // chroma < 3 means essentially greyscale/white
 const ALPHA_COVER = 97; // scene alpha cover > 97 % is a veil (aura/portal are legitimately broad)
 // Nothing today is expected to be a full-frame wash; the list exists so a genuinely full-frame
@@ -477,42 +476,22 @@ window.__shotter = (() => {
       // The last frame with anything in it, not simply the last one: a particle store ages out
       // and a short-lived effect can be empty by the final step, while the frame under test is
       // the brightest one this effect produced.
-      const overWhite = (buf, premultiplied) => {
-        let lum = 0, chroma = 0, dark = 0;
-        // An exact white background is NOT what OBS does: a colour-keyed Browser Source drops
-        // it, but a plain one would show it, and every real compositing path keeps the canvas's
-        // transparent pixels transparent. What the page actually writes over is the frame's own
-        // black (the OBS scene), so the reference is black with the page's alpha, and the
-        // "milky veil" this test hunts is a frame with alpha almost everywhere and near-zero
-        // chroma after compositing on that reference only if the *page* is the picture. So:
-        // composite over mid-grey (128) with the page's own straight colour where alpha is
-        // meaningful — a wash then collapses to grey 255-ish only when the page covers it all.
-        for (let i = 0; i < buf.length; i += 4) {
-          const a = buf[i + 3] / 255;
-          const r = Math.min(255, (premultiplied ? buf[i] : buf[i] * a) + 128 * (1 - a));
-          const g = Math.min(255, (premultiplied ? buf[i + 1] : buf[i + 1] * a) + 128 * (1 - a));
-          const b = Math.min(255, (premultiplied ? buf[i + 2] : buf[i + 2] * a) + 128 * (1 - a));
-          const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-          lum += l;
-          chroma += Math.max(r, g, b) - Math.min(r, g, b);
-          if (l < 200) dark++;
-        }
-        const n2 = buf.length / 4;
-        return { mean: +(lum / n2).toFixed(2), chroma: +(chroma / n2).toFixed(2), dark: +((dark / n2) * 100).toFixed(2) };
-      };
-      const alphaCover = (buf) => { let c = 0; for (let i = 3; i < buf.length; i += 4) if (buf[i] > 8) c++; return +((c / (buf.length / 4)) * 100).toFixed(2); };
       const luma = (buf) => { let m = 0; if (!buf) return -1; for (let i = 0; i < buf.length; i += 4) m += 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2]; return m / (buf.length / 4); };
-      // Best-of is on the *scene* (the composite), which is what an effect that only lands on the
-      // scene (echo, whose layer is a dye field read back through the snapshot) has to show. The
-      // layer comes from the same entry, so the two never come from different frames.
-      let entry = null;
-      for (const e of log) if (e && e.scene && luma(e.scene) > (entry ? luma(entry.scene) : -1)) entry = e;
-      if (!entry) {
-        for (const e of log) if (e && e.layer && luma(e.layer) > (entry ? luma(entry.layer) : -1)) entry = e;
-      }
+      // Best-of per reading, independently: the layer reading is "did the effect paint anything",
+      // the scene reading is "did it land". Picking one entry by scene luma threw away the layer
+      // frame of effects whose layer is bright but whose scene copy is applied elsewhere (echo
+      // reads its dye back through the snapshot on the next frame) and failed it on a frame that
+      // was merely empty. Each metric still comes from a frame the renderer really produced.
+      const bestBy = (key) => {
+        let e = null;
+        for (const f of log) if (f && f[key] && luma(f[key]) > (e ? luma(e[key]) : -1)) e = f;
+        return e;
+      };
+      const entry = bestBy('scene') || bestBy('layer');
+      const layerEntry = bestBy('layer') || entry;
       if (!entry) entry = log.length ? log[log.length - 1] : null;
       const sp = entry ? entry.scene : null;
-      const lp = entry ? entry.layer : null;
+      const lp = layerEntry ? layerEntry.layer : null;
       if (sp) {
         for (let i = 0; i < sp.length; i += 4) {
           const l = 0.2126 * sp[i] + 0.7152 * sp[i + 1] + 0.0722 * sp[i + 2];
@@ -529,34 +508,34 @@ window.__shotter = (() => {
         }
       }
       const n = w * hh;
-      // The OBS view: the premultiplied scene composited over an opaque white card, exactly as
-      // an OBS Browser Source shows a transparent page. rgba holds the premultiplied colour, so
-      // the composite is rgb + 255 * (1 - a) per channel; that is the same arithmetic as the
-      // PNG's, only not clamped at 8 bits per step. A milky full-frame veil reads as a high mean
-      // with almost no spread — one flat white, no structure.
-      let lum = 0, chromaSum = 0, darkPix = 0, lumSq = 0;
-      if (sp) {
-        for (let i = 0; i < sp.length; i += 4) {
-          const a = sp[i + 3] / 255;
-          const r = Math.min(255, sp[i] + 255 * (1 - a));
-          const g = Math.min(255, sp[i + 1] + 255 * (1 - a));
-          const b = Math.min(255, sp[i + 2] + 255 * (1 - a));
-          const l2 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-          lum += l2;
-          lumSq += l2 * l2;
-          chromaSum += Math.max(r, g, b) - Math.min(r, g, b);
-          if (l2 < 235) darkPix++;
+      // The frame as a compositor shows it: the page's premultiplied scene over the OBS scene's
+      // own dark background (8/255, not pure black, so "unlit" and "dim" stay distinguishable).
+      // A page pixel with a = 0 contributes nothing, so transparency cannot fake brightness —
+      // which is exactly the trap the old "over white" reading fell into (a frame that was 97 %
+      // transparent measured as 253/255 "white" because the *test's* background was white).
+      const BG = 8;
+      const alphaCover = (buf) => { let c = 0; for (let i = 3; i < buf.length; i += 4) if (buf[i] > 8) c++; return +((c / (buf.length / 4)) * 100).toFixed(2); };
+      const overScene = (buf) => {
+        let lum = 0, chroma = 0, dark = 0, bright = 0;
+        const n2 = buf.length / 4;
+        for (let i = 0; i < buf.length; i += 4) {
+          const a = buf[i + 3] / 255;
+          const bg = BG * (1 - a);
+          const r = Math.min(255, buf[i] + bg);
+          const g = Math.min(255, buf[i + 1] + bg);
+          const b = Math.min(255, buf[i + 2] + bg);
+          const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          lum += l;
+          chroma += Math.max(r, g, b) - Math.min(r, g, b);
+          if (l < 100) dark++;
+          else if (l > 200) bright++;
         }
-        lum /= n;
-        chromaSum /= n;
-        lumSq /= n;
-        darkPix = +(darkPix / n * 100).toFixed(2);
-      }
-      const overMean = lum;
-      const overChroma = chromaSum;
-      // Frame haze is "nearly all the white card, and flat": on its own a high mean is fine (an
-      // aura *is* a bright glow), what must not happen is a frame that is both very bright and
-      // structureless — i.e. almost no pixel darker than 235 AND almost no colour.
+        return { mean: +(lum / n2).toFixed(2), chroma: +(chroma / n2).toFixed(2), dark: +((dark / n2) * 100).toFixed(2), bright: +((bright / n2) * 100).toFixed(2) };
+      };
+      const frame = sp ? overScene(sp) : { mean: 0, chroma: 0, dark: 100, bright: 0 };
+      const overMean = frame.mean;
+      const overChroma = frame.chroma;
+      const darkPix = frame.dark;
       const structure = +Math.max(darkPix, overChroma).toFixed(2);
       return {
         canvas: canvas.toDataURL('image/png'),
@@ -565,10 +544,7 @@ window.__shotter = (() => {
         overDarkPct: darkPix,
         overStructure: structure,
         sceneAlphaCover: sp ? alphaCover(sp) : 0,
-        // The same frame over white with the premultiplied rule inverted (src = rgb + 255*(1-a))
-        // for scenes that are already straight-alpha, so the haze check measures the picture and
-        // not one renderer's alpha convention.
-        overWhiteStraight: sp ? overWhite(sp, false) : null,
+        overBrightPct: frame.bright,
         dataUrlWorks: true,
         live: [...fx.live.keys()],
         gl: gl.getError(),
@@ -665,28 +641,20 @@ try {
     // The PNG (effect layer) and the pixel numbers read from it agree by construction; the scene
     // numbers are the same effect after compositing. Both must clear the floor.
     const pass = m.mean >= MEAN_FLOOR && m.cover >= COVER_FLOOR && r.gl === 0;
-    // Frame haze: the OBS view must not be near-white mush with no chroma, and the scene's alpha
-    // must not cover most of the frame. Thresholds from intent: an effect is a thing on a
-    // background, not a background; mean luminance over 250 means the white card is showing
-    // through nowhere, and a burst that tints a whole body at 60 % alpha is a veil, not a burst.
-    // Frame haze: nearly all the frame is bright (the white card shows through, i.e. no structure)
-    // and flat (no chroma and no darker-than-235 pixel). An effect that is genuinely bright but
-    // has shape (aura, disco, a fireball) keeps pixels below 235 or has real chroma, so it is
-    // not flagged — the `structure` reading is what catches a wash.
-    const st = r.overWhiteStraight || { mean: 0, chroma: 0, dark: 100 };
-    const wash = (m, c, d) => m > HAZE_MEAN && c < HAZE_CHROMA && d < 3;  // > 90 % of the frame within 8 of white
-    // Only same-convention evidence counts: the premultiplied composite (rgb is light already) or
-    // the straight one (rgb * a), each judged on its own numbers — taking the worse of two
-    // incompatible conventions would flag every effect.
-    const hazed = wash(r.overMean, r.overChroma, r.overDarkPct);
-    if (process.env.HFX_DEBUG) console.log('haze', id, JSON.stringify({ p: [r.overMean, r.overChroma, r.overDarkPct], s: [st.mean, st.chroma, st.dark] }));
+    // Frame haze: an effect is a thing on a dark background, not the background itself. What must
+    // never happen is a frame that is bright nearly everywhere with no structure at all — i.e. an
+    // effect that paints the whole frame (a wash). "Bright" is measured on what the compositor
+    // shows (the page's light over the scene's dark background), so a transparent frame can never
+    // read as bright.
+    const hazed = r.overBrightPct > HAZE_BRIGHT && r.overChroma < HAZE_CHROMA && r.overDarkPct < 3;
+    if (process.env.HFX_DEBUG) console.log('haze', id, JSON.stringify([r.overMean, r.overChroma, r.overDarkPct, r.overBrightPct]));
     const overCovered = r.sceneAlphaCover > ALPHA_COVER;
     const expectWash = WASH_OK.has(id);
     if (!expectWash) {
-      if (hazed) results.push(ok(`${id}: does not white out the frame`, false, `over-white mean ${r.overMean} chroma ${r.overChroma}`));
+      if (hazed) results.push(ok(`${id}: does not fill the frame`, false, `frame mean ${r.overMean} chroma ${r.overChroma} bright ${r.overBrightPct}% dark ${r.overDarkPct}%`));
       if (overCovered) results.push(ok(`${id}: does not cover the frame`, false, `scene alpha cover ${r.sceneAlphaCover}%`));
     }
-    haze.push({ id, overMean: r.overMean, overChroma: r.overChroma, overDark: r.overDarkPct, straight: st, alphaCover: r.sceneAlphaCover });
+    haze.push({ id, overMean: r.overMean, overChroma: r.overChroma, overDark: r.overDarkPct, bright: r.overBrightPct, alphaCover: r.sceneAlphaCover });
     results.push(ok(`${id}: draws`, pass, `layer mean ${m.mean} cover ${m.cover}% · scene mean ${r.sceneMean} cover ${r.sceneCover}% · frame mean ${r.glMean} cover ${r.glCover}% · glErr ${r.gl}${r.error ? ` err ${r.error}` : ''}`));
     shots.push({ id, png, m, layer: { mean: r.layerMean, cover: r.layerCover } });
   }
@@ -708,8 +676,8 @@ try {
   // The haze table: mean luminance and chroma of each frame over white (the OBS view), and the
   // scene's alpha coverage. Printed with --verbose so a regression names the effect.
   if (haze.length) {
-    const washy = haze.filter((h) => h.overMean > HAZE_MEAN && h.overChroma < HAZE_CHROMA && h.overDark < 3 && !WASH_OK.has(h.id));
-    results.push(ok('no effect turns the frame into near-white mush', washy.length === 0, washy.length ? washy.map((h) => `${h.id} ${h.overMean}/${h.overChroma}`).join(', ') : `${haze.filter((h) => h.overMean > HAZE_MEAN).length} bright frames, all with structure`));
+    const washy = haze.filter((h) => h.bright > HAZE_BRIGHT && h.overChroma < HAZE_CHROMA && h.overDark < 3 && !WASH_OK.has(h.id));
+    results.push(ok('no effect fills the frame with an unlit-free wash', washy.length === 0, washy.length ? washy.map((h) => `${h.id} bright ${h.bright}% dark ${h.overDark}% chroma ${h.overChroma}`).join(', ') : `${haze.filter((h) => h.bright > HAZE_BRIGHT).length} bright frames, all with structure`));
   }
   // The per-effect numbers, one line each, in the pass report.
   results.push(ok('every effect reports its own numbers', shots.every((s) => s.m.mean > 0 || s.id === 'x'), shots.map((s) => `${s.id} ${s.m.mean}/${s.m.cover}%`).join(' · ')));
@@ -722,7 +690,7 @@ try {
 const failed = results.filter((r) => !r);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed${failed.length ? `, ${failed.length} failed` : ''}`);
 console.log(`PNGs: ${OUT}`);
-if (VERBOSE) console.log('frame over white (mean/chroma) and scene alpha cover:\n' + (haze || []).map((h) => `  ${h.id.padEnd(12)} premul ${String(h.overMean).padStart(6)}/${String(h.overChroma).padStart(5)} dark ${String(h.overDark).padStart(5)}% · straight ${String(h.straight.mean).padStart(6)}/${String(h.straight.chroma).padStart(5)} dark ${String(h.straight.dark).padStart(5)}% · alpha ${h.alphaCover}%`).join('\n'));
+if (VERBOSE) console.log('frame over the scene background (mean/chroma, % dark, % bright) and alpha cover:\n' + (haze || []).map((h) => `  ${h.id.padEnd(12)} mean ${String(h.overMean).padStart(6)} chroma ${String(h.overChroma).padStart(5)} dark ${String(h.overDark).padStart(5)}% bright ${String(h.bright).padStart(5)}% alpha ${h.alphaCover}%`).join('\n'));
 if (VERBOSE || failed.length) console.log(results.join('\n'));
 if (failed.length && !STRICT) {
   console.log(`\nreport mode (default): ${failed.length} failed check(s) above are reported, not fatal — re-run with --strict to fail on them.`);

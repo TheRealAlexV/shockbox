@@ -680,8 +680,11 @@ async function main() {
       // Fresh t0 so the ring is a few hundred ms old, not two minutes (the page's clock starts at
       // load; an effect triggered later must be aged against a t0 near now).
       fx.live.get('electroshock').t0 = performance.now();
-      fx.render(performance.now(), view);
-      fx.render(performance.now() + 260, view);
+      // A fresh t0 puts the shader at age ~0; the ring's radius runs with age (u_radius = expand
+      // rate * age), so the frames must be aged forward from t0 for the ring to be anywhere.
+      const t0 = fx.live.get('electroshock').t0;
+      fx.render(t0, view);
+      fx.render(t0 + 260, view);
       const gl = fx.gl;
       const px = (x, y) => { const b = new Uint8Array(4); gl.readPixels(Math.floor(fx.w * x), Math.floor(fx.h * y), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b); return b[3]; };
       return { live: fx.live.has('electroshock'), gl: gl.getError(), snap: Boolean(fx.snapTex), centre: px(0.5, 0.5), edge: px(0.82, 0.5) };

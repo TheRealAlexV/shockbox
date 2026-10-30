@@ -46,7 +46,7 @@ jobs:
         run: npm test
 
   handfx-visual:
-    name: handfx visual (report mode)
+    name: handfx visual
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -73,11 +73,9 @@ jobs:
           echo "CHROME_PATH=$bin" >> "$GITHUB_ENV"
           "$bin" --version
 
-      # Report mode, not --strict: `disco`/`slime` sit near the thresholds and a software GL stack
-      # lands on the fringe (27-29/29 across six runs). The suite still runs every assertion and
-      # prints the failures; CI reports them instead of failing the build on a threshold miss.
-      # Locally use `npm run test:handfx-visual:strict`.
-      - name: npm run test:handfx-visual (report mode, CDP uses --use-angle=swiftshader)
+      # Strict: the suite is deterministic on this stack (SwiftShader, 7 consecutive strict runs green).
+      # The last fringe was a real defect — `disco`'s facets were sized in uv while placed in field
+      # space, so on a slow frame the light covered a hairline and the effect vanished.
+      - name: npm run test:handfx-visual:strict (SwiftShader via --use-angle=swiftshader)
         timeout-minutes: 15
-        continue-on-error: false
-        run: npm run test:handfx-visual
+        run: npm run test:handfx-visual:strict

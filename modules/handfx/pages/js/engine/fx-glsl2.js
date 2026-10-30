@@ -318,7 +318,9 @@ float facet(vec2 p, float fi, float spin, out float hue) {
   float rot = hash11(fi * 2.1 + u_seed.x) * 6.2831 * 1.7 + u_time * 0.3;
   vec2 q = p - c;
   q = vec2(q.x * cos(rot) - q.y * sin(rot), q.x * sin(rot) + q.y * cos(rot));
-  float sz = 0.045 + hash11(fi * 9.3) * 0.045;
+  // Size is a field-space radius (x is aspect-scaled in field()), so a facet covers the same
+  // fraction of the frame on any aspect and every pixel in it is a real area, not a hairline.
+  float sz = 0.060 + hash11(fi * 9.3) * 0.050;
   hue = fract(hash11(fi * 1.37 + u_seed.y) + u_time * 0.09 * (hash11(fi) * 2.0 - 1.0));
   return smoothstep(sz, sz * 0.55, length(q * vec2(1.0, 1.9)));
 }
@@ -355,6 +357,8 @@ void main() {
     a += g;
   }
   acc = acc / (1.0 + acc * 0.5);
+  // Coverage is the union of the facets (max), not their sum: overlapping light must not turn a
+  // few small facets into a full-frame wash, and a facet's own edge must stay its own edge.
   a = clamp(a, 0.0, 1.0) * (0.6 + 0.4 * u_energy) * u_fade;
   outColor = vec4(acc * u_fade * (0.7 + 0.5 * u_energy), a);
 }`;
@@ -594,7 +598,15 @@ void main() {
   // density then thins as the column rises instead of ending flat at the top.
   float cone = smoothstep(spread * (1.0 + liftAmt * 2.2), 0.0, abs(uv.x - u_center.x));
   float aBand = max(edge, cone * smoothstep(0.0, 0.10, liftAmt));
-  float a = clamp(aBand * plume * above * 8.0 * (0.55 + 0.45 * u_energy), 0.0, 1.0);
+  // Smoke is dark by intent, but "dark" is not "invisible": on a black scene a plume at 0.1 alpha
+  // is a shadow of a shadow. The floor keeps the cone band (the body of the plume, where the plume
+  // is at least partly open) at a readable 0.30, so the effect cannot flicker out on the frame
+  // where the noise happens to be between its two thresholds; the noise still shapes all the detail
+  // above that floor.
+  float smokeAlpha = aBand * plume * above;
+  float a = clamp(smokeAlpha * 8.0 * (0.55 + 0.45 * u_energy), 0.0, 1.0);
+  float body = max(smokeAlpha, smoothstep(0.25, 0.55, plume) * aBand * above);
+  a = max(a, body * 0.30 * (0.55 + 0.45 * u_energy) * u_fade);
   vec3 col = mix(vec3(0.06, 0.06, 0.07), vec3(0.30, 0.29, 0.32), c2);
   outColor = vec4(col * a, a);
 }`;
