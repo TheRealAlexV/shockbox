@@ -1,5 +1,8 @@
 import { HttpError } from '../../core/id.mjs';
 import { createNotifyState } from './state.mjs';
+import { createSounds } from './audio.mjs';
+import { audioListRoute, checkTone } from './audio-routes.mjs';
+import { DEFAULT_NOTIFY_TONE } from './sound.mjs';
 
 // Notifications module — the toast side of the popup feature.
 //
@@ -15,12 +18,40 @@ export default {
 
   channels: ['notifications'],
 
+  // The clip route is origin-level (`/audio/<name>`), not under `/api/<id>/`: core's static
+  // fallback answers anything under `/api/<id>/audio/` before module routes are consulted, so a
+  // module route there would be unreachable. The handler is registered by server.mjs through
+  // `core.extraRoutes` — see `coreExtraRoutes()` below; core never names this module.
+  coreExtraRoutes(ctx) {
+    const mod = this;
+    return [
+      { method: 'GET', path: /^\/audio\/([^/]+)$/, handler: (req, res, url, body, params) => mod.sounds.serve(req, res, params[0]) },
+      { method: 'HEAD', path: /^\/audio\/([^/]+)$/, handler: (req, res, url, body, params) => mod.sounds.serve(req, res, params[0]) },
+    ];
+  },
+
   init(ctx) {
     this.ctx = ctx;
     this.state = createNotifyState({ settings: ctx.settings, log: ctx.log });
     this.settings = ctx.settings;
     this.pool = ctx.pool;
     this.events = ctx.events;
+    // The tone clips. notifications owns the directory (core passes it in `ctx.sounds`); the
+    // dialogs module picks the same instance up off `ctx.notifications.sounds`, so the
+    // directory and the name rules live in exactly one place. `ctx.notifications` is the registry.
+    // The registry keeps one instance per module id: created after init, or the earlier one.
+    const reg = ctx.notifications && ctx.notifications();
+    const entry = reg && reg.byId && reg.byId.get('notifications');
+    this.sounds = (entry && entry.api && entry.api.sounds) || createSounds(ctx);
+    this.audio = this.sounds;
+    if (!this.sounds.dir.root) ctx.log.warn('sounds: no directory configured — tones are silent');
+    else if (this.sounds.dir.list() === null) ctx.log.warn(`sounds: ${this.sounds.dir.root} is not readable — tone list empty`);
+    // A document written on another machine can name a clip that is not here. Keep the operator's
+    // choice on disk and say so; a write through PATCH /settings is what validates for real.
+    const keep = [DEFAULT_NOTIFY_TONE];
+    if (!this.sounds.has(this.settings.get('tone'), keep)) {
+      ctx.log.warn(`sounds: tone "${this.settings.get('tone')}" is not in ${this.sounds.dir.root || '(no directory)'} — it will not play`);
+    }
     // Auto-close is a visual timer, so it is swept here and never persisted.
     this.timer = setInterval(() => {
       try {
@@ -60,6 +91,7 @@ export default {
     const mod = this;
     const S = () => mod.settings;
     return [
+      audioListRoute(mod),
       {
         method: 'GET',
         path: '/live',
@@ -112,19 +144,24 @@ export default {
           const eligible = mod.pool.eligible('notification', 'storm');
           if (!eligible.length) throw new HttpError(409, 'no notification message is checked for storm');
           const total = mode === 'fill' ? Math.min(eligible.length, 12) : count;
+          // `handle` is read inside the first synchronous `tick()` below, so it is declared first
+          // (as `undefined` it would throw a TDZ ReferenceError from a const/let further down).
+          let handle = null;
           let spawned = 0;
           const tick = () => {
-            if (spawned >= total) return clearInterval(handle);
+            if (spawned >= total) { if (handle) clearInterval(handle); return; }
             const spec = mode === 'fill' ? eligible[spawned % eligible.length] : eligible[Math.floor(Math.random() * eligible.length)];
             const out = mod.spawnSpec(spec, 'storm');
-            if (out.error) return clearInterval(handle);
+            if (out.error) { if (handle) clearInterval(handle); return; }
             spawned++;
             mod.push('server');
-            if (spawned >= total) clearInterval(handle);
+            if (spawned >= total && handle) clearInterval(handle);
           };
           tick();
-          const handle = setInterval(tick, mode === 'fill' ? 90 : interval);
-          handle.unref?.();
+          if (spawned < total) {
+            handle = setInterval(tick, mode === 'fill' ? 90 : interval);
+            handle.unref?.();
+          }
           return { ok: true, mode, total };
         },
       },
@@ -134,6 +171,9 @@ export default {
         handler(req, res, url, body) {
           // Validation is the schema's job (enum values, min/max from module.json); a second
           // hardcoded allow-list here drifted from it within a day, so there is only one.
+          // The one exception is `tone`: its legal values are the files on disk, not a manifest
+          // enum, so it is checked here against the same list /api/audio/list reports.
+          checkTone(mod, body);
           const changed = S().patch(body || {});
           if (changed.length) {
             mod.push('control');

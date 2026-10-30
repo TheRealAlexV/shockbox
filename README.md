@@ -1,55 +1,87 @@
 # ShockBox
 
-One served app for OBS stream overlays, built as a set of **modules**:
+One Node process that serves OBS stream overlays, built as **modules**. No build step, no npm
+dependency: `server.mjs` imports only Node built-ins.
 
-| module | what it is |
+| module | what it does now |
 |---|---|
-| `wall` | the LED wall renderer (one page, 16:9, with a 9:16 fence toggle) + the wall admin pane |
-| `notifications` | small toasts (iOS / Android / Win11 / macOS styles) with a message pool, queue and repeats |
-| `dialogs` | fake Windows / macOS alert dialogs with buttons, cursor and storm mode |
-| `handfx` | hand tracking in the browser (MediaPipe) + layered WebGL2 effects (fireball on an open palm, lightning between two hands' fingertips, spark ring, embers, smoke) + the handfx pane |
+| `wall` | LED wall renderer for a 1280×720 OBS browser source (`/wall/render`): LED grid, patterns, presets, blackout, bloom/streak/flare grading, a movable 9:16 fence, text slots, and a ratio key that a live forcing scene (Desktop, Theater, PHub, OnlyFans, CominOut) overrides to 16:9 |
+| `notifications` | the 405×720 toast strip (`/notify`) in iOS / Android / Win11 / macOS looks, spawned from the shared message pool, stacked and auto-closing, with a per-banner tone |
+| `dialogs` | fake Win95 / Win11 / macOS alert dialogs (`/dialogs`) with buttons and storm mode, from the same pool (message `kind` decides which module renders it), with a per-alert tone |
+| `handfx` | hand tracking and WebGL2 effects (`/handfx`) plus a body-tracking page (`/handfx/body`): 23 effects, MediaPipe in the page, everything computed client-side |
 
-Every front end is served by ShockBox itself. Adding a feature is adding a folder under `modules/`
-— there is no core edit, no build step for a module, and no dependency to install.
+Hand FX effects (23): `fireball`, `lightning`, `sparkring`, `embers`, `smoke`, `aura`, `wires`,
+`frost`, `portal`, `disco`, `slime`, `inkflow`, `shatter`, `cyber`, `bloomlife`, `echo`,
+`bodyonfire`, `bodysmoke`, `frozenbody`, `edit`, `electroshock`, `meteor`, `shoot`. Body tracking
+(pose + selfie segmenter on `/handfx/body`) drives `bodyonfire`, `bodysmoke` and `frozenbody`. All
+rendering happens in the page: no camera frame, landmark, mask or per-frame state reaches the
+server; the page posts a status line (`/ack`) only.
+
+The message pool (`/api/pools`, core) is shared by notifications and dialogs.
+
+Tones: both popup modules play clips from one directory — `--sounds <dir>`, env
+`SHOCKBOX_SOUNDS`, config `soundsDir`, default `C:\OBS\Sounds\SoundBoard` — served at
+`/audio/<name>` with an extension allow-list and a traversal guard, listed at
+`/api/{notifications,dialogs}/audio/list`. The player (`modules/notifications/sound.mjs`) runs in
+the page: one `<audio>` per clip, created only when `sound` is on, played once for each newly
+seen banner/alert at `volume`, retried once after an autoplay block. Defaults:
+notifications `sound:true`, `volume:0.6`, `tone:iphone_16_messege_tone.mp3`; dialogs
+`sound:true`, `volume:0.6`, `tone:error_CDOxCYm.mp3`.
 
 ## Run
 
 ```bash
-node server.mjs                      # http://127.0.0.1:8972 — admin shell at /#/wall
+node server.mjs                       # http://127.0.0.1:8972 — admin shell at /
+node server.mjs --sounds ~/Sounds     # a sound directory other than C:\OBS\Sounds\SoundBoard
 SHOCKBOX_PORT=8973 node server.mjs --state ./state-dev
-npm test                             # every gate: unit, contract, and real-browser checks
+npm run dev                           # port 8973, state ./state-dev
 ```
 
-`npm test` runs the gates in order and exits non-zero on the first failure:
+The admin shell lists each module's pane; pages are served by ShockBox itself — point an OBS
+browser source at `http://127.0.0.1:8972/<page>`.
 
-| gate | what it proves |
+## Tests
+
+`npm test` runs the gates in order and stops on the first failure. Each boots its own server and
+its own headless Chrome on free ports, so it is safe while the live server runs.
+
+| gate | proves |
 |---|---|
-| `test/ratio.mjs` | the scene-forced ratio state machine (entry, leave, restore, reconnect) |
+| `test/ratio.mjs` | the scene-forced ratio state machine: entry, leave, restore, reconnect |
 | `test/ratio-commands.mjs` | `ratio.toggle` / `ratio.force16x9` are answered by the server, not forwarded to a page |
-| `test/api-smoke.mjs` | core routes ahead of module routes, the shared pool, `/events` channels, module assets |
-| `test/pane-browser.mjs` | the wall admin pane in headless Chrome: real pointer drag, controls that write the schema, no console errors |
-| `test/pane-drag.mjs` | the drag gesture end to end: window moves, snaps to whole cells, commits to the state file, grip keeps 9:16 |
-| `test/wall-browser.mjs` | the render page in headless Chrome: engine mounts, bus commands land, the 9:16 fence reaches the shader, frames animate |
-| `test/handfx-browser.mjs` | the handfx overlay + pane in headless Chrome with a fake camera: COOP/COEP isolation, `/api/handfx/*`, bus dispatch, the effect registry, all five effects rendering with no GL error |
+| `test/api-smoke.mjs` | core routes ahead of module routes, the pool, `/events` channels, module assets |
+| `test/pane-browser.mjs` | the wall pane in headless Chrome: renders, no overflow, a refused ratio toggle surfaces the truth |
+| `test/pane-drag.mjs` | a real pointer drag of the fence: snaps to cells, previews live, commits to `/render` |
+| `test/wall-browser.mjs` | the render page: engine mounts, bus commands land, the fence reaches the shader, frames animate |
+| `test/handfx-browser.mjs` | handfx page + pane with a fake camera: COOP/COEP isolation, `/api/handfx/*`, bus dispatch, effect registry, zero hands on the fake device, no GL error |
+| `test/panes-notify-dialogs.mjs` | the Notifications and Alerts panes in the shell, painting from the server, not local state |
+| `test/sound.mjs` | the tone path: a temp sound directory is listed and served, traversal and bad extensions are refused, a missing directory lists empty and 404s, and in headless Chrome a new banner/alert builds one `<audio>` and calls `play()` once while a page load over existing banners and `sound:false` stay silent |
 
-They boot their own server and their own Chrome on free ports — no rig, no OBS and no
-`state/` needed, so they are safe to run while the live server is up.
+Separate gates (not in `npm test`):
 
-On the rig it runs as the scheduled task `ShockBox-Server` via `ShockBox.cmd start`.
+- `npm run test:handfx` — `test/handfx-browser.mjs` alone.
+- `npm run test:handfx-visual` — renders every one of the 23 effects on the real page, reads the
+  canvas back, and fails if an effect draws nothing, if two effects draw the same thing, or if an
+  effect violates the frame-haze bounds: composited over a white card it must not become a
+  near-white flat wash (mean > 252 with chroma < 3 and < 3 % dark pixels), and its scene alpha must
+  not cover more than 97 % of the frame (`smoke`, `disco`, `inkflow`, `echo`, `edit`, `embers`,
+  `wires`, `shoot` are exempt by name).
+- `npm run test:sound` — `test/sound.mjs` alone.
+- `node test/glsl-check.mjs` — compiles the wall engine shaders in headless Chrome.
 
-## Layout
+## Adding a module
 
-```
-server.mjs            process entry: config, listeners, shutdown
-core/                 registry, events, store, settings, obs client, http server — no module knowledge
-modules/<id>/         module.json + server.js + ui/ + pages/ + its own data directory under state/
-public/               admin shell: rail, hash router, settings form, health drawer (no build step)
-state/<id>/           live data, outside the code tree, never in git
-docs/                 ARCHITECTURE.md and one CONTRACT-*.md per module
-test/                 the gates above — plain node scripts, each booting what it needs
-```
+A module is a folder under `modules/` with a `module.json` and an entry file. No core edit, no
+build. Fields, hooks, bus and steps: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#6-adding-a-module).
+Per-module API contracts: `docs/CONTRACT-{wall,notifications,dialogs,handfx}.md`.
+
+## Deploy
+
+On the rig: `C:\OBS\ShockBox`, started by the scheduled task `ShockBox-Server`
+(`ShockBox.cmd start`), listening on port 8972.
 
 ## Licence
 
-PolyForm Noncommercial 1.0.0 — free to use, fork and share noncommercially. Commercial use
-requires a licence from the author.
+PolyForm Noncommercial License 1.0.0 (Copyright Alexander Vanino, 2026) — see [`LICENSE`](LICENSE).
+Commercial use requires a paid licence: alex@vaninollc.com. The vendored MediaPipe runtime under
+`modules/handfx/vendor/` is Apache-2.0 and keeps its own licence.

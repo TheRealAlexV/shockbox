@@ -47,6 +47,9 @@ const cfg = readConfig();
 const PORT = Number(arg('port', process.env.SHOCKBOX_PORT || process.env.PORT || cfg.port || 8972));
 const HOST = arg('host', process.env.SHOCKBOX_HOST || cfg.host || '127.0.0.1');
 const STATE_DIR = path.resolve(arg('state', process.env.SHOCKBOX_STATE || cfg.stateDir || path.join(HERE, 'state')));
+// Where the notification / alert tone clips live. Rig default; overridable for tests and for a
+// checkout on another machine. Handed to the modules through the context; core does not read it.
+const SOUNDS_DIR = path.resolve(arg('sounds', process.env.SHOCKBOX_SOUNDS || cfg.soundsDir || 'C:\\OBS\\Sounds\\SoundBoard'));
 const PUBLIC_DIR = path.join(HERE, 'public');
 const COMPAT_PORT = has('no-compat') ? 0 : Number(process.env.EP_COMPAT === '1' ? process.env.EP_COMPAT_PORT || 8787 : cfg.compatPort || 0);
 const OBS_URL = cfg.obs?.url || 'ws://127.0.0.1:4455';
@@ -107,12 +110,10 @@ const obs = createObsClient({
   log: log.scope('obs'),
 });
 
-const registry = await loadRegistry({
-  modulesDir: path.join(HERE, 'modules'),
-  stateDir: STATE_DIR,
-  log: root,
-  ctx: {
-    core: { version: VERSION, here: HERE, publicDir: PUBLIC_DIR, stateDir: STATE_DIR, port: PORT, url: `http://127.0.0.1:${PORT}` },
+let registry = null;
+const registryCtx = {
+    sounds: SOUNDS_DIR,
+    core: { version: VERSION, here: HERE, publicDir: PUBLIC_DIR, stateDir: STATE_DIR, soundsDir: SOUNDS_DIR, port: PORT, url: `http://127.0.0.1:${PORT}` },
     events,
     obs,
     log: root,
@@ -127,7 +128,15 @@ const registry = await loadRegistry({
     },
     // Per-module settings document, created by the registry from a manifest `settings` map.
     makeSettings: (opts) => new Settings({ log: root, ...opts }),
-  },
+};
+// `notifications`: the registry itself, so a module can read another's API without core naming
+// it (dialogs borrows the notifications module's sound store).
+registryCtx.notifications = () => registry;
+registry = await loadRegistry({
+  modulesDir: path.join(HERE, 'modules'),
+  stateDir: STATE_DIR,
+  log: root,
+  ctx: registryCtx,
 });
 
 const httpServer = createServer({
@@ -142,8 +151,24 @@ const httpServer = createServer({
   version: VERSION,
   core: {
     settings: coreSettings,
-    // Shared surfaces core answers for every module: the message pool and the pool channel.
-    extraRoutes: [...poolRoutes({ pool, events, log: log.scope('pool') })],
+    // Shared surfaces core answers for every module: the message pool and the pool channel,
+    // plus anything a module registers at the origin (the notifications module's `/audio/<name>`).
+    // Core never names the module; it asks every loaded module for its extra routes.
+    extraRoutes: [
+      ...poolRoutes({ pool, events, log: log.scope('pool') }),
+      // Origin-level routes a module registers for itself (`/audio/<name>`). Evaluated here so a
+      // module that fails cannot take the server down; `ctx.sounds` is already in the context.
+      ...registry.entries
+        .filter((e) => e.status === 'up' && typeof (e.api && e.api.coreExtraRoutes) === 'function')
+        .flatMap((e) => {
+          try {
+            return e.api.coreExtraRoutes({ ...registryCtx, id: e.id, dir: e.dir, dataDir: e.dataDir, settings: e.settings, log: log.scope(e.id) }) || [];
+          } catch (err) {
+            log.warn(`${e.id}: coreExtraRoutes failed — ${err.message}`);
+            return [];
+          }
+        }),
+    ],
     channels: ['pool','core'],
     obsStatus: () => ({
       enabled: coreSettings.get('obsEnabled'),

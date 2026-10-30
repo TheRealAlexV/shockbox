@@ -1,5 +1,7 @@
 import { HttpError } from '../../core/id.mjs';
 import { createDialogState } from './state.mjs';
+import { checkTone } from '../notifications/audio-routes.mjs';
+import { DEFAULT_DIALOG_TONE } from '../notifications/sound.mjs';
 
 // Alerts module — the dialog side of the popup feature.
 //
@@ -18,6 +20,24 @@ export default {
     this.settings = ctx.settings;
     this.pool = ctx.pool;
     this.events = ctx.events;
+    // One sound directory for both popup modules: notifications resolves it in its init
+    // (order 20 runs before this module's order 30) and this module reads the same store.
+    // Looked up at call time, not copied, so a load order change cannot leave a stale copy.
+    const audio = this.soundStore();
+    if (!audio) ctx.log.info('sounds: notifications module not up yet — dialogs borrows its sound store per request');
+    else {
+      const keep = [DEFAULT_DIALOG_TONE];
+      if (!audio.has(this.settings.get('tone'), keep)) {
+        ctx.log.warn(`sounds: tone "${this.settings.get('tone')}" is not in ${audio.dir.root || '(no directory)'} — it will not play`);
+      }
+    }
+  },
+
+  /** The notifications module's sound store, resolved at call time (module order is mutable). */
+  soundStore() {
+    const reg = this.ctx.notifications && this.ctx.notifications();
+    const entry = reg && reg.byId && reg.byId.get('notifications');
+    return entry && entry.status === 'up' ? entry.api.sounds || null : null;
   },
 
   push(origin = 'server') {
@@ -36,6 +56,17 @@ export default {
     const mod = this;
     const S = () => mod.settings;
     return [
+      {
+        method: 'GET',
+        path: '/audio/list',
+        handler() {
+          const audio = mod.soundStore();
+          if (!audio) throw new HttpError(500, 'notifications module is not up');
+          const out = audio.listRoute();
+          if (!out.available) throw new HttpError(500, out.error || 'sound directory unavailable');
+          return { ...out, key: 'tone' };
+        },
+      },
       {
         method: 'GET',
         path: '/live',
@@ -117,6 +148,9 @@ export default {
         method: 'PATCH',
         path: '/settings',
         handler(req, res, url, body) {
+          // `tone` is validated against the files on disk, not a manifest enum.
+          const audio = mod.soundStore();
+          if (audio) checkTone({ settings: S(), audio }, body);
           const changed = S().patch(body || {});
           if (changed.length) {
             mod.push('control');

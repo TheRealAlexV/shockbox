@@ -15,8 +15,9 @@
     "style": { "type": "enum", "default": "ios", "values": ["ios", "android", "win11", "macos"], "label": "Look" },
     "height": { "type": "number", "default": 76, "min": 48, "max": 160, "integer": true, "label": "Height (px)" },
     "autoCloseMs": { "type": "number", "default": 12000, "min": 0, "max": 120000, "integer": true, "label": "Auto-close (ms, 0 = never)" },
-    "sound": { "type": "boolean", "default": true, "label": "Sound" },
-    "volume": { "type": "number", "default": 0.6, "min": 0, "max": 1, "label": "Volume" }
+    "sound": { "type": "boolean", "default": true, "label": "Sound", "group": "sound", "help": "Play a tone for each newly shown notification" },
+    "volume": { "type": "number", "default": 0.6, "min": 0, "max": 1, "step": 0.05, "label": "Volume", "group": "sound" },
+    "tone": { "type": "string", "default": "iphone_16_messege_tone.mp3", "maxLength": 200, "label": "Notification tone", "group": "sound", "help": "A clip from this module's /audio/list" }
   },
   "pages": [
     { "route": "/notify", "title": "Notification overlay", "file": "overlay/index.html" }

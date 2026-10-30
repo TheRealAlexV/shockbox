@@ -360,6 +360,15 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
         }
         return sendJson(res, 404, { ok: false, error: `page file missing for ${p}` });
       }
+      // A page served at its own route also serves its siblings from its own directory
+      // (`/notify/app.js` → `<dir>/overlay/app.js`).
+      const sameDir = registry.pageDir ? registry.pageDir(p) : null;
+      if (sameDir && (req.method === 'GET' || req.method === 'HEAD')) {
+        const f = safeJoin(path.dirname(sameDir.page.file), sameDir.rel);
+        if (f && serveFile(res, f, { cache: sameDir.page.cache || 'no-store', method: req.method, headers: sameDir.page.headers })) {
+          return undefined;
+        }
+      }
       // A page's sibling files (its classic scripts, images) under the page's own URL.
       const sibling = registry.pageFile ? registry.pageFile(p) : null;
       if (sibling && sibling.page.staticDir && (req.method === 'GET' || req.method === 'HEAD')) {

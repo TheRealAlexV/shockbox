@@ -11,6 +11,7 @@
 //   DELETE /api/dialogs/live        close every dialog
 //   PATCH  /api/dialogs/settings    {key:value} → persists + pushes `relayout`
 //   GET    /api/pool/dialogs        message list for the picker
+//   GET    /api/dialogs/audio/list         clip names the sound directory offers (tone picker)
 // Live:
 //   channel `dialogs`, cmd `snapshot` | `relayout`; event `sound` is informational.
 //
@@ -473,6 +474,13 @@ export async function render(container, ctx) {
       settingsSlot.appendChild(el('div', { class: 'live-error', text: `could not read alerts: ${err.message}` }));
     }
     try {
+      const a = await api.get('/api/dialogs/audio/list', { signal: ctx.signal });
+      toneNames = Array.isArray(a?.files) && a.files.length ? a.files : null;
+    } catch {
+      toneNames = null; // not fatal: the tone row stays a plain text field
+    }
+    if (toneNames && form) form.refresh(settingsMeta);
+    try {
       const p = await api.get('/api/pool/dialogs', { signal: ctx.signal });
       pool = Array.isArray(p?.messages) ? p.messages : [];
       paintPool();
@@ -482,6 +490,7 @@ export async function render(container, ctx) {
     }
   }
 
+  let toneNames = null; // /api/dialogs/audio/list files, or null when unavailable
   let form = null;
   function mountForm(meta) {
     if (form) {
@@ -492,6 +501,9 @@ export async function render(container, ctx) {
     form = renderSettingsForm(settingsSlot, {
       settings: meta,
       title: 'Look',
+      // `tone` is a string but its legal values are the clips on disk, not free text.
+      choices: (key) => (key === 'tone' && toneNames && toneNames.length ? toneNames : null),
+      help: (key) => (key === 'tone' && !toneNames ? 'No sound directory readable — see --sounds.' : undefined),
       signal: ctx.signal,
       onSave: async (patch) => {
         const out = await api.patch('/api/dialogs/settings', patch);

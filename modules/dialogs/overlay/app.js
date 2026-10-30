@@ -5,10 +5,31 @@
 // Placement is server-side; the page reports its measured box back so the server can centre
 // against the real height instead of a guess.
 
+import { createPlayer, DEFAULT_DIALOG_TONE } from '/mod/notifications/sound.mjs';
+
 const root = document.getElementById('desk');
 const els = new Map(); // id -> element
 const sizeSent = new Map(); // id -> "w:h"
 let theme = 'win11';
+
+// The tone. One player per page, from the notifications module's authored asset: both popup
+// modules present the same behaviour, and neither page has to know the other one exists.
+const player = createPlayer({ instrument: true });
+
+/** Settings document → player: on/off, volume, and the one alert clip to preload. */
+function syncSound(snapSettings) {
+  if (!snapSettings) return;
+  const val = (k, d) => {
+    const m = snapSettings[k];
+    return m && typeof m === 'object' && 'value' in m ? m.value : m === undefined ? d : m;
+  };
+  const on = val('sound', false) === true;
+  player.setVolume(val('volume', 1));
+  player.setEnabled(on);
+  const tone = val('tone', DEFAULT_DIALOG_TONE);
+  player.want(on && typeof tone === 'string' && tone ? [tone] : []);
+  return tone;
+}
 
 /* ---------------------------------------------------------------- icons */
 
@@ -145,7 +166,13 @@ function reportSize(el, entity) {
   }).catch(() => {});
 }
 
+// Alert ids this page has already sounded. One alert can arrive twice (first paint, then the
+// frame that follows it carries the same record), so the id — not the frame — decides.
+const announced = new Set();
+let firstPaint = true;
+
 function apply(snap) {
+  const tone = snap.settings ? syncSound(snap.settings) : undefined;
   if (snap.settings && snap.settings.theme) {
     const next = snap.settings.theme.value || 'win11';
     if (next !== theme) {
@@ -157,6 +184,8 @@ function apply(snap) {
     if (scale) document.documentElement.style.setProperty('--scale', String(scale));
   }
   const list = Array.isArray(snap.live) ? snap.live : [];
+  const seeded = firstPaint;
+  firstPaint = false;
   const live = new Set(list.map((d) => d.id));
   for (const [id, el] of els) {
     if (!live.has(id)) {
@@ -171,6 +200,13 @@ function apply(snap) {
       el = build(entity);
       place(el, entity);
       root.appendChild(el);
+      // Built once, so a `measure` frame (which only re-sends the record) cannot play again.
+      // The very first snapshot seeds: alerts already on screen are not new, so a page load
+      // never sounds; everything applied afterwards is a genuinely new alert.
+      if (!announced.has(entity.id)) {
+        announced.add(entity.id);
+        if (!seeded) player.sync([{ id: entity.id, sound: 'dialog', tone }]);
+      }
       requestAnimationFrame(() => {
         el.classList.add('in');
         reportSize(el, entity);
@@ -187,18 +223,24 @@ function apply(snap) {
 
 function connect() {
   const es = new EventSource('/events?channels=dialogs&client=alerts-overlay');
-  es.addEventListener('snapshot', (ev) => {
-    try {
-      apply(JSON.parse(ev.data));
-    } catch (err) {
-      console.error('bad snapshot', err);
-    }
-  });
   es.addEventListener('reset', () => {
     fetch('/api/dialogs/live')
       .then((r) => r.json())
       .then(apply)
       .catch(() => {});
+  });
+  // The hub sends every frame twice (typed event + `message`) and the EventSource collapses them
+  // into `message` only. Re-read the full record once per frame, coalesced while a read is open.
+  let pending = null;
+  es.addEventListener('message', () => {
+    if (pending) return;
+    pending = fetch('/api/dialogs/live')
+      .then((r) => r.json())
+      .then(apply)
+      .catch(() => {})
+      .finally(() => {
+        pending = null;
+      });
   });
 }
 
