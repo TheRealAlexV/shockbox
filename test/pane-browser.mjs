@@ -169,6 +169,17 @@ try {
   if (!mounted) console.log(await mountDiagnostics(c, c.events, 'shell mount (wall)'));
   ok('shell loads the wall route', mounted, url);
 
+  // The shell document's own load-failure path: a module that never executes (404, wrong MIME)
+  // is silent otherwise. If the entry document is the server's "shell missing" page there is no
+  // marker either, so assert the document is ours at all before the pane checks.
+  const doc = JSON.parse(await c.eval(`JSON.stringify({
+    app: Boolean(document.getElementById('app')),
+    shellScript: Boolean(document.querySelector('script[type=module][src="/src/shell.js"]')),
+    failure: document.getElementById('shell-load-failure') ? document.getElementById('shell-load-failure').textContent : null,
+  })`));
+  ok('the page served is the shell document', doc.app && doc.shellScript, `app:${doc.app} module-script:${doc.shellScript}`);
+  ok('the shell module executed (no load-failure notice)', doc.failure === null, doc.failure || 'no notice');
+
   // The custom pane, not the generic fallback (which has no preview surface).
   const paneReady = await c.waitFor('Boolean(document.querySelector("[data-wall-preview], .wall-preview, canvas, .preview"))', 10000);
   if (!paneReady) console.log(await mountDiagnostics(c, c.events, 'wall preview surface'));

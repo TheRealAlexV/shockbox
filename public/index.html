@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShockBox — control</title>
+  <link rel="stylesheet" href="/src/shell.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%2308080a'/%3E%3Cpath d='M9 2 3 9h4l-1 5 6-8H8z' fill='%23b18cff'/%3E%3C/svg%3E">
+</head>
+<body>
+  <!-- ShockBox control surface. Everything visible is painted by src/shell.js from the API;
+       this file is only the frame. See the contract comment at the top of src/shell.js. -->
+  <div class="app" id="app" data-drawer="closed">
+    <nav class="rail" id="rail" aria-label="Modules">
+      <div class="rail-mark" aria-hidden="true">
+        <svg viewBox="0 0 16 16" width="16" height="16"><path d="M9 1 3 9h4l-1 6 7-9H8z" fill="currentColor"/></svg>
+        <span class="rail-mark-text">SHOCKBOX</span>
+      </div>
+      <div class="rail-list" id="rail-list" aria-live="polite"></div>
+      <div class="rail-foot">
+        <button type="button" class="rail-btn" id="drawer-toggle" aria-controls="drawer" aria-expanded="false" title="Debug drawer (Ctrl+`)">
+          <span class="rail-btn-label">debug</span>
+          <span class="rail-btn-dot dot" id="drawer-dot" data-tone="idle" aria-hidden="true"></span>
+        </button>
+      </div>
+    </nav>
+
+    <main class="main" id="main">
+      <header class="topbar" id="topbar">
+        <div class="topbar-left">
+          <span class="topbar-title" id="topbar-title">ShockBox</span>
+          <span class="topbar-sub" id="topbar-sub"></span>
+        </div>
+        <div class="topbar-right" id="topbar-status" aria-live="polite"></div>
+      </header>
+      <section class="pane" id="pane" tabindex="-1" aria-live="off">
+        <div class="pane-slot" id="pane-slot"><div class="pool-empty">connecting to the server…</div></div>
+      </section>
+    </main>
+
+    <aside class="drawer" id="drawer" aria-label="Debug" aria-hidden="true">
+      <header class="drawer-head">
+        <span class="drawer-title">Debug</span>
+        <span class="drawer-age mono" id="drawer-age"></span>
+        <span class="drawer-spacer"></span>
+        <button type="button" class="btn btn-quiet btn-sm" id="drawer-refresh" title="Refresh now">refresh</button>
+        <button type="button" class="btn btn-quiet btn-sm btn-icon" id="drawer-close" aria-label="Close drawer" title="Close drawer (Ctrl+`)">✕</button>
+      </header>
+      <div class="drawer-body" id="drawer-body"></div>
+    </aside>
+  </div>
+
+  <div class="toast-host" id="toasts" role="status" aria-live="polite"></div>
+
+  <script type="module" src="/src/shell.js"></script>
+  <!-- A module <script> has no onerror, and a module that 404s or arrives with a non-JS MIME
+       fails silently: readyState goes "complete", the console stays empty, and the page keeps
+       the static frame with nothing in it. This classic script is the load-failure path: if the
+       shell has not started a few seconds after the document is complete, it says so in the page
+       (and on the console), naming the script URL and what the server actually returned. -->
+  <script>
+    (function () {
+      var src = '/src/shell.js';
+      var shown = false;
+      function report(reason, detail) {
+        if (shown || window.__shell) return;
+        shown = true;
+        var line = document.createElement('div');
+        line.id = 'shell-load-failure';
+        line.setAttribute('role', 'alert');
+        line.setAttribute('data-shell-error', reason);
+        line.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:9999;padding:10px 14px;' +
+          'font:12px/1.5 ui-monospace,monospace;background:#3a1216;color:#ffd9dd;border-top:1px solid #ff5d6a';
+        line.textContent = 'ShockBox: the shell did not load. ' + reason + ' — ' + src + (detail ? ' (' + detail + ')' : '');
+        (document.body || document.documentElement).appendChild(line);
+        console.error('shockbox: ' + reason + ' — ' + src + (detail ? ' (' + detail + ')' : ''));
+      }
+      // The document finished parsing but never booted: fetch the module ourselves to learn why.
+      window.addEventListener('load', function () {
+        setTimeout(function () {
+          if (window.__shell) return;
+          fetch(src, { cache: 'no-store' })
+            .then(function (r) {
+              return r.text().then(function (body) {
+                report('http ' + r.status, 'content-type ' + (r.headers.get('content-type') || 'none') + ', ' + body.length + ' B');
+              });
+            })
+            .catch(function (e) {
+              report('fetch failed', e && e.message);
+            });
+        }, 3000);
+      });
+      // A module that fails to resolve/parse does fire error at the window (no details available).
+      window.addEventListener('error', function (e) {
+        if (e && e.target && e.target.tagName === 'SCRIPT') report('script error', e.target.src);
+      }, true);
+    })();
+  </script>
+</body>
+</html>

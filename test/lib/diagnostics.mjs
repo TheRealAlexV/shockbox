@@ -24,6 +24,13 @@ const PROBE = `(() => {
     partialNotes: [].map.call(document.querySelectorAll('[data-note="pane-partial"]'), (n) => n.innerText.trim()),
     rail: document.querySelectorAll('.rail-item').length,
     shell: window.__shell || null,
+    scripts: [].map.call(document.querySelectorAll('script'), (s) => s.src || 'inline'),
+    srcModule: (performance.getEntriesByType('resource').filter((e) => /\\/src\\//.test(e.name))[0] || null) &&
+      (function (e) { return { name: e.name.replace(origin, ''), status: e.responseStatus || 0, transferSize: e.transferSize, duration: Math.round(e.duration) }; })(
+        performance.getEntriesByType('resource').filter((e) => /\\/src\\//.test(e.name))[0],
+      ),
+    srcCount: performance.getEntriesByType('resource').filter((e) => /\\/src\\//.test(e.name)).length,
+    loadFailure: document.getElementById('shell-load-failure') ? document.getElementById('shell-load-failure').textContent : null,
     hung: inflight.map((e) => e.name.replace(origin, '') + ' (' + e.initiatorType + ')' + (e.responseStatus ? ' HTTP ' + e.responseStatus : '')),
   };
 })()`;
@@ -51,6 +58,8 @@ export async function mountDiagnostics(c, events = [], label = 'mount') {
         `      shell state: ${d.shell ? `phase=${d.shell.phase} route=${d.shell.route} since=${d.shell.since}${d.shell.notes?.length ? ` notes=${JSON.stringify(d.shell.notes)}` : ''}` : 'window.__shell is undefined — the shell never reached boot()'}`,
       );
       lines.push(d.hung.length ? `      hung requests (duration 0): ${d.hung.join(', ')}` : '      hung requests: none');
+      if (d.loadFailure) lines.push(`      page load-failure notice: ${JSON.stringify(d.loadFailure)}`);
+      lines.push(`      scripts: ${JSON.stringify(d.scripts)} · /src/ resources: ${d.srcCount}${d.srcModule ? ` · first: ${JSON.stringify(d.srcModule)}` : ''}`);
     }
   } catch (err) {
     lines.push(`      probe failed: ${err.message}`);

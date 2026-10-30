@@ -386,7 +386,16 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
         if (p === '/' || p === '/control' || p === '/control/') {
           const shell = path.join(publicDir, 'index.html');
           if (serveFile(res, shell, { method: req.method })) return undefined;
-          return sendText(res, 503, '<h1>ShockBox</h1><p>Admin shell not built. Run <code>npm run build</code> in the app root.</p>', 'text/html; charset=utf-8');
+          // The entry document is source, served straight from public/. If it is missing the
+          // checkout is incomplete — say which file and where we looked, not "run a build".
+          log.error(`shell missing: ${shell} — serving 503 (incomplete checkout?)`);
+          return sendText(
+            res,
+            503,
+            `<h1>ShockBox</h1><p>The shell document is missing: <code>${shell}</code> was not found. ` +
+              `It is part of the repository (public/index.html); check the checkout at <code>${publicDir}</code>.</p>`,
+            'text/html; charset=utf-8',
+          );
         }
         const file = safeJoin(publicDir, p);
         if (file && serveFile(res, file, { method: req.method })) return undefined;

@@ -24,9 +24,10 @@ captures/
 # builds
 node_modules/
 public/assets/
-public/index.html
 .vite/
 dist/
+# public/index.html is the shell's entry document (source, not a build output): it is served
+# directly from public/, and an untracked copy means CI checks out a repo with no shell at all.
 
 # editor / OS noise
 .DS_Store
