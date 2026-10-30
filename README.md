@@ -45,6 +45,9 @@ browser source at `http://127.0.0.1:8972/<page>`.
 `npm test` runs the gates in order and stops on the first failure. Each boots its own server and
 its own headless Chrome on free ports, so it is safe while the live server runs.
 
+`npm run test:ci` runs exactly what `.github/workflows/test.yml` runs on a push — `npm test` plus
+the visual proof in report mode — so a red CI run reproduces locally in one command.
+
 | gate | proves |
 |---|---|
 | `test/ratio.mjs` | the scene-forced ratio state machine: entry, leave, restore, reconnect |
@@ -65,7 +68,10 @@ Separate gates (not in `npm test`):
   effect violates the frame-haze bounds: composited over a white card it must not become a
   near-white flat wash (mean > 252 with chroma < 3 and < 3 % dark pixels), and its scene alpha must
   not cover more than 97 % of the frame (`smoke`, `disco`, `inkflow`, `echo`, `edit`, `embers`,
-  `wires`, `shoot` are exempt by name).
+  `wires`, `shoot` are exempt by name). By default it **reports**: every check runs and failures are
+  printed with their numbers, but the exit code stays 0 unless the page cannot boot. `--strict`
+  (`npm run test:handfx-visual:strict`) exits 1 on any failed check — that is the local gate; CI uses
+  report mode because `disco`/`slime` sit near the thresholds on a software GL stack.
 - `npm run test:sound` — `test/sound.mjs` alone.
 - `node test/glsl-check.mjs` — compiles the wall engine shaders in headless Chrome.
 
