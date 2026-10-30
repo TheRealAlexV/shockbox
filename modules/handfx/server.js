@@ -292,6 +292,21 @@ function build(ctx) {
             return send(res, 200, { ok: true, changed, mirror: settings.get('mirror'), settings: settings.describe() });
           }
           if (cmd === 'effect.set') {
+            // The pane and Stream Deck set the *effect list*, not a cursor: `args.value` is the
+            // array of live ids (the old `args.id` shape is answered the same way it always was,
+            // by publishing). Writing the document here is what made `{ok:true}` true — before,
+            // the route validated and published but never touched settings, so /status kept
+            // reporting the five defaults.
+            const value = Array.isArray(args.value) ? args.value : null;
+            if (value) {
+              const unknown = value.filter((id) => !EFFECTS.some((e) => e.id === id));
+              if (unknown.length) {
+                return send(res, 400, { ok: false, error: `unknown effect: ${unknown.join(', ')}` });
+              }
+              const changed = settings.patch({ effects: value });
+              publish(cmd, { ...args, effects: settings.get('effects') });
+              return send(res, 200, { ok: true, changed, settings: settings.describe() });
+            }
             const id = args.id;
             if (!EFFECTS.some((e) => e.id === id)) {
               return send(res, 400, { ok: false, error: `unknown effect: ${id}` });

@@ -25,8 +25,9 @@
 //   5  particles source (u_body/u_prev/u_src   TEXTURE_UNIT_NEUTRAL, nil)
 // The final pass uses 0 (scene) and 1 (bloom).
 
-import { VERT, FIREBALL, LIGHTNING, SPARKRING, EMBERS, SMOKE, COMPOSITE, FINAL, BLIT } from './fx-glsl.js';
+import { VERT, FIREBALL, LIGHTNING, SPARKRING, SMOKE, COMPOSITE, FINAL, BLIT } from './fx-glsl.js';
 import {
+  EMBERS2,
   WIRES,
   AURA,
   FROST,
@@ -76,6 +77,18 @@ const TEXTURE_UNIT_NEUTRAL = 5;
 /** Per-upload EMA weight for the body mask (see setBodyMask). */
 const BODY_EMA = 0.35;
 
+/** Additive composite weight for an effect layer (1 = the layer's own brightness). */
+const ADD_WEIGHT = 0.55;
+/** The dye effects are a full-frame field, so they land lighter than a glow. */
+const ADD_WEIGHT_DYE = 0.35;
+
+/**
+ * Add-mode composite weight for a layer. The layer shaders write premultiplied colour, so an
+ * additive composite adds `rgb * weight`: at 1.0 a handful of overlapping effects clip to white
+ * and the frame reads as a milky veil. The dye effects are a full-frame field and land lighter.
+ */
+const layerWeight = (id) => (id === 'inkflow' || id === 'echo' ? ADD_WEIGHT_DYE : ADD_WEIGHT);
+
 /** How long a history-needing effect may be absent before its ping-pong targets are cleared. */
 const HISTORY_IDLE_FRAMES = 30;
 
@@ -110,7 +123,7 @@ export const EFFECTS = {
     gesture: 'any',
     mode: 0,
     layer: 'hands',
-    program: EMBERS,
+    program: EMBERS2,
   },
   smoke: {
     id: 'smoke',
@@ -600,7 +613,7 @@ export class FxRenderer {
   }
 
   /** Spawn (or refresh) an effect at a page-space anchor. */
-  trigger(id, { centre, radius } = {}) {
+  trigger(id, { centre, radius, dir, view } = {}) {
     if (!EFFECTS[id]) return false;
     if (!this.settings.effects.includes(id)) return false;
     const intensity = clamp(Number(this.settings.intensity[id] ?? 1), 0, 2);
@@ -623,9 +636,17 @@ export class FxRenderer {
     // The hand-edit canvas is a scratch picture: a new session starts on a clean canvas, because
     // the previous gesture's strokes belong to the previous effect, not this one.
     if (id === 'edit') this.editClear();
-    // `shoot` and `meteor` throw particles from the anchor the gesture fired at.
+    // `shoot` and `meteor` throw particles from the anchor the gesture fired at, along the
+    // direction the page saw. Both are read from the frame the page handed us at trigger time
+    // (`opts.dir`, `opts.view`) rather than from `this.view`: the page triggers in its input
+    // handler, before `render()` has stored the new view, so this.view there is one frame old and
+    // the burst would leave from the previous hand position.
     if (id === 'shoot' || id === 'meteor') {
-      this.spawnBurst(id, centre || live.centre, null, id === 'shoot' ? 24 : 16);
+      const seen = view || this.view || {};
+      const palm = (seen.palms && seen.palms[0]) || (seen.hands && seen.hands[0] && seen.hands[0].palm) || null;
+      const from = centre || (seen.anchor && seen.anchor) || palm || live.centre;
+      const burstDir = dir || (seen.swipe && seen.swipe.dir ? { x: seen.swipe.dir, y: -1 } : null);
+      this.spawnBurst(id, from, burstDir, id === 'shoot' ? 24 : 16);
     }
     return true;
   }
@@ -675,10 +696,43 @@ export class FxRenderer {
         px = new Uint8Array(source.data.buffer || source.data, source.data.byteOffset || 0, n);
       }
     }
+    // Canvas row 0 is the top of the picture; every shader here reads v_uv.y = 0 at the bottom.
+    // Array sources have no upload flip (UNPACK_FLIP_Y only applies to DOM sources and is ignored
+    // for ImageBitmap), so the flip is done once, right here, by walking rows.
+    if (px) {
+      const out = new Uint8Array(px.length);
+      const row = w * 4;
+      for (let y = 0; y < h; y++) out.set(px.subarray(y * row, (y + 1) * row), (h - 1 - y) * row);
+      px = out;
+    }
     if (px && smooth && this._bodyRaw && this._bodyRaw.length === px.length) {
       const a = BODY_EMA;
       const prev = this._bodyRaw;
       for (let i = 0; i < px.length; i++) px[i] = prev[i] + (px[i] - prev[i]) * a;
+    }
+    if (!px && smooth) {
+      // A DOM source (canvas, ImageBitmap, video): read it back once so the EMA and the row flip
+      // apply to it too. `texImage2D` alone would upload it unflipped and unsmoothed — which is
+      // what left a canvas mask uniform under a shader that reads v_uv.y upward.
+      try {
+        const tmp = this._bodyRead || (this._bodyRead = document.createElement('canvas'));
+        tmp.width = w;
+        tmp.height = h;
+        const ctx = tmp.getContext('2d', { willReadFrequently: true });
+        ctx.clearRect(0, 0, w, h);
+        ctx.drawImage(source, 0, 0, w, h);
+        const img = ctx.getImageData(0, 0, w, h);
+        const a = new Uint8Array(img.data.buffer, img.data.byteOffset, img.data.length);
+        if (this._bodyRaw && this._bodyRaw.length === a.length) {
+          for (let i = 0; i < a.length; i++) a[i] = this._bodyRaw[i] + (a[i] - this._bodyRaw[i]) * BODY_EMA;
+        }
+        const out = new Uint8Array(a.length);
+        const row = w * 4;
+        for (let y = 0; y < h; y++) out.set(a.subarray(y * row, (y + 1) * row), (h - 1 - y) * row);
+        px = out;
+      } catch (err) {
+        px = null;
+      }
     }
     if (px) this._bodyRaw = Uint8Array.from(px);
     if (!this.bodyTex) this.bodyTex = gl.createTexture();
@@ -770,6 +824,12 @@ export class FxRenderer {
       }
       data[o + 0] += data[o + 2] * dt;
       data[o + 1] += data[o + 3] * dt;
+      // Off-frame particles are retired here, so the store cannot grow with invisible records and
+      // a later draw cannot resurrect one.
+      if (data[o + 0] < -0.15 || data[o + 0] > 1.15 || data[o + 1] < -0.15 || data[o + 1] > 1.15) {
+        this.particles.kill(o);
+        continue;
+      }
       // Drag and a little buoyancy: a projectile's trail settles rather than flying off the frame.
       data[o + 2] *= 1 - Math.min(0.9, dt * 1.8);
       data[o + 3] = data[o + 3] * (1 - Math.min(0.9, dt * 1.8)) - dt * 0.05;
@@ -800,6 +860,10 @@ export class FxRenderer {
       for (let r = 0; r < this.particles.count; r++) {
         const o = r * L;
         if (Math.round(data[o + 7]) !== skin) continue;
+        // A page-space y is 0 at the top and 1 at the bottom; a particle thrown upward leaves the
+        // frame through y < 0. Without this a dead orb sits at y -2 and paints the whole screen
+        // white — the field is unbounded, so there is no edge to clip it.
+        if (data[o + 0] < -0.15 || data[o + 0] > 1.15 || data[o + 1] < -0.15 || data[o + 1] > 1.15) continue;
         if (!used) {
           // the header and per-program uniforms are filled once per batch
           this._uniformHeader(prog, t, 7.0 + skin);
@@ -811,13 +875,17 @@ export class FxRenderer {
         const fade = Math.min(1, age / 0.12) * Math.min(1, (life - age) / (life * 0.6));
         const size = data[o + 6] * (1 - (age / life) * 0.5);
         const [u, v] = toUv(data[o + 0], data[o + 1], this.w / this.h);
+        // The skin programs draw at unit scale: u_radius is the field-space size, while the vertex
+        // shader works in clip space where x spans the whole width whatever the aspect. The orb is
+        // round on screen, so a size in field units becomes size / aspect in clip x.
+        const radius = size / (this.w / this.h);
         // The orb's trail points back along its own velocity, so the streak follows the throw
         // instead of always hanging downward. Field space, like METEOR's u_dir.
         const vx = data[o + 2] * (this.w / this.h);
         const vy = -data[o + 3];
         const vm = Math.hypot(vx, vy) || 1;
         loc(gl, prog, 'u_center', this._uniformCache, (l) => gl.uniform2f(l, u, v));
-        loc(gl, prog, 'u_radius', this._uniformCache, (l) => gl.uniform1f(l, size));
+        loc(gl, prog, 'u_radius', this._uniformCache, (l) => gl.uniform1f(l, radius));
         loc(gl, prog, 'u_dir', this._uniformCache, (l) => gl.uniform2f(l, vx / vm, vy / vm));
         loc(gl, prog, 'u_energy', this._uniformCache, (l) => gl.uniform1f(l, 1.4));
         loc(gl, prog, 'u_fade', this._uniformCache, (l) => gl.uniform1f(l, Math.max(0, fade)));
@@ -1047,17 +1115,24 @@ export class FxRenderer {
     let historyUsed = false;
     for (const layer of LAYER_ORDER) {
       for (const live of groups[layer]) {
+        // `id` is what `_drawEffect` keys the program and the uniform fill on; take it from `live`
+        // so the draw can never disagree with the effect that is actually live.
         const id = live.id;
         const def = EFFECTS[id];
         if (!def) continue;
         if (id === 'shoot') {
-          // No layer pass: the particles composite themselves onto the scene directly. They wear
-          // the operator's skin for the whole effect, recorded per particle when it spawned, so a
-          // burst already in flight keeps the look it was thrown with.
-          gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
+          // The default projector: particles go through the ordinary layer path (cleared layer,
+          // particles drawn into it, layer composited onto the scene at the effect's `mode`), so
+          // they sit in the same order as every other effect instead of bypassing the layers.
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
           gl.viewport(0, 0, this.w, this.h);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
           this._drawParticles(view, t);
           checkpoint('particles');
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
+          gl.viewport(0, 0, this.w, this.h);
+          this._composite(this.layerTex, def.mode === 1 ? 1 : 0, layerWeight(id));
           continue;
         }
         if (id === 'edit') {
@@ -1091,7 +1166,7 @@ export class FxRenderer {
         if (!drew) continue;
         gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
         gl.viewport(0, 0, this.w, this.h);
-        this._composite(target, def.mode === 1 ? 1 : 0);
+        this._composite(target, def.mode === 1 ? 1 : 0, layerWeight(id));
         checkpoint(`composite:${id}`);
       }
     }
@@ -1274,16 +1349,29 @@ export class FxRenderer {
       // The blob follows the hand's centre; its size follows the hand's scale where the shader reads
       // a radius. Slime's goo sags from the centre, so it wants the palm-sized radius, not a ring's.
       const c = centreOf(anchor);
-      const [u, v] = toUv(c);
       const handRadius = Math.max(0.06, (anchor && anchor.radius) || live.radius * 2);
-      const r = id === 'aura' ? handRadius * 5 : id === 'portal' ? handRadius * 6 : id === 'slime' ? handRadius : handRadius * 6;
+      if (id === 'bloomlife') {
+        // Blossoms are placed at `u_center + (cos, sin) * u_radius * (0.45..2)`, i.e. the shader
+        // works in field space (x already aspect-scaled). Passing a uv centre and a field radius
+        // squashed the ring toward the frame edge, so the flowers mostly fell off it; both go in
+        // in field units here, with the vertical sweep kept to the hand's own scale.
+        set('u_center', (l) => gl.uniform2f(l, c.x * (this.w / this.h), 1 - c.y));
+        set('u_radius', (l) => gl.uniform1f(l, handRadius * 2.2));
+        energySet();
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        return true;
+      }
+      const [u, v] = toUv(c);
+      const r = id === 'aura' ? handRadius * 5 : id === 'portal' ? handRadius * 6 : handRadius;
       set('u_center', (l) => gl.uniform2f(l, u, v));
       set('u_radius', (l) => gl.uniform1f(l, r));
       energySet();
     } else if (id === 'frost') {
+      // Frost roots sit at field y = -0.15 / 1.15 and grow *toward* u_center, so the centre is a
+      // field-space point (x aspect-scaled) like every other field-space input in this shader —
+      // feeding it a uv point put the growth target off to the left of the frame.
       const c = centreOf(anchor);
-      const [u, v] = toUv(c);
-      set('u_center', (l) => gl.uniform2f(l, u, v));
+      set('u_center', (l) => gl.uniform2f(l, c.x * (this.w / this.h), 1 - c.y));
       // Growth curve: reach rises fast in the first half second (the creep is visible immediately)
       // and saturates by ~2.5 s; smoothstep keeps the tip soft instead of a hard edge.
       const grow = smoothstep01(live.age / 2.5);
@@ -1368,11 +1456,56 @@ export class FxRenderer {
     const loc = gl.getUniformLocation(p, 'u_tex');
     if (loc) gl.uniform1i(loc, 1);
     // mode 0 = add light, 1 = over.
+    // The layer shaders write premultiplied colour, so there is no separable weight for add-mode
+    // that keeps `src + dst` exact. Additive composition is done in the COMPOSITE program instead
+    // (mode 0, `u_weight` on the light and a max() on coverage): a fixed-function ONE/ONE add
+    // here would clip every bright layer to white and trip the frame-haze check.
+    const w = Number.isFinite(weight) ? clamp(weight, 0, 1) : 1;
     gl.enable(gl.BLEND);
     if (mode === 1) gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    else gl.blendFunc(gl.ONE, gl.ONE);
+    else if (w !== 1) {
+      gl.disable(gl.BLEND);
+      this._addLayer(layerTex, w);
+      return;
+    } else gl.blendFunc(gl.ONE, gl.ONE);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.disable(gl.BLEND);
+  }
+
+  /**
+   * Add one layer onto the scene. Light adds (the layer is premultiplied, so ONE/ONE on colour is
+   * exact), and coverage unions instead of summing: a second pass rewrites the destination alpha
+   * to `max(dst, src)` by drawing the layer's alpha again with `blendEquationSeparate(ADD, MAX)`,
+   * which WebGL2 supports natively (no program, no scene re-read, so no feedback loop).
+   */
+  _addLayer(layerTex, weight) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
+    gl.viewport(0, 0, this.w, this.h);
+    const p = this.progs.blit;
+    gl.useProgram(p);
+    gl.bindVertexArray(this.vao);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, layerTex);
+    const loc = gl.getUniformLocation(p, 'u_tex');
+    if (loc) gl.uniform1i(loc, 1);
+    gl.enable(gl.BLEND);
+    if (weight !== 1) {
+      // constant factor on colour (CONSTANT_COLOR) and on the source alpha of the coverage pass
+      gl.blendColor(weight, weight, weight, weight);
+      gl.blendFunc(gl.CONSTANT_COLOR, gl.ONE);
+    } else gl.blendFunc(gl.ONE, gl.ONE);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    // coverage union: colour writes off, alpha equation = MAX
+    gl.colorMask(false, false, false, true);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.blendEquationSeparate(gl.MAX, gl.FUNC_ADD);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.colorMask(true, true, true, true);
+    gl.disable(gl.BLEND);
+    gl.activeTexture(gl.TEXTURE0);
   }
 
   _blit(srcTex) {

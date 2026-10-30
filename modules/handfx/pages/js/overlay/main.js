@@ -93,8 +93,10 @@ async function loadStatus() {
 }
 
 function applySettings(status) {
+  // Values may arrive bare (the test and the pane's console hand in plain values) or wrapped as
+  // `{ value }` (what server.js serves from settings.describe()). Both are the same document.
   const s = {};
-  for (const [k, d] of Object.entries(status.settings || {})) s[k] = d.value;
+  for (const [k, d] of Object.entries(status.settings || {})) s[k] = d && typeof d === 'object' && 'value' in d ? d.value : d;
   state.settings = s;
   state.status = status;
   fx.setSettings({
@@ -631,6 +633,9 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
     classify,
     syntheticHands,
     stepEffect,
+    // The page's own settings entry point (status shape in, settings applied), so a test or the
+    // pane's console can change the effect list the way the server would.
+    applySettings,
     startTracking,
     stopTracking,
     applyBusCommand,

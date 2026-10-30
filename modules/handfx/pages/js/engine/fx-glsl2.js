@@ -115,19 +115,21 @@ void main() {
     float wob = (fbm(vec2(along * 3.4 + seed, u_time * 0.35 + seed * 0.5), 3) - 0.5) * amp;
     wob += (vnoise(vec2(along * 13.0 + seed, u_time * 1.4)) - 0.5) * amp * 0.35;
     vec2 q = A + dir * t + nrm * wob;
-    float d = length(p - q);
+    vec2 dq = p - q;
+    dq.x *= u_aspect;   // field x is aspect-scaled, keep the wire round in page space
+    float d = length(dq);
     float spd = 0.35 + hash11(seed) * 0.9 + 0.25 * u_energy;
     float ph = fract(u_time * spd + hash11(seed * 2.3));
     float pulse = 0.35 + 1.1 * exp(-pow((along - ph) * 5.0, 2.0));
-    float f = filament(d, 0.0018 + 0.0012 * u_energy) * pulse;
-    float joint = smoothstep(0.012, 0.0, length(p - A)) * 0.5;
+    float f = filament(d, 0.0040 + 0.0026 * u_energy) * pulse;
+    float joint = smoothstep(0.020, 0.0, length(p - A)) * 0.5;
     vec3 col = mix(vec3(0.45, 0.80, 1.0), vec3(0.92, 0.98, 1.0), clamp(f * 0.8, 0.0, 1.0));
     acc += col * (f + joint);
     a += f + joint * 0.5;
   }
   acc = acc / (1.0 + acc * 0.4);
-  a = clamp(a, 0.0, 1.0) * u_fade * (0.55 + 0.45 * u_energy);
-  outColor = vec4(acc * u_fade * (0.6 + 0.5 * u_energy), a);
+  a = clamp(a, 0.0, 1.0) * u_fade * (0.75 + 0.45 * u_energy);
+  outColor = vec4(acc * u_fade * (1.0 + 0.8 * u_energy), a);
 }`;
 
 /* ------------------------------------------------------------------ aura */
@@ -205,9 +207,9 @@ float front(vec2 p, vec2 root, float reach) {
 
 float needle(vec2 p, vec2 root, vec2 tip, float grow) {
   float d = sdSeg(p, root, tip);
-  float w = 0.0026 + 0.0014 * u_energy;
+  float w = 0.0105 + 0.0055 * u_energy;
   float core = smoothstep(w, 0.0, d);
-  float glow = smoothstep(w * 5.0, 0.0, d) * 0.22;
+  float glow = smoothstep(w * 3.0, 0.0, d) * 0.55;
   float acc = core * 1.3 + glow;
   vec2 dir = normalize(root - tip + 1e-5);
   for (int l = 1; l <= 2; l++) {
@@ -230,22 +232,25 @@ float needle(vec2 p, vec2 root, vec2 tip, float grow) {
 void main() {
   vec2 p = field();
   vec2 c = u_center;
-  float reach = 0.02 + smoothstep(0.0, 1.0, u_grow) * 1.25;
+  float reach = 0.06 + smoothstep(0.0, 1.0, u_grow) * 0.92;
   float acc = 0.0;
   for (int i = 0; i < 14; i++) {
     float fi = float(i);
     float t = (fi + 0.5) / 14.0;
     float s = hash11(fi * 1.9 + u_seed.y * 13.0);
-    vec2 root = vec2(mix(-0.25, u_aspect + 0.25, t), -0.15);
+    // The roots ring the centre at one field unit, so every side of the frame has needles and
+    // they creep inward; a root pinned to y = -0.15 grew off-frame upward and left the front curl
+    // above the picture.
+    vec2 root = c + vec2(cos(t * 6.2831 + hash11(fi * 8.7)), sin(t * 6.2831 + hash11(fi * 8.7))) * 0.98;
     vec2 tdir = normalize(c - root + vec2((s - 0.5) * 0.5, 0.0));
     vec2 tip = root + tdir * reach * (0.55 + (hash11(fi * 5.3 + u_seed.x) - 0.5) * 0.7);
     acc += needle(p, root, tip, reach);
-    vec2 root2 = vec2(root.x, 1.15);
+    vec2 root2 = c + vec2(cos(t * 6.2831 + hash11(fi * 2.3) + 3.14), sin(t * 6.2831 + hash11(fi * 2.3) + 3.14)) * 1.06;
     vec2 tdir2 = normalize(c - root2 + vec2((s - 0.5) * 0.6, 0.0));
     vec2 tip2 = root2 + tdir2 * reach * (0.5 + hash11(fi * 3.1) * 0.6);
     acc += needle(p, root2, tip2, reach) * 0.8;
   }
-  float veil = smoothstep(0.45, 0.85, fbm(p * 9.0 + u_seed.xy + u_time * 0.05, 4)) * 0.12;
+  float veil = smoothstep(0.34, 0.85, fbm(p * 9.0 + u_seed.xy + u_time * 0.05, 4)) * 0.34;
   float a = clamp(acc * 0.85 + veil, 0.0, 1.0) * front(p, u_center, reach) * u_energy * u_fade;
   vec3 col = mix(vec3(0.45, 0.72, 1.0), vec3(0.94, 0.98, 1.0), clamp(acc * 0.5, 0.0, 1.0));
   outColor = vec4(col * a, a);
@@ -475,7 +480,7 @@ void main() {
   float border = smoothstep(0.0, 0.055 + 0.03 * u_energy, F2 - F1);
   float id = hash11(dot(bestId, vec2(1.0, 57.0)));
   vec3 col = mix(vec3(0.35, 0.55, 0.75), vec3(0.85, 0.95, 1.0), 0.25 + 0.75 * id);
-  float facetLight = 0.22 + 0.40 * id * (0.7 + 0.3 * sin(u_time * 0.8 + id * 9.0));
+  float facetLight = 0.10 + 0.18 * id * (0.7 + 0.3 * sin(u_time * 0.8 + id * 9.0));
   // radial cracks out from the centre: divide the circle into twelve wedges
   vec2 d = p - u_center;
   float r = length(d);
@@ -483,8 +488,12 @@ void main() {
   float crackLine = abs(fract(ang + 0.5) - 0.5);
   float crack = smoothstep(0.10, 0.0, crackLine) * smoothstep(0.0, 0.10, r)
               * (1.0 - smoothstep(0.30, 1.10, r));
-  float a = clamp(facetLight + (1.0 - border) * 0.55 + crack * 1.1, 0.0, 1.0) * u_fade;
-  a *= smoothstep(0.02, 0.18, F1);   // keep facet interiors translucent, not flat paint
+  // A burst confined to the impact. The old interior alpha (roughly 0.6-1.0 on every facet) was
+  // also multiplied by smoothstep(0.02, 0.18, F1), which killed coverage at the seeds and left
+  // near-white mush across the frame; the disc is the honest bound on where the shards are.
+  float disc = 1.0 - smoothstep(0.28, 0.62, length(p - u_center));
+  float a = clamp(facetLight + (1.0 - border) * 0.85 + crack * 1.1, 0.0, 1.0) * u_fade;
+  a *= disc;
   col = mix(col * 0.45, col, border);
   col = mix(col, vec3(1.0), crack * 0.8);
   outColor = vec4(col * a, a);
@@ -547,7 +556,9 @@ void main() {
 /**
  * Curled smoke lifted off a body silhouette. The mask gradient gives the outward edge normal, so
  * the plumes start at the boundary and curl away from it; two fbm fields counter-scroll for the
- * curl. Dark and thin: alpha stays low, the colour is near-grey, and the layer is meant for the
+ * curl. Above the anchor the plume forms a cone that widens upward (narrow at the waist, spreading
+ * with height), so the smoke reads as rising off the body rather than as a line on its outline.
+ * Dark and thin: alpha stays low, the colour is near-grey, and the layer is meant for the
  * source-over composite.
  */
 export const BODYSMOKE = `${PRELUDE}
@@ -563,21 +574,82 @@ void main() {
   vec2 g = vec2(texture(u_body, uv + vec2(px * 2.0, 0.0)).a - texture(u_body, uv - vec2(px * 2.0, 0.0)).a,
                 texture(u_body, uv + vec2(0.0, px * 2.0)).a - texture(u_body, uv - vec2(0.0, px * 2.0)).a);
   vec2 nrm = g / max(length(g), 1e-4);          // outward edge direction
-  float edge = 1.0 - smoothstep(0.0, 0.18, abs(m - 0.4) * 2.0);
-  float lift = clamp(dot(uv - u_center, nrm * 0.5 + vec2(0.0, 1.0)), -0.5, 0.5);
-  vec2 q = uv * vec2(9.0, 5.0) + nrm * 0.6;
+  // A cone that widens above the anchor: a thin ring on the silhouette itself (the mask's own
+  // half-coverage crossing) plus a column of plume that rises out of it and drifts sideways, so a
+  // hand-centred shot has smoke over the anchor rather than on a 1-px boundary line. liftAmt
+  // is how far above the centre a pixel sits; the plume is advected upward by it, fades out with
+  // height and never appears below the anchor.
+  float edge = 1.0 - smoothstep(0.0, 0.03, abs(m - 0.5));
+  float rise = uv.y - u_center.y;
+  float liftAmt = clamp(rise, 0.0, 1.0);
+  float qx = uv.x * 9.0 + nrm.x * 0.25;
+  float qy = (uv.y - liftAmt * 0.22) * 5.0;
+  vec2 q = vec2(qx, qy) + nrm * 0.6;
   float c1 = fbm(q + vec2(-u_time * 0.18, -u_time * 0.55) + u_seed.xz, 4);
   float c2 = fbm(q * 2.1 + vec2(u_time * 0.11, -u_time * 0.3) + u_seed.zy, 3);
-  float plume = smoothstep(0.46, 0.80, c1 * 0.7 + c2 * 0.4);
-  float above = smoothstep(-0.05, 0.35, uv.y + lift - u_center.y);
-  float band = edge * plume * above;
-  float a = clamp(band * (0.55 + 0.45 * u_energy), 0.0, 1.0);
-  a *= u_fade * 0.55;
+  float plume = smoothstep(0.42, 0.78, c1 * 0.7 + c2 * 0.4);
+  float spread = 0.16;
+  float above = 1.0 - smoothstep(0.02, 0.55, liftAmt);
+  // A ring alone is a 1-px line, so the cone has a cross-section that widens with height; the
+  // density then thins as the column rises instead of ending flat at the top.
+  float cone = smoothstep(spread * (1.0 + liftAmt * 2.2), 0.0, abs(uv.x - u_center.x));
+  float aBand = max(edge, cone * smoothstep(0.0, 0.10, liftAmt));
+  float a = clamp(aBand * plume * above * 8.0 * (0.55 + 0.45 * u_energy), 0.0, 1.0);
   vec3 col = mix(vec3(0.06, 0.06, 0.07), vec3(0.30, 0.29, 0.32), c2);
   outColor = vec4(col * a, a);
 }`;
 
 /* ------------------------------------------------------------------ electowave */
+
+/* ------------------------------------------------------------------ ember rise */
+
+/**
+ * Self-contained embers rising from an anchor. The first version of this effect was a *trail*
+ * program meant to be fed its own previous frame through a buffer-scroll feedback loop, which this
+ * renderer does not have (bufferScroll was cut): fed a single frame it emitted a one-frame grain
+ * that measured ~0.1 % coverage. This one is a stateless emission: 64 sparks each walking a
+ * deterministic life cycle up from the anchor, with a hot head, a cooling colour and a fade, so a
+ * single frame already reads as a column of embers. Its offsets are page units converted to
+ * field space (x times the aspect); the spark radius is a field-space radius on both axes.
+ */
+export const EMBERS2 = `${PRELUDE}
+uniform vec2 u_center;
+uniform float u_spread;
+uniform float u_energy;
+uniform float u_fade;
+
+// fbm taken along a point's own trajectory so each spark's path wanders, not the whole field.
+float emberField(vec2 p) {
+  float acc = 0.0;
+  for (int i = 0; i < 64; i++) {
+    float fi = float(i);
+    float speed = 0.22 + hash11(fi * 1.7 + u_seed.x) * 0.26;
+    float life = fract(u_time * speed + hash11(fi * 9.1 + u_seed.y));
+    float rise = life * (0.22 + 0.18 * hash11(fi * 4.3 + u_seed.z));
+    float wander = (vnoise(vec2(fi * 5.0, life * 3.0 + u_seed.x)) - 0.5) * u_spread * 0.9 * life;
+    // Offsets are in page (uv) units and multiplied by the aspect where they become field x, so
+    // the column's width is the same fraction of the frame on any aspect. The spark radius is a
+    // field-space radius on both axes (no aspect on d.x): field() already scales p.x, so scaling
+    // it again here made every spark an ellipse and halved its width.
+    float x = ((hash11(fi * 3.3) - 0.5) * u_spread * 0.55 + wander) * u_aspect;
+    vec2 c = u_center + vec2(x, rise);
+    vec2 d = p - c;
+    float size = mix(0.030, 0.008, life) * (0.6 + hash11(fi) * 1.0);
+    float spark = smoothstep(size, 0.0, length(d));
+    float twinkle = 0.55 + 0.45 * sin(u_time * (5.0 + hash11(fi) * 9.0) + fi * 2.1);
+    acc += spark * (1.0 - life * life) * twinkle;
+  }
+  return acc;
+}
+
+void main() {
+  vec2 p = field();
+  float e = emberField(p);
+  // A soft halo at a smaller size so each spark has a glow, not just a hard dot.
+  float a = clamp(e * 1.6 * u_energy * u_fade, 0.0, 1.0);
+  vec3 col = mix(vec3(1.0, 0.36, 0.06), vec3(1.0, 0.9, 0.6), clamp(a * 1.6, 0.0, 1.0));
+  outColor = vec4(col * a, a);
+}`;
 
 /**
  * Shockwave that displaces what the overlay already knows: `u_src` is a snapshot of the accumulated
@@ -725,14 +797,18 @@ uniform float u_energy;
 uniform float u_fade;
 
 // One blossom: a round centre plus a petal ring whose radius is modulated by the petal count.
+// One blossom. Anchor radius ~0.07 field units (field y runs 0..1 over the frame height); the
+// petals are a ring that breathes inward as the flower opens, so a blossom covers a real patch of
+// frame instead of a few pixels. (The first version used r ≈ 0.12 * open with open < 1 and the
+// whole bloom measured ~1 % of the frame: five pinpricks.)
 vec3 blossom(vec2 p, vec2 c, float r, float open, float seed) {
   vec2 d = p - c;
   float ang = atan(d.y, d.x);
   float petals = 5.0 + floor(hash11(seed) * 3.0);
   float wav = 0.55 + 0.45 * cos(ang * petals + seed * 6.0);
-  float rr = max(r * open, 0.0015);
+  float rr = max(r * (0.55 + 0.45 * open), 0.004);
   float shape = smoothstep(rr * (0.55 + 0.45 * wav), rr * 0.15, length(d));
-  float core = smoothstep(rr * 0.3, 0.0, length(d));
+  float core = smoothstep(rr * 0.32, 0.0, length(d));
   vec3 col = mix(vec3(0.95, 0.35, 0.55), vec3(1.0, 0.85, 0.35), core * 0.9);
   return col * shape;
 }
@@ -745,25 +821,25 @@ void main() {
     float fi = float(i);
     float ang = hash11(fi * 3.1 + u_seed.x) * 6.2831 + u_time * 0.15;
     float growth = fract(u_time * 0.16 + hash11(fi * 7.3));
-    float rad = u_radius * (0.45 + growth * 1.6);
+    float rad = u_radius * (0.35 + growth * 1.15);
     vec2 c = u_center + vec2(cos(ang), sin(ang) * 0.8) * rad;
     // stem: distance to the centre->flower line, wobbled along its length (the spiral)
     vec2 sdir = c - u_center;
     float sl = max(length(sdir), 1e-4);
     float along = clamp(dot(p - u_center, sdir) / (sl * sl), 0.0, 1.0);
     float off = length(p - u_center - sdir * along) + sin(hash11(fi) * 9.0 + along * 9.0) * 0.012 * sl;
-    float stem = smoothstep(0.0035, 0.0, abs(off)) * step(along, 0.985);
+    float stem = smoothstep(0.006, 0.0, abs(off)) * step(along, 0.985);
     col += vec3(0.22, 0.70, 0.36) * stem;
     acc += stem * 0.6;
     // opening cycle: per-flower phase, slow, so blossoms breathe rather than flash
     float open = 0.35 + 0.65 * fract(u_time * 0.18 + hash11(fi * 2.9));
-    vec3 b = blossom(p, c, 0.12 + 0.06 * hash11(fi * 5.9), open, fi * 1.7 + 1.0);
+    vec3 b = blossom(p, c, 0.10 + 0.05 * hash11(fi * 5.9), open, fi * 1.7 + 1.0);
     col += b;
     acc += dot(b, vec3(0.33));
   }
   for (int i = 0; i < 14; i++) {
     float fi = float(i);
-    vec2 q = u_center + (hash21(vec2(fi, u_seed.y)) - 0.5) * vec2(1.4, 1.0);
+    vec2 q = u_center + (hash21(vec2(fi, u_seed.y)) - 0.5) * vec2(u_radius * 5.0, u_radius * 2.6);
     q += vec2(sin(u_time * 0.4 + fi), cos(u_time * 0.33 + fi * 2.0)) * 0.05;
     float glint = smoothstep(0.006, 0.0, length(p - q)) * (0.5 + 0.5 * sin(u_time * 3.0 + fi));
     col += vec3(1.0, 0.95, 0.6) * glint;

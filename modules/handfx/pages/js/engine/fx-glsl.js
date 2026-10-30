@@ -92,8 +92,7 @@ uniform float u_radius;
 uniform float u_energy;
 uniform float u_fade;
 void main() {
-  vec2 p = vec2((v_uv.x - u_center.x) * u_aspect, v_uv.y - u_center.y);
-  p.x *= u_aspect;
+  vec2 p = field() - u_center;
   float r = length(p);
   float R = u_radius;
   vec2 n = normalize(p + 1e-5);
@@ -273,7 +272,9 @@ void main() {
   float density = smoothstep(0.42, 0.78, n1 * 0.7 + n2 * 0.4) * band * (1.0 - smoothstep(0.15, 0.9, up));
   float a = density * u_energy * u_fade;
   vec3 col = mix(vec3(0.55, 0.58, 0.66), vec3(0.82, 0.85, 0.92), density);
-  outColor = vec4(col, a * 0.75);
+  // Premultiplied like every other layer shader: the composite reads rgb as light already
+  // weighted by coverage, and a straight (unpremultiplied) rgb there washes the layer out.
+  outColor = vec4(col * a * 0.75, a * 0.75);
 }`;
 
 /* ------------------------------------------------------------------ composite */
@@ -300,7 +301,8 @@ void main() {
   }
   vec4 s = l;
   if (u_mode == 0) {
-    outColor = vec4(s.rgb + l.rgb * l.a * u_weight, min(1.0, s.a + l.a * u_weight));
+    // Add light, but union coverage: six faint halos must not saturate the whole frame's alpha.
+    outColor = vec4(s.rgb + l.rgb * l.a * u_weight, max(s.a, l.a * u_weight));
   } else {
     float a = l.a * u_weight;
     outColor = vec4(s.rgb * (1.0 - a) + l.rgb * a, min(1.0, s.a + a));
@@ -330,6 +332,8 @@ void main() {
   c = c / (1.0 + c * 0.6);
   vec3 b = texture(u_bloom, v_uv).rgb;
   c += b * u_bloomAmount;
-  float a = clamp(s.a + dot(b, vec3(0.33)) * u_bloomAmount, 0.0, 1.0);
+  // Bloom is light, not coverage: adding its luminance to alpha made opaque pixels translucent
+  // and gave transparent ones alpha, which OBS reads as a full-frame milky veil.
+  float a = clamp(s.a, 0.0, 1.0);
   outColor = vec4(c, a);
 }`;

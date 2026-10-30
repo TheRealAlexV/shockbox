@@ -805,6 +805,32 @@ async function main() {
     ok(`pane renders all ${CANON.length} registry ids with gestures`, paneAll.tiles.length === CANON.length && paneAll.gestures >= CANON.length, `${paneAll.tiles.length} tiles, ${paneAll.gestures} gestures`);
     ok('pane shows the shoot skin and the body row', paneAll.skins >= 1 && /mask|body/i.test(paneAll.bodyRow) && paneAll.fireBtn && paneAll.clearBtn, JSON.stringify({ skins: paneAll.skins, row: paneAll.bodyRow.slice(0, 120) }));
 
+    // The command path end to end: POST /cmd with an effect list has to *change the document*,
+    // not just answer `{ok:true}`. (This was the defect: the route validated and published but
+    // never wrote settings, so /status kept reporting the five defaults.)
+    const srvOrigin = new URL(srv.url);
+    const api = (path, body) => new Promise((resolve, reject) => {
+      const payload = body === undefined ? null : JSON.stringify(body);
+      const req = http.request({ host: srvOrigin.hostname, port: srvOrigin.port, path, method: payload ? 'POST' : 'GET', headers: payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {} }, (res) => {
+        let text = '';
+        res.on('data', (d) => (text += d));
+        res.on('end', () => resolve({ status: res.statusCode, json: (() => { try { return JSON.parse(text); } catch { return null; } })() }));
+      });
+      req.on('error', reject);
+      if (payload) req.write(payload);
+      req.end();
+    });
+    const want = CANON.slice(0, 3);
+    const listRes = await api('/api/handfx/cmd', { cmd: 'effect.set', args: { value: want } });
+    const statusAfterSet = await api('/api/handfx/status');
+    const got = statusAfterSet.json?.settings?.effects?.value;
+    ok('effect.set writes the effect list (not only {ok:true})', listRes.status === 200 && listRes.json?.ok === true && JSON.stringify(got) === JSON.stringify(want), JSON.stringify({ status: listRes.status, got }));
+    const allRes = await api('/api/handfx/cmd', { cmd: 'effect.set', args: { value: CANON } });
+    const afterAll = await api('/api/handfx/status');
+    ok('effect.set accepts all ' + CANON.length + ' registry ids', allRes.status === 200 && (afterAll.json?.settings?.effects?.value || []).length === CANON.length, `${allRes.status}`);
+    const badRes = await api('/api/handfx/cmd', { cmd: 'effect.set', args: { value: ['not_an_effect'] } });
+    ok('effect.set rejects an unknown id and keeps the list', badRes.status === 400 && JSON.stringify((await api('/api/handfx/status')).json?.settings?.effects?.value) === JSON.stringify(CANON), `${badRes.status} ${badRes.json?.error || ''}`);
+
     const pageErr = await evaluate(c, 'window.__err || null');
     ok('no uncaught page exceptions', !pageErr, pageErr || '');
   } finally {
