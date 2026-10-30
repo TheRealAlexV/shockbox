@@ -20,6 +20,16 @@
 import { el, clear, actionButton } from '/src/ui.js';
 import { syntheticHands } from '../pages/js/engine/tracker.js';
 import { classify as classifyPose, Motion } from '../pages/js/engine/gestures.js';
+import { EFFECTS as ENGINE_EFFECTS } from '../pages/js/engine/fx.js';
+
+// What this build can actually draw. The page's registry is the truth (it is the same module the
+// overlay imports), so the pane can never claim an effect the page would silently skip.
+const KNOWN = new Set(Object.keys(ENGINE_EFFECTS));
+const SKINS = ['projectile', 'heart'];
+// The body page's masks arrive over a BroadcastChannel between two OBS sources; the pane only
+// learns a timestamp, never a frame. "Recent" matches the overlay's own 1 s mask expiry, with
+// room for the 2 s /ack throttle on top.
+const BODY_FRESH_MS = 3000;
 
 
 export async function render(container, ctx) {
@@ -162,7 +172,34 @@ export async function render(container, ctx) {
 
   function registry() {
     const served = (s.status && s.status.effects) || [];
-    return served.map((e) => ({ ...e, known: ['fireball', 'lightning', 'sparkring', 'embers', 'smoke'].includes(e.id) }));
+    return served.map((e) => ({ ...e, known: KNOWN.has(e.id), skin: e.id === 'shoot' }));
+  }
+
+  /** Shoot's skin: `skins.shoot` is optional, absent means the default projectile orb. */
+  function shootSkin() {
+    const skins = s.settings.skins;
+    const want = skins && typeof skins === 'object' ? skins.shoot : null;
+    return SKINS.includes(want) ? want : 'projectile';
+  }
+
+  async function setSkin(skin) {
+    try {
+      await patch('skins', { ...(s.settings.skins || {}), shoot: skin });
+      push(`shoot skin → ${skin}`, 'ok');
+    } catch (err) {
+      push(`skin refused: ${err.message}`, 'bad');
+    }
+    render();
+  }
+
+  /** Body-tracking facts: the mask timestamp the overlay reports, and the body page's own beat. */
+  function bodySummary() {
+    const b = (s.status && s.status.body) || {};
+    const last = Number(b.lastMaskAt) || 0;
+    const age = last ? Date.now() - last : Infinity;
+    if (!last) return { tone: 'idle', text: 'no body mask yet — open the body page and start it' };
+    if (age < BODY_FRESH_MS) return { tone: 'ok', text: `mask arriving (${Math.round(age / 100) / 10}s ago)` };
+    return { tone: 'warn', text: `mask stopped ${Math.round(age / 1000)}s ago — body effects are off` };
   }
 
   function effectEnabled(id) {
@@ -323,7 +360,7 @@ export async function render(container, ctx) {
 
   function sideColumn(reg, enabled) {
     const col = el('div', { class: 'hfx-side' });
-    col.append(trackingCard(), cameraCard(), lookCard());
+    col.append(trackingCard(), bodyCard(), cameraCard(), lookCard());
     return col;
   }
 
@@ -340,6 +377,32 @@ export async function render(container, ctx) {
       row('next-effect gesture', selectControl('nextGesture', s.settings.nextGesture || 'bothFingertips', (s.status?.settings?.nextGesture?.values) || ['bothFingertips', 'palmTouch', 'bothPalmsUp', 'fist'], (v) => patch('nextGesture', v))),
       row('resolution', selectControl('resolution', s.settings.resolution || '720p', (s.status?.settings?.resolution?.values) || ['480p', '720p', '1080p'], (v) => patch('resolution', v))),
     );
+    card.append(body);
+    return card;
+  }
+
+  /** Body tracking: a read-only report of the body page's mask, plus its page link and buttons. */
+  function bodyCard() {
+    const card = el('section', { class: 'panel' });
+    const b = bodySummary();
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Body tracking' }),
+      el('span', { class: 'hfx-pill', 'data-tone': b.tone, text: b.text })));
+    const body = el('div', { class: 'panel-body hfx-fields' });
+    const page = s.status && s.status.body;
+    body.append(
+      el('p', { class: 'hfx-help', text: `The body page runs PoseLandmarker + ImageSegmenter in its own small Browser Source and posts one mask at ~15 Hz over BroadcastChannel('handfx.body'). Only timestamps come back here — a frame never crosses the wire. Body effects stop 1 s after the mask does.` }),
+      el('div', { class: 'hfx-row hfx-actions' },
+        actionButton({ label: 'projectile.fire', title: 'throw the projectile from the current hand anchor', variant: 'btn btn-sm', run: () => bus('projectile.fire', { skin: shootSkin() }), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+        actionButton({ label: 'edit.clear', title: 'wipe the hand-edit canvas', variant: 'btn btn-quiet btn-sm', run: () => bus('edit.clear'), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+      ),
+      (s.status && s.status.bodyPage)
+        ? el('a', { class: 'gen-link hfx-open', href: s.status.bodyPage, target: '_blank', rel: 'noopener' },
+            el('span', { class: 'gen-link-title', text: 'Open the body tracking page' }), el('span', { class: 'gen-link-go', text: 'open ↗', 'aria-hidden': 'true' }))
+        : null,
+    );
+    if (page && page.lastPoseAt) {
+      body.append(el('div', { class: 'hfx-note', text: `body page beat ${Math.round((Date.now() - page.lastPoseAt) / 1000)}s ago` }));
+    }
     card.append(body);
     return card;
   }
@@ -416,6 +479,13 @@ export async function render(container, ctx) {
       const slider = sliderControl(`intensity-${e.id}`, intensity, 0, 2, 0.05, (v) => setIntensity(e.id, v), { disabled: !e.known || !on });
       controls.append(slider);
       tile.append(top, mid, controls);
+      // `shoot` wears one of two skins; the setting is optional and per-id (module.json: skins).
+      if (e.skin && e.known) {
+        tile.append(el('div', { class: 'hfx-effect-meta' },
+          el('span', { class: 'hfx-note', text: 'skin' }),
+          selectControl(`skin-${e.id}`, shootSkin(), SKINS, (v) => setSkin(v)),
+        ));
+      }
       grid.append(tile);
     }
     card.append(grid);
@@ -578,6 +648,9 @@ export async function render(container, ctx) {
     // Any command can have changed the document (mirror.toggle writes it), and the pane's own
     // controls rendered from the old values would then lie: re-read rather than guess.
     if (msg.cmd) scheduleRefresh();
+    // The body page's beat arrives as its own /ack; the mask timestamp lives on /status, so a
+    // page event is a reason to re-read the status too (throttled like everything else).
+    if (msg.event === 'page') scheduleRefresh();
   });
 
   let refreshTimer = 0;
@@ -595,9 +668,17 @@ export async function render(container, ctx) {
   await listDevices();
   render();
 
+  // The body-tracking row is about the last few seconds (mask freshness), not the last command:
+  // re-read the status on a slow beat so it ages honestly on an idle pane.
+  const bodyTimer = setInterval(() => {
+    if (document.hidden) return;
+    refresh().then(render).catch(() => {});
+  }, 3000);
+
   signal.addEventListener('abort', () => {
     cancelAnimationFrame(landmarkRaf);
     clearTimeout(refreshTimer);
+    clearInterval(bodyTimer);
     stopPreview();
     unsub();
   });

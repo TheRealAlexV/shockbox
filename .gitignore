@@ -34,3 +34,10 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+# Agent tooling scratch (never shipped)
+/.openchamber/
+/.opencode/
+/.cortexkit/

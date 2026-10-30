@@ -1,0 +1,444 @@
+/* Alerts (dialogs) pane.
+ *
+ * The stage is the module's own 405×720 canvas at the entity's x/y/w/h, wearing the same skin
+ * class the overlay puts on <html> (skin-win11 / skin-win95 / skin-macos). The dialog chrome —
+ * title bar, close box, icon, message, buttons — is copied from modules/dialogs/overlay/style.css
+ * so the preview is the window OBS draws, not a drawing of it. The one addition is the stage
+ * scale: entities are authored in canvas px and scaled here, exactly like the overlay's --scale.
+ */
+
+.dg-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 264px;
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+  margin-top: 12px;
+}
+
+.dg-main { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.dg-side { min-width: 0; display: flex; flex-direction: column; gap: 12px; position: sticky; top: 0; }
+
+/* ------------------------------------------------------------------ quick */
+
+.dg-quick { margin-top: 12px; flex-wrap: wrap; row-gap: 8px; }
+.dg-quick .segmented-sm .seg { font-size: 10px; padding: 0 9px; }
+.dg-quick input[type='range'] { width: 126px; accent-color: var(--accent); }
+.dg-scale-val { min-width: 30px; text-align: right; font-size: 10.5px; color: var(--fg-2); }
+
+/* ----------------------------------------------------------------- stage */
+
+.dg-stage {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding: 12px;
+  border: var(--hair) solid var(--line);
+  background:
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 9px),
+    var(--bg-1);
+  overflow: hidden;
+}
+
+/* The canvas: 405×720 at the module's scale, top-centre, like the overlay's desk. */
+.dg-desk {
+  --dg-scale: 0.7;
+  position: relative;
+  flex: 0 0 auto;
+  width: 405px;
+  height: 720px;
+  transform: scale(var(--dg-scale));
+  transform-origin: top center;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0d0d11;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+  /* the skin sets font-family; keep the box from inheriting the shell's mono labels */
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  pointer-events: none;
+}
+
+.dg-desk.skin-win95 { font-family: Tahoma, 'MS Sans Serif', 'DejaVu Sans', sans-serif; }
+
+/* --- the dialog: the overlay's own chrome ------------------------------- */
+
+.dg-desk .dialog {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+  opacity: 1;
+}
+
+.dg-desk .dialog[data-newest='true'] {
+  animation: dg-in 160ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
+  z-index: 2;
+}
+
+@keyframes dg-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dg-desk .dialog[data-newest='true'] { animation: none; }
+}
+
+.dg-desk .titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0 6px 0 9px;
+  flex: 0 0 auto;
+}
+
+.dg-desk .ttitle {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dg-desk .tclose {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.75;
+  position: relative;
+}
+
+.dg-desk .tclose::before,
+.dg-desk .tclose::after {
+  content: '';
+  position: absolute;
+  left: 5px;
+  right: 5px;
+  top: 8px;
+  height: 1.6px;
+  background: currentColor;
+}
+
+.dg-desk .tclose::before { transform: rotate(45deg); }
+.dg-desk .tclose::after { transform: rotate(-45deg); }
+
+.dg-desk .body {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px 6px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.dg-desk .icon {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+}
+
+.dg-desk .icon svg { width: 100%; height: 100%; display: block; }
+
+.dg-desk .msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.35;
+  word-break: break-word;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+}
+
+.dg-desk .buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 6px 12px 10px;
+  flex: 0 0 auto;
+}
+
+.dg-desk .btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 4px;
+}
+
+/* --- win11 -------------------------------------------------------------- */
+
+.dg-desk.skin-win11 .dialog {
+  background: #f3f3f3;
+  color: #1a1a1a;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.2),
+    0 2px 6px rgba(0, 0, 0, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85);
+}
+
+.dg-desk.skin-win11 .btn {
+  color: #1f1f1f;
+  background: #fbfbfb;
+  border: 1px solid #d7d7d7;
+}
+
+.dg-desk.skin-win11 .btn.primary {
+  color: #fff;
+  background: #0067c0;
+  border-color: #0067c0;
+}
+
+/* --- win95 -------------------------------------------------------------- */
+
+.dg-desk.skin-win95 .dialog {
+  background: #c0c0c0;
+  color: #000;
+  border: 1px solid #000;
+  border-radius: 0;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+}
+
+.dg-desk.skin-win95 .dialog::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-top: 2px solid #fff;
+  border-left: 2px solid #fff;
+  border-right: 2px solid #808080;
+  border-bottom: 2px solid #808080;
+}
+
+.dg-desk.skin-win95 .titlebar {
+  height: 20px;
+  min-height: 20px;
+  margin: 2px 2px 0;
+  background: linear-gradient(90deg, #000080, #1084d0);
+  color: #fff;
+  font-weight: 700;
+}
+
+.dg-desk.skin-win95 .ttitle { font-size: 11.5px; }
+.dg-desk.skin-win95 .body { padding: 10px 10px 4px; }
+.dg-desk.skin-win95 .msg { font-size: 12px; line-height: 1.3; }
+
+.dg-desk.skin-win95 .btn {
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 3px 14px;
+  background: #c0c0c0;
+  color: #000;
+  border: 0;
+  border-radius: 0;
+  box-shadow:
+    inset -1px -1px 0 #000,
+    inset 1px 1px 0 #fff,
+    inset -2px -2px 0 #808080,
+    inset 2px 2px 0 #dfdfdf;
+}
+
+.dg-desk.skin-win95 .btn.primary { outline: 1px dotted #000; outline-offset: -4px; }
+
+.dg-desk.skin-win95 .tclose {
+  width: 16px;
+  height: 14px;
+  opacity: 1;
+  background: #c0c0c0;
+  box-shadow:
+    inset -1px -1px 0 #000,
+    inset 1px 1px 0 #dfdfdf;
+}
+
+/* --- macos -------------------------------------------------------------- */
+
+.dg-desk.skin-macos .dialog {
+  background: #f6f6f6;
+  color: #1d1d1f;
+  border: 1px solid rgba(0, 0, 0, 0.13);
+  border-radius: 12px;
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.26),
+    0 3px 8px rgba(0, 0, 0, 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.dg-desk.skin-macos .body {
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 14px 16px 10px;
+}
+
+.dg-desk.skin-macos .ttitle { font-size: 13px; font-weight: 700; }
+.dg-desk.skin-macos .msg { font-size: 11.5px; line-height: 1.35; color: #3a3a3c; display: block; }
+
+.dg-desk.skin-macos .buttons { padding: 0; gap: 0; border-top: 1px solid rgba(0, 0, 0, 0.1); }
+
+.dg-desk.skin-macos .btn {
+  flex: 1 1 0;
+  padding: 8px 6px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #007aff;
+  font-size: 12px;
+  min-height: 32px;
+}
+
+.dg-desk.skin-macos .btn + .btn { border-left: 1px solid rgba(0, 0, 0, 0.1); }
+.dg-desk.skin-macos .btn.primary { font-weight: 700; }
+.dg-desk.skin-macos .btn:last-child { border-bottom-right-radius: 12px; }
+.dg-desk.skin-macos .btn:first-child { border-bottom-left-radius: 12px; }
+
+/* the mac close box is the traffic light, not an X */
+.dg-desk.skin-macos .tclose { width: 12px; height: 12px; opacity: 1; }
+.dg-desk.skin-macos .tclose::before,
+.dg-desk.skin-macos .tclose::after { display: none; }
+.dg-desk.skin-macos .tclose {
+  border-radius: 50%;
+  background: #ff5f57;
+  align-self: center;
+}
+
+/* --- empty state -------------------------------------------------------- */
+
+.dg-empty {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg-4);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.dg-empty[hidden] { display: none; }
+.dg-empty-mark { width: 22px; height: 2px; background: var(--line-3); }
+
+/* --- panel head bits ---------------------------------------------------- */
+
+.dg-count { font-size: 10px; letter-spacing: 0.06em; color: var(--fg-2); }
+.dg-count[data-state='full'] { color: var(--warn); }
+
+.dg-mode {
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding: 1px 6px;
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--r);
+}
+
+/* ----------------------------------------------------------------- storm */
+
+.dg-storm-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 10px 12px 12px;
+}
+
+.dg-storm-body .look-label { font-size: 9.5px; }
+.dg-storm-body .control-spacer { flex: 1 1 auto; }
+.dg-storm-body .segmented-sm .seg { font-size: 10px; padding: 0 8px; }
+.dg-unit { font-size: 9.5px; }
+.dg-storm-body .input-num { width: 64px; }
+.dg-storm .panel-head { min-height: 26px; }
+.dg-storm-body [data-disabled='true'] { opacity: 0.45; }
+
+/* ------------------------------------------------------------------ send */
+
+.dg-send-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  min-width: 0;
+}
+
+.dg-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  padding: 0 8px;
+  height: 30px;
+}
+
+/* ------------------------------------------------------------------ list */
+
+.dg-log { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
+
+.dg-log-row {
+  display: grid;
+  grid-template-columns: 6px auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border-bottom: var(--hair) solid var(--line);
+  cursor: pointer;
+  min-width: 0;
+}
+
+.dg-log-row:last-child { border-bottom: 0; }
+.dg-log-row:hover { background: var(--bg-2); }
+.dg-log-type { font-size: 9.5px; letter-spacing: 0.05em; color: var(--fg-3); }
+
+.dg-log-text {
+  font-size: 11.5px;
+  color: var(--fg-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.dg-log-geo, .dg-log-when { font-size: 9.5px; color: var(--fg-4); }
+.dg-log-empty { padding: 14px 12px; font-size: 11px; color: var(--fg-4); }
+
+/* ---------------------------------------------------------------- status */
+
+.dg-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 10px 12px 12px;
+}
+
+.dg-status .look-label { font-size: 9.5px; }
+.dg-stream { font-size: 9.5px; letter-spacing: 0.05em; color: var(--fg-4); }
+.dg-stream[data-state='live'] { color: var(--ok); }
+.dg-stream[data-state='idle'] { color: var(--warn); }
+
+/* ------------------------------------------------------------------ narrow */
+
+@media (max-width: 1180px) {
+  .dg-body { grid-template-columns: minmax(0, 1fr); }
+  .dg-side { position: static; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+}
+
+@media (max-width: 760px) {
+  .dg-side { grid-template-columns: minmax(0, 1fr); }
+  .dg-stage { padding: 8px; }
+}

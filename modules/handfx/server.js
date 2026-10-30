@@ -25,13 +25,28 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-/** Every command the bus accepts. `reload` is handled by the page; nothing here is tracked. */
-export const CMDS = ['effect.next', 'effect.prev', 'effect.set', 'tracking.toggle', 'mirror.toggle', 'reload'];
+/**
+ * Every command the bus accepts. `reload` and the effect cursor are handled by the page;
+ * `projectile.fire` and `edit.clear` are one-shots the page acts on. Nothing here is tracked.
+ */
+export const CMDS = [
+  'effect.next',
+  'effect.prev',
+  'effect.set',
+  'tracking.toggle',
+  'mirror.toggle',
+  'projectile.fire',
+  'edit.clear',
+  'reload',
+];
 
 /**
- * The effect registry as the server knows it: ids only, never parameters. The page has the
- * implementations; the pane shows this list so the operator can order the module's effect list
- * without opening the page. `gesture` is documentation for the pane, not a contract.
+ * The effect registry as the server knows it: ids only, never parameters, in the renderer's own
+ * order (`pages/js/engine/fx.js` → `EFFECTS`). The page has the implementations; the pane shows
+ * this list so the operator can order the module's effect list without opening the page.
+ * `gesture` is documentation for the pane, not a contract — the page maps the classifier's own
+ * gesture names onto these ids. `handdebug` is not an effect: the camera/landmark picture is the
+ * `debugOverlay` setting. `edit` is the operator's hand-drawn canvas, `shoot` the projectile skin.
  */
 export const EFFECTS = [
   { id: 'fireball', title: 'Fireball', gesture: 'open palm up', from: 'fireball-controller/main.py' },
@@ -39,7 +54,28 @@ export const EFFECTS = [
   { id: 'sparkring', title: 'Spark ring', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
   { id: 'embers', title: 'Ember rise', gesture: 'any hand', from: 'handfx_filter (Hand FX)' },
   { id: 'smoke', title: 'Smoke veil', gesture: 'sideways hand / swipe', from: 'handfx_filter (Hand FX)' },
+  { id: 'aura', title: 'Aura outline', gesture: 'any hand', from: 'handfx_filter (Hand FX)' },
+  { id: 'wires', title: 'Wire skeleton', gesture: 'any hand (follows the skeleton)', from: 'handfx_filter (Hand FX)' },
+  { id: 'frost', title: 'Frost creep', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
+  { id: 'portal', title: 'Portal ring', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
+  { id: 'disco', title: 'Disco ball', gesture: 'both hands raised', from: 'handfx_filter (Hand FX)' },
+  { id: 'slime', title: 'Slime drip', gesture: 'palms together', from: 'handfx_filter (Hand FX)' },
+  { id: 'inkflow', title: 'Ink flow', gesture: 'swipe', from: 'handfx_filter (Hand FX)' },
+  { id: 'shatter', title: 'Shatter shards', gesture: 'fist', from: 'handfx_filter (Hand FX)' },
+  { id: 'cyber', title: 'Cyber glitch', gesture: 'fist', from: 'handfx_filter (Hand FX)' },
+  { id: 'bloomlife', title: 'Bloom life', gesture: 'both palms up', from: 'handfx_filter (Hand FX)' },
+  { id: 'echo', title: 'Echo trails', gesture: 'any hand', from: 'handfx_filter (Hand FX)' },
+  { id: 'bodyonfire', title: 'Body on fire', gesture: 'body page sees a body', from: 'handfx body page (PoseLandmarker)' },
+  { id: 'bodysmoke', title: 'Body smoke', gesture: 'body page sees a body', from: 'handfx body page (PoseLandmarker)' },
+  { id: 'frozenbody', title: 'Frozen body', gesture: 'body page sees a body', from: 'handfx body page (PoseLandmarker)' },
+  { id: 'edit', title: 'Hand edit', gesture: 'fist (draws where the fingertips point)', from: 'handfx_filter (Hand FX)' },
+  { id: 'electroshock', title: 'Electro shockwave', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
+  { id: 'meteor', title: 'Meteor', gesture: 'both hands raised', from: 'handfx_filter (Hand FX)' },
+  { id: 'shoot', title: 'Shoot', gesture: 'point (index only)', from: 'handfx_filter (Hand FX)' },
 ];
+
+/** Projectile skins `shoot` may wear; the renderer's registry accepts exactly these two. */
+export const SKINS = ['projectile', 'heart'];
 
 const VENDOR = path.join(HERE, 'vendor');
 // The model search order: the module's own models dir (gitignored — models are licensed per
@@ -51,6 +87,14 @@ const MODEL_DIRS = [path.join(HERE, 'models'), path.resolve(HERE, '../../..', 'h
 const MODEL_NAME = 'hand_landmarker.task';
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+// The body page's models: one pose model (33 landmarks) and one segmentation model (the mask).
+// Both are Apache-2.0 from the same MediaPipe model garden; the same MODEL_DIRS search applies.
+const POSE_NAME = 'pose_landmarker_lite.task';
+const POSE_URL =
+  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+const SEG_NAME = 'selfie_segmenter.tflite';
+const SEG_URL =
+  'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite';
 
 const MIME = {
   '.js': 'text/javascript; charset=utf-8',
@@ -63,8 +107,13 @@ const MIME = {
 };
 
 function findModel() {
+  return findIn(MODEL_NAME);
+}
+
+/** The first MODEL_DIRS entry that holds `name`, or null. */
+function findIn(name) {
   for (const dir of MODEL_DIRS) {
-    const f = path.join(dir, MODEL_NAME);
+    const f = path.join(dir, name);
     try {
       if (fs.statSync(f).isFile()) return f;
     } catch {
@@ -72,6 +121,17 @@ function findModel() {
     }
   }
   return null;
+}
+
+/** Whether the body page's two models are on disk (`local`) or must be downloaded once. */
+function bodyModels() {
+  const pose = findIn(POSE_NAME);
+  const seg = findIn(SEG_NAME);
+  return {
+    pose: { local: Boolean(pose), name: POSE_NAME, url: POSE_URL },
+    segmenter: { local: Boolean(seg), name: SEG_NAME, url: SEG_URL },
+    local: Boolean(pose && seg),
+  };
 }
 
 function send(res, status, body) {
@@ -130,6 +190,9 @@ function build(ctx) {
   const { events, log } = ctx;
   const settings = ctx.settings;
   let lastCmd = null;
+  // Body-tracking status: updated only by the overlay's /ack (a timestamp, never a frame) and by
+  // the body page's own /ack. Read back on /status so the pane can say whether a mask is arriving.
+  const body = { lastMaskAt: 0, pageOpen: false, lastPoseAt: 0 };
 
   function publish(cmd, args) {
     const rec = events.publish('handfx', cmd, { ...args, at: Date.now(), id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}` });
@@ -144,6 +207,8 @@ function build(ctx) {
       cmds: CMDS,
       effects: EFFECTS,
       model: { local: Boolean(model), name: MODEL_NAME, url: MODEL_URL },
+      bodyModels: bodyModels(),
+      body: { lastMaskAt: body.lastMaskAt, pageOpen: body.pageOpen && Date.now() - body.lastPoseAt < 5000, lastPoseAt: body.lastPoseAt },
       runtime: {
         vendored: fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')),
         simdWasm: fs.existsSync(path.join(VENDOR, 'vision', 'simd-wasm', 'vision_wasm_internal.wasm')),
@@ -151,6 +216,7 @@ function build(ctx) {
         base: '/api/handfx/vendor',
       },
       page: '/handfx',
+      bodyPage: '/handfx/body',
       // The page is isolated by the headers its manifest entry declares (COOP/COEP); the pane
       // reads this to say plainly whether a browser tab of /handfx will be a secure, isolated
       // document — it is the operator's camera permission that depends on it.
@@ -202,6 +268,16 @@ function build(ctx) {
             return send(res, 400, { ok: false, error: `unknown cmd: ${cmd} (known: ${CMDS.join(', ')})` });
           }
           const args = body.args && typeof body.args === 'object' ? body.args : {};
+          // `skins` is optional and per-id: only a skin the renderer implements is written, and
+          // only for `shoot` (the one effect that wears one). An unknown skin is refused, never
+          // coerced, so a deck key cannot silently switch the picture to something else.
+          if (cmd === 'projectile.fire' && args.skin !== undefined) {
+            if (!SKINS.includes(args.skin)) return send(res, 400, { ok: false, error: `unknown skin: ${args.skin}` });
+            const skins = { ...(settings.get('skins') || {}), shoot: args.skin };
+            settings.patch({ skins });
+          }
+          // `edit.clear` wipes the operator's hand-drawn canvas in the page; the server only
+          // relays the command (the picture lives in the page, as everything else does here).
           // `effect.set` and `mirror/tracking` are answered here when they change the document,
           // so a deck key and a pane control never disagree; `next`/`prev`/`reload` are the
           // page's (it holds the cursor, and its cursor is the one an operator sees).
@@ -231,18 +307,28 @@ function build(ctx) {
 
       // The page reports what it reached, and honest state: tracking on/off, the model state,
       // the active effect. Nothing here is a frame or a landmark — this is a status line.
+      // `maskAt` (the overlay's receipt time of a body-mask message) and `bodyPage` (the body
+      // page's own beat) are two timestamps; a frame never crosses this route.
       {
         path: '/ack',
         method: 'POST',
-        handler: async (req, res, url, body) => {
-          body = body && typeof body === 'object' ? body : {};
+        handler: async (req, res, url, bodyIn) => {
+          bodyIn = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
+          if (bodyIn.source === 'body') {
+            // The body page's beat: it is open and its camera is running. Timestamp only.
+            body.pageOpen = bodyIn.open === true;
+            if (body.pageOpen) body.lastPoseAt = Date.now();
+            return send(res, 200, { ok: true });
+          }
+          if (Number.isFinite(bodyIn.maskAt) && bodyIn.maskAt > body.lastMaskAt) body.lastMaskAt = Math.min(Date.now(), bodyIn.maskAt);
           events.emit('handfx', 'page', {
-            effect: typeof body.effect === 'string' ? body.effect : null,
-            tracking: body.tracking === true,
-            model: ['idle', 'loading', 'ready', 'failed', 'cached'].includes(body.model) ? body.model : 'idle',
-            hands: Number.isFinite(body.hands) ? Math.max(0, Math.min(4, body.hands | 0)) : 0,
-            gesture: typeof body.gesture === 'string' ? body.gesture.slice(0, 40) : null,
-            error: typeof body.error === 'string' ? body.error.slice(0, 240) : null,
+            effect: typeof bodyIn.effect === 'string' ? bodyIn.effect : null,
+            tracking: bodyIn.tracking === true,
+            model: ['idle', 'loading', 'ready', 'failed', 'cached'].includes(bodyIn.model) ? bodyIn.model : 'idle',
+            hands: Number.isFinite(bodyIn.hands) ? Math.max(0, Math.min(4, bodyIn.hands | 0)) : 0,
+            gesture: typeof bodyIn.gesture === 'string' ? bodyIn.gesture.slice(0, 40) : null,
+            body: bodyIn.body === true,
+            error: typeof bodyIn.error === 'string' ? bodyIn.error.slice(0, 240) : null,
             at: Date.now(),
           });
           send(res, 200, { ok: true });
@@ -252,12 +338,16 @@ function build(ctx) {
       {
         path: '/model',
         method: 'GET',
-        handler: (req, res) => {
-          const model = findModel();
-          if (!model) {
-            return send(res, 404, { ok: false, error: 'no local model', url: MODEL_URL });
+        handler: (req, res, url) => {
+          // `/model` is the hand model (unchanged); `/model/body` and `/model/pose` are the body
+          // page's, same search, same streaming, named in /status so the page can pick one.
+          const kind = url && url.searchParams ? url.searchParams.get('kind') : null;
+          const file = kind === 'pose' ? findIn(POSE_NAME) : kind === 'segmenter' ? findIn(SEG_NAME) : findModel();
+          const fallback = kind === 'pose' ? POSE_URL : kind === 'segmenter' ? SEG_URL : MODEL_URL;
+          if (!file) {
+            return send(res, 404, { ok: false, error: 'no local model', url: fallback });
           }
-          const st = fs.statSync(model);
+          const st = fs.statSync(file);
           res.writeHead(200, {
             'content-type': 'application/octet-stream',
             // Cached for a day: re-read is cheap, and a new model file swaps on restart anyway.
@@ -265,7 +355,7 @@ function build(ctx) {
             'content-length': st.size,
           });
           if (req.method === 'HEAD') return res.end();
-          fs.createReadStream(model).pipe(res);
+          fs.createReadStream(file).pipe(res);
         },
       },
     ],

@@ -301,20 +301,12 @@ async function renderPanes(m, slot, signal, signature) {
     slot.appendChild(failedModulePane(m));
     return;
   }
-  // Prefer the pane this UI ships for known modules; otherwise the module's own ui.pane;
-  // otherwise the generic settings fallback. A broken pane never breaks the shell.
-  const known = { notifications: './panes/notifications.js', dialogs: './panes/alerts.js' }[m.id];
+  // A module's own `ui.pane` is the only pane for it. The shell keeps a generic settings pane
+  // for a module that declares none, and never a second implementation of the same screen: a
+  // hardcoded map outranked the module's pane and kept two of them alive unnoticed.
   let mod = null;
   let source = null;
-  if (known) {
-    try {
-      mod = await import(known);
-      source = known;
-    } catch (err) {
-      console.error(`pane ${known} failed`, err);
-    }
-  }
-  if (!mod && m.ui && m.ui.pane) {
+  if (m.ui && m.ui.pane) {
     const panePath = `/mod/${m.id}/${m.ui.pane.replace(/^\/+/, '')}`;
     if (await paneExists(panePath)) {
       try {

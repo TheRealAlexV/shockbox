@@ -12,6 +12,13 @@
     "style": "ui/pane.css"
   },
   "settings": {
+    "skins": {
+      "type": "object",
+      "default": {},
+      "label": "Projectile skins (effect id → 'projectile' | 'heart')",
+      "help": "Optional, per effect. Only 'shoot' wears a skin today; absent means the default projectile orb. Written by the pane's skin switch and by projectile.fire {skin}.",
+      "group": "effects"
+    },
     "enabled": {
       "type": "boolean",
       "default": true,
@@ -71,7 +78,25 @@
         "lightning": 1,
         "sparkring": 1,
         "embers": 1,
-        "smoke": 1
+        "smoke": 1,
+        "aura": 1,
+        "wires": 1,
+        "frost": 1,
+        "portal": 1,
+        "disco": 1,
+        "slime": 1,
+        "inkflow": 1,
+        "shatter": 1,
+        "cyber": 1,
+        "bloomlife": 1,
+        "echo": 1,
+        "bodyonfire": 1,
+        "bodysmoke": 1,
+        "frozenbody": 1,
+        "edit": 1,
+        "electroshock": 1,
+        "meteor": 1,
+        "shoot": 1
       },
       "label": "Per-effect intensity",
       "help": "Per-effect multipliers (0–2), merged onto the defaults. Keys the pane knows: the registry's effect ids.",
@@ -96,11 +121,35 @@
       "group": "effects"
     }
   },
+  "files": {
+    "pages": [
+      {
+        "route": "/body",
+        "title": "Hand FX body tracking",
+        "file": "pages/body.html",
+        "headers": {
+          "Cross-Origin-Opener-Policy": "same-origin",
+          "Cross-Origin-Embedder-Policy": "require-corp",
+          "Cross-Origin-Resource-Policy": "cross-origin"
+        }
+      }
+    ]
+  },
   "pages": [
     {
       "route": "/handfx",
       "title": "Hand FX overlay",
       "file": "pages/overlay.html",
+      "headers": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Resource-Policy": "cross-origin"
+      }
+    },
+    {
+      "route": "/handfx/body",
+      "title": "Hand FX body tracking",
+      "file": "pages/body.html",
       "headers": {
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Embedder-Policy": "require-corp",

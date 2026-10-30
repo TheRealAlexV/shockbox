@@ -59,7 +59,12 @@ async function startServer() {
     await sleep(200);
     try {
       const r = await fetch(`${url}/health`);
-      if (r.ok) return { url, log, stop: () => child.kill('SIGTERM') };
+      if (r.ok) {
+        // The server holds SSE streams and timers open; a killed test must not leave one behind.
+        const stop = () => { if (child.exitCode === null) child.kill('SIGTERM'); };
+        process.on('exit', () => child.kill('SIGKILL'));
+        return { url, log, stop };
+      }
     } catch {
       /* not up yet */
     }
@@ -328,6 +333,7 @@ async function main() {
     c.close();
     chrome.kill('SIGKILL');
     srv.stop();
+    await new Promise((r) => setTimeout(r, 150));
     if (srv.log) fs.writeFileSync('/tmp/opencode/wall-browser-server.log', srv.log.join(''));
     fs.writeFileSync('/tmp/opencode/wall-browser-console.log', consoleLines.join('\n'));
   }

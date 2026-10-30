@@ -37,6 +37,10 @@ if (!CHROME) {
   process.exit(2);
 }
 
+// The canonical effect ids, in the order the page's registry declares them. `handdebug` is the
+// debug-overlay setting, not an effect, and is deliberately absent.
+const CANON = ['fireball', 'lightning', 'sparkring', 'embers', 'smoke', 'aura', 'wires', 'frost', 'portal', 'disco', 'slime', 'inkflow', 'shatter', 'cyber', 'bloomlife', 'echo', 'bodyonfire', 'bodysmoke', 'frozenbody', 'edit', 'electroshock', 'meteor', 'shoot'];
+
 const results = [];
 function ok(name, pass, detail = '') {
   results.push({ name, pass, detail, skipped: false });
@@ -76,7 +80,11 @@ async function startServer() {
     await sleep(200);
     try {
       const r = await fetch(`${url}/health`);
-      if (r.ok) return { url, log, stop: () => child.kill('SIGTERM') };
+      if (r.ok) {
+        const stop = () => { if (child.exitCode === null) child.kill('SIGTERM'); };
+        process.on('exit', () => child.kill('SIGKILL'));
+        return { url, log, stop };
+      }
     } catch {
       /* not up yet */
     }
@@ -111,6 +119,33 @@ async function cdp(devtools) {
       ws.send(JSON.stringify({ id: n, method, params }));
     });
   return { send, events, close: () => ws.close() };
+}
+
+/** A CDP session bound to one target id (a new tab), apart from the main page's session. */
+async function cdpPage(devtools, targetId) {
+  const ws = new WebSocket(`ws://${new URL(devtools).host}/devtools/page/${targetId}`);
+  let id = 0;
+  const pending = new Map();
+  ws.addEventListener('message', (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.id && pending.has(m.id)) {
+      pending.get(m.id)(m);
+      pending.delete(m.id);
+    }
+  });
+  await new Promise((res, rej) => {
+    ws.addEventListener('open', res, { once: true });
+    ws.addEventListener('error', rej, { once: true });
+  });
+  return {
+    send: (method, params = {}) =>
+      new Promise((resolve, reject) => {
+        const n = ++id;
+        pending.set(n, (m) => (m.error ? reject(new Error(`${method}: ${m.error.message}`)) : resolve(m.result)));
+        ws.send(JSON.stringify({ id: n, method, params }));
+      }),
+    close: () => ws.close(),
+  };
 }
 
 async function evaluate(c, expression, awaitPromise = false) {
@@ -202,6 +237,190 @@ async function main() {
     };
     ok('page is served cross-origin isolated (COOP+COEP)', coi.coop === 'same-origin' && coi.coep === 'require-corp', JSON.stringify(coi));
     await pageRes.arrayBuffer();
+
+    // The body page is its own small source; it must be served isolated too (wasm + SIMD), and its
+    // files with it, or the page cannot boot.
+    const bodyRes = await fetch(`${srv.url}/handfx/body`);
+    const bodyCoi = { coop: bodyRes.headers.get('cross-origin-opener-policy'), coep: bodyRes.headers.get('cross-origin-embedder-policy') };
+    const bodyHtml = await bodyRes.text();
+    ok('body page is served cross-origin isolated', bodyRes.ok && bodyCoi.coop === 'same-origin' && bodyCoi.coep === 'require-corp' && /body\/main\.js/.test(bodyHtml), `${bodyRes.status} ${JSON.stringify(bodyCoi)}`);
+    const bodyJs = await fetch(`${srv.url}/handfx/body/js/body/main.js`);
+    const bodySrc = await bodyJs.text();
+    ok('body page script serves and names the missing-model path', bodyJs.ok && /model missing/.test(bodySrc) && /BroadcastChannel/.test(bodySrc), `${bodyJs.status} ${bodySrc.length}B`);
+
+    // The body page's two models: present on disk means the construct+segment+channel path must
+    // run; absent means "model missing" stays the honest state, and that is all this file can check.
+    const modelsEarly = (await (await fetch(`${srv.url}/api/handfx/status`)).json()).bodyModels || {};
+    const modelsLocal = Boolean(modelsEarly.pose?.local && modelsEarly.segmenter?.local);
+    if (!modelsLocal) {
+      skip(
+        'body page: models construct, segment and reach a peer over handfx.body',
+        `body models are not on disk (pose=${modelsEarly.pose?.local ? 'local' : 'absent'}, segmenter=${modelsEarly.segmenter?.local ? 'local' : 'absent'}) — the page's "model missing" path is the shipped state here`,
+      );
+    } else {
+      // Bytes are read from disk by the server; the test never touches the network for them.
+      const poseBytes = await fetch(`${srv.url}/api/handfx/model?kind=pose`);
+      const poseBuf = await poseBytes.arrayBuffer();
+      const segBytes = await fetch(`${srv.url}/api/handfx/model?kind=segmenter`);
+      const segBuf = await segBytes.arrayBuffer();
+      const head = new Uint8Array(poseBuf.slice(0, 4));
+      ok(
+        'body models serve with the right bytes',
+        poseBytes.status === 200 && segBytes.status === 200 && poseBuf.byteLength > 1_000_000 && segBuf.byteLength > 100_000 && head[2] === 0x50 && head[3] === 0x4b,
+        `pose ${poseBuf.byteLength}B seg ${segBuf.byteLength}B pose-head=${Array.from(head).map((b) => b.toString(16)).join(' ')}`,
+      );
+
+      // Two same-origin documents: the body page itself, and a listener page that subscribes to
+      // `handfx.body`. The listener must receive a mask bitmap the body page posted. `new?` PUT
+      // (unlike Target.createTarget) hands back the target's real id for the session audit.
+      // The listener is a fresh tab attached by its own session. `Target.createTarget` returns a
+      // `targetId`, not the `TargetID` attach expects — attaching by it lands the session on
+      // whatever tab is already open. `/json/new?about:blank` hands back the real target id.
+      const listener = JSON.parse(await (await fetch(`${devtools}/json/new?about:blank`, { method: 'PUT' })).text());
+      const listenerTarget = listener.id;
+      const listenerWs = `ws://127.0.0.1:${port}/devtools/page/${listenerTarget}`;
+      const attach = { sessionId: null };
+      {
+        const lws = new WebSocket(listenerWs);
+        let n = 0;
+        const pending = new Map();
+        lws.addEventListener('message', (ev) => {
+          const m = JSON.parse(ev.data);
+          if (m.id && pending.has(m.id)) {
+            pending.get(m.id)(m);
+            pending.delete(m.id);
+          }
+        });
+        await new Promise((r, j) => {
+          lws.addEventListener('open', r, { once: true });
+          lws.addEventListener('error', j, { once: true });
+        });
+        const raw = (method, params = {}) =>
+          new Promise((resolve, reject) => {
+            const id = ++n;
+            pending.set(id, (m) => (m.error ? reject(new Error(`${method}: ${m.error.message}`)) : resolve(m.result)));
+            lws.send(JSON.stringify({ id, method, params }));
+          });
+        attach.close = () => lws.close();
+        attach.sessionId = 'listener';
+        // The body page's own script is irrelevant here; only the channel listener is.
+        const lc0 = { send: (method, params = {}) => raw(method, params), events: [], close: () => lws.close() };
+        await lc0.send('Runtime.enable');
+        await lc0.send('Page.enable');
+        await lc0.send('Page.navigate', { url: `${srv.url}/handfx/body?listener=1` });
+        for (let i = 0; i < 100; i++) {
+          const st = await lc0.send('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true });
+          if (st.result.value === 'complete') break;
+          await sleep(100);
+        }
+        await lc0.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+        await lc0.send('Runtime.evaluate', {
+          expression: `window.__got = []; window.__bc = new BroadcastChannel('handfx.body');
+            window.__bc.onmessage = (e) => { const m = e.data || {}; if (m.type === 'mask' && m.bitmap) window.__got.push({ w: m.bitmap.width, h: m.bitmap.height, at: m.at }); };`,
+          returnByValue: true,
+        });
+        var lc = lc0;
+      }
+
+      // The body page is a separate document: open it here (the listener already has one open for
+      // the channel, but the driven page must be the one this session evaluates in).
+      await c.send('Page.navigate', { url: `${srv.url}/handfx/body?drive=1` });
+      const bodyBooted = await waitFor(c, 'Boolean(window.__handfxBody)', 15000).catch(() => false);
+      if (!bodyBooted) console.log(`     body page console:\n       ${consoleLines.slice(-12).join('\n       ')}\n     url=${await evaluate(c, 'location.href')}`);
+      // Drive the body page directly (a real click is the operator's path; the module's Start is
+      // the same call). The camera is Chrome's fake device, so pose/segment run on a test pattern:
+      // the point is that they *run*, not that they find a body.
+      // A headless tab opened behind another document is `visibilityState: hidden`, and a hidden
+      // page does not run its rAF mask loop: without this the body page never posts, and the
+      // failure would look like a broken channel. Focus emulation + an active lifecycle is what
+      // makes the tab behave like the OBS source it stands in for.
+      await c.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+      await c.send('Page.bringToFront').catch(() => {});
+      await c.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
+      await sleep(400);
+      const bodyRun = await evaluate(
+        c,
+        `(async () => {
+          const out = { models: null, pose: null, seg: null, sent: 0, error: null };
+          const h = window.__handfxBody;
+          if (!h) return { error: 'body page did not boot (no window.__handfxBody)' };
+          // Both models construct in this same call (everything a thenable yields to, so a busy
+          // loop would starve them): 20 s is the model load, not a race.
+          await h.start();
+          for (let i = 0; i < 200 && !(h.state.sent > 0); i++) await new Promise((r) => setTimeout(r, 100));
+          out.pose = h.state.pose; out.seg = h.state.segmenter; out.sent = h.state.sent;
+          out.error = h.state.error; out.running = h.state.running;
+          out.status = document.getElementById('status').textContent;
+          out.visibility = document.visibilityState;
+          return out;
+        })()`,
+        true,
+      );
+      ok(
+        'body page loads both models and posts masks',
+        bodyRun.pose === 'ready' && bodyRun.seg === 'ready' && bodyRun.sent > 0 && bodyRun.running === true,
+        JSON.stringify(bodyRun).slice(0, 300),
+      );
+
+      // Wait for the listener to see one; a BroadcastChannel that cannot cross documents is the
+      // failure this check is for, so it gets a real timeout, not a retry loop forever.
+      let received = null;
+      // The listener lives in its own CDP session, so its evaluates go through that session.
+      for (let i = 0; i < 60; i++) {
+        const r = await lc.send('Runtime.evaluate', { expression: 'window.__got.length', returnByValue: true });
+        if (r.result.value > 0) {
+          const first = await lc.send('Runtime.evaluate', { expression: 'JSON.stringify(window.__got[0])', returnByValue: true });
+          received = JSON.parse(first.result.value);
+          break;
+        }
+        await sleep(100);
+      }
+      ok('body mask arrives over BroadcastChannel(handfx.body)', Boolean(received && received.w > 0 && received.h > 0), received ? JSON.stringify(received) : 'no mask message within 6 s');
+
+
+      // The overlay's own subscription path: a mask on the channel reaches fx.setBodyMask. The CDP
+      // session's foreground tab runs the body page here, so the overlay goes in a separate tab
+      // that keeps running (headless tabs behind the active one are throttled, so it is made
+      // active by focus emulation — the same trick as the body page above).
+      const overlayTab = JSON.parse(await (await fetch(`${devtools}/json/new?about:blank`, { method: 'PUT' })).text());
+      const octl = await cdpPage(devtools, overlayTab.id);
+      await octl.send('Page.enable');
+      await octl.send('Runtime.enable');
+      await octl.send('Page.navigate', { url: `${srv.url}/handfx` });
+      for (let i = 0; i < 200; i++) {
+        const r = await octl.send('Runtime.evaluate', { expression: 'Boolean(window.__handfx && window.__handfx.fx)', returnByValue: true });
+        if (r.result.value) break;
+        await sleep(100);
+      }
+      await octl.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+      await octl.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
+      // Keep the body page posting: this session's tab has been in the background since the
+      // overlay tab opened, so focus it again and let the fake camera deliver a frame.
+      await c.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+      await c.send('Page.bringToFront').catch(() => {});
+      await c.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
+      let overlaySaw = false;
+      for (let i = 0; i < 100; i++) {
+        const r = await octl.send('Runtime.evaluate', { expression: 'Boolean(window.__handfx.fx.bodyMaskSeen)', returnByValue: true });
+        if (r.result.value) {
+          overlaySaw = true;
+          break;
+        }
+        await sleep(100);
+      }
+      const maskUploaded = await octl.send('Runtime.evaluate', {
+        expression: `(() => { const fx = window.__handfx.fx; if (!fx.bodyTex) return false; return { w: fx.bodyW, h: fx.bodyH, seen: fx.bodyMaskSeen }; })()`,
+        returnByValue: true,
+      }).then((r) => r.result.value).catch(() => false);
+      ok('overlay page receives the mask and marks the body live', Boolean(overlaySaw && maskUploaded && maskUploaded.seen), `saw=${overlaySaw} mask=${JSON.stringify(maskUploaded)}`);
+      ok('the mask reaches the renderer as a texture', Boolean(maskUploaded && maskUploaded.w > 0 && maskUploaded.h > 0), JSON.stringify(maskUploaded));
+      await fetch(`${devtools}/json/close/${overlayTab.id}`).catch(() => {});
+      octl.close();
+      // The listener tab also runs the body page, so it posts a second stream on the channel; the
+      // overlay would merge both and test nothing extra. Close it before the overlay check.
+      await fetch(`${devtools}/json/close/${listenerTarget}`).catch(() => {});
+      lc.close();
+    }
 
     const status = await (await fetch(`${srv.url}/api/handfx/status`)).json();
     ok('/api/handfx/status answers', Array.isArray(status.effects) && status.effects.length >= 4, `${status.effects ? status.effects.length : 0} effects: ${(status.effects || []).map((e) => e.id).join(',')}`);
@@ -407,10 +626,190 @@ async function main() {
     // restore
     await fetch(`${srv.url}/api/handfx/settings`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ effects: beforeList }) }).then((r) => r.arrayBuffer());
 
+    // ── 8. the full registry: every id draws, history/snapshot/particles/edit work ──
+    // Back to the overlay page (the pane navigation above left it).
+    await c.send('Page.navigate', { url: `${srv.url}/handfx` });
+    const overlayBack = await waitFor(c, 'Boolean(window.__handfx && window.__handfx.ready)', 12000);
+    ok('overlay page boots again for the registry pass', Boolean(overlayBack), '');
+
+    // A synthetic skeleton in field space, and a generated body mask (an ellipse "torso").
+    await evaluate(c, `(() => {
+      const h = window.__handfx;
+      h.fx.setSettings({ effects: h.EFFECT_ORDER.slice() });
+      const w = 96, ht = 72, data = new Uint8Array(w * ht * 4);
+      for (let y = 0; y < ht; y++) for (let x = 0; x < w; x++) {
+        const cx = (x / w - 0.5) * 2, cy = (y / ht - 0.5) * 2;
+        const inside = (cx * cx) / 0.048 + (cy * cy) / 0.384 < 1 ? 255 : 0;
+        const i = (y * w + x) * 4; data[i] = data[i + 1] = data[i + 2] = data[i + 3] = inside;
+      }
+      h.__testMask = h.fx.setBodyMask({ width: w, height: ht, data });
+      h.__testView = {
+        palms: [{ x: 0.5, y: 0.6, radius: 0.1 }],
+        fingertipPairs: [[{ x: 0.38, y: 0.4 }, { x: 0.62, y: 0.4 }], [{ x: 0.36, y: 0.45 }, { x: 0.64, y: 0.45 }]],
+        front: { x: 0.5, y: 0.5, radius: 0.12 },
+        anchor: { x: 0.5, y: 0.6, radius: 0.12 },
+        swipe: { x: 0.5, y: 0.6, radius: 0.12, dir: 1 },
+        hands: [{ landmarks: h.syntheticHands(1)[0].landmarks.map((p) => ({ x: p.x, y: p.y })), palm: { x: 0.5, y: 0.6 }, handedness: 'Left' }],
+      };
+      return h.__testMask;
+    })()`).then((maskOk) => ok('renderer accepts a synthetic body mask', maskOk === true, `setBodyMask=${maskOk}`));
+
+    const registryPass = await evaluate(c, `(() => {
+      const h = window.__handfx, fx = h.fx, view = h.__testView;
+      fx.debugGl = true; fx.debugLog = [];
+      const res = {};
+      for (const id of h.EFFECT_ORDER) {
+        fx.trigger(id, {});
+        fx.render(performance.now(), view);
+        fx.render(performance.now() + 16, view);
+        res[id] = { live: fx.live.has(id), gl: fx.gl.getError(), err: fx.error || null };
+      }
+      fx.debugGl = false;
+      return { res, errs: fx.debugLog.slice(0, 10), probe: fx.probeComposite(), count: h.EFFECT_ORDER.length };
+    })()`);
+    const ids = Object.keys(registryPass.res);
+    const badIds = ids.filter((id) => !registryPass.res[id].live || registryPass.res[id].gl !== 0 || registryPass.res[id].err);
+    // The page's registry is the canonical list; `handdebug` is a debug-overlay setting, not an
+    // effect, so it must not be in it.
+    ok(`every registry id draws without a GL error (${ids.length} ids)`, ids.length === CANON.length && ids.every((id, i) => id === CANON[i]) && badIds.length === 0 && registryPass.probe === 0, `bad=${JSON.stringify(badIds)} probe=${registryPass.probe} errs=${JSON.stringify(registryPass.errs)}`);
+
+    // History path: inkflow and echo sample u_prev, so frame 2 must be non-zero where frame 1 was not.
+    const history = await evaluate(c, `(() => {
+      const h = window.__handfx, fx = h.fx, view = h.__testView;
+      fx.setSettings({ effects: ['inkflow', 'echo'] });
+      for (const id of ['inkflow', 'echo']) fx.release(id);
+      fx.trigger('inkflow', { centre: { x: 0.5, y: 0.5, radius: 0.2 } });
+      const px = () => { const b = new Uint8Array(4); fx.gl.readPixels(Math.floor(fx.w * 0.5), Math.floor(fx.h * 0.5), 1, 1, fx.gl.RGBA, fx.gl.UNSIGNED_BYTE, b); return [b[0], b[1], b[2], b[3]]; };
+      fx.render(performance.now(), view);
+      const a = px();
+      fx.render(performance.now() + 400, view);
+      fx.render(performance.now() + 800, view);
+      const b = px();
+      return { a, b, age: fx.historyAge };
+    })()`);
+    ok('inkflow history produces pixels by the second frame', history.b[3] > 0 || (history.a[3] > 0 && history.b[0] >= history.a[0]), `f1=${history.a} f3=${history.b}`);
+
+    // Electroshock samples the snapshot: u_src bound, and a bright ring appears at u_radius.
+    const shock = await evaluate(c, `(() => {
+      const h = window.__handfx, fx = h.fx, view = h.__testView;
+      fx.setSettings({ effects: ['electroshock'] });
+      fx.release('electroshock');
+      fx.trigger('electroshock', { centre: { x: 0.5, y: 0.5, radius: 0.2 } });
+      // Fresh t0 so the ring is a few hundred ms old, not two minutes (the page's clock starts at
+      // load; an effect triggered later must be aged against a t0 near now).
+      fx.live.get('electroshock').t0 = performance.now();
+      fx.render(performance.now(), view);
+      fx.render(performance.now() + 260, view);
+      const gl = fx.gl;
+      const px = (x, y) => { const b = new Uint8Array(4); gl.readPixels(Math.floor(fx.w * x), Math.floor(fx.h * y), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b); return b[3]; };
+      return { live: fx.live.has('electroshock'), gl: gl.getError(), snap: Boolean(fx.snapTex), centre: px(0.5, 0.5), edge: px(0.82, 0.5) };
+    })()`);
+    ok('electroshock draws from the scene snapshot', shock.live && shock.gl === 0 && shock.snap && (shock.centre > 0 || shock.edge > 0), JSON.stringify(shock));
+
+    // Particles: a burst increments the store, and one render integrates + draws them.
+    const parts = await evaluate(c, `(() => {
+      const h = window.__handfx, fx = h.fx;
+      const before = fx.particleCount();
+      const n = h.spawnShoot(h.__testView);
+      fx.render(performance.now(), h.__testView);
+      return { before, n, after: fx.particleCount() };
+    })()`);
+    ok('shoot burst spawns particles', parts.n > 0 && parts.after >= parts.n, JSON.stringify(parts));
+
+    // Edit canvas: a stroke stamps pixels, clear wipes them.
+    const edit = await evaluate(c, `(() => {
+      const h = window.__handfx, fx = h.fx;
+      fx.setSettings({ effects: ['edit'] });
+      fx.trigger('edit', {});
+      const gl = fx.gl, b = new Uint8Array(4);
+      const begin = fx.editBegin(0.4, 0.4); const moved = fx.editMove(0.6, 0.5); fx.editEnd();
+      // The stroke is on the edit canvas, not the scene: read the canvas (the scene would only
+      // show it through the composite, which a 0.5 s fade can dim). The canvas is RGBA8, and
+      // readPixels counts from its bottom-left, so a scan of the whole buffer is the honest
+      // count — the stroke's exact pixel row depends on the page's aspect.
+      const canvas = () => {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fx.edit.fbo);
+        const all = new Uint8Array(fx.w * fx.h * 4);
+        gl.readPixels(0, 0, fx.w, fx.h, gl.RGBA, gl.UNSIGNED_BYTE, all);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        let lit = 0;
+        for (let i = 3; i < all.length; i += 4) if (all[i] > 0) lit++;
+        return lit;
+      };
+      const stamped = canvas();
+      h.applyBusCommand({ channel: 'handfx', cmd: 'edit.clear', args: {} });
+      const cleared = canvas();
+      fx.render(performance.now(), h.__testView);
+      return { begin, moved, stamped, cleared, gl: gl.getError() };
+    })()`);
+    ok('edit stamps pixels and edit.clear wipes them', edit.stamped > 0 && edit.cleared < edit.stamped && edit.gl === 0, JSON.stringify(edit));
+
+    // Body effects never draw without a mask (a fresh renderer path cannot be faked here, so the
+    // check is that the mask is required: bind nothing and the effect reports it drew nothing).
+    const noMask = await evaluate(c, `(() => {
+      const h = window.__handfx, fx = h.fx;
+      const saved = fx.bodyMaskSeen;
+      fx.bodyMaskSeen = false;
+      fx._resize();
+      fx.release('bodyonfire');
+      fx.trigger('bodyonfire', {});
+      const live = fx.live.get('bodyonfire') || { centre: { x: 0.5, y: 0.5 }, radius: 0.1, energy: 1, fade: 1, age: 0.2 };
+      const drewWithMask = fx._drawEffect('bodyonfire', live, h.__testView, 1);
+      fx.bodyMaskSeen = saved;
+      return { hasMask: Boolean(fx.bodyTex), drewWithMask };
+    })()`);
+    ok('body effects draw nothing without a mask', noMask.hasMask === true && noMask.drewWithMask === false, JSON.stringify(noMask));
+
+    // ── 9. the server accepts the full id set, and the new commands ─────────
+    const allStatus = await (await fetch(`${srv.url}/api/handfx/status`)).json();
+    const servedIds = (allStatus.effects || []).map((e) => e.id);
+    ok('status serves the full registry (handdebug excluded)', servedIds.length === CANON.length && servedIds.every((id, i) => id === CANON[i]) && !servedIds.includes('handdebug'), servedIds.join(','));
+    let acceptAll = true;
+    const refused = [];
+    for (const id of servedIds) {
+      const r = await fetch(`${srv.url}/api/handfx/cmd`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cmd: 'effect.set', args: { id } }) });
+      const j = await r.json();
+      if (!(r.status === 200 && j.ok)) { acceptAll = false; refused.push(id); }
+    }
+    ok(`cmd effect.set accepts all ${servedIds.length} registry ids`, acceptAll, refused.length ? `refused: ${refused.join(',')}` : '');
+    const unknown = await fetch(`${srv.url}/api/handfx/cmd`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cmd: 'effect.set', args: { id: 'definitely-not-an-effect' } }) });
+    ok('cmd effect.set rejects an unknown id', unknown.status === 400, `HTTP ${unknown.status}`);
+    await unknown.arrayBuffer();
+    const fire = await fetch(`${srv.url}/api/handfx/cmd`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cmd: 'projectile.fire', args: { skin: 'heart' } }) });
+    const fireBody = await fire.json();
+    ok('cmd projectile.fire is published', fire.status === 200 && fireBody.ok && fireBody.seq > 0, JSON.stringify(fireBody).slice(0, 120));
+    const badSkin = await fetch(`${srv.url}/api/handfx/cmd`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cmd: 'projectile.fire', args: { skin: 'banana' } }) });
+    ok('cmd projectile.fire refuses an unknown skin', badSkin.status === 400, `HTTP ${badSkin.status}`);
+    await badSkin.arrayBuffer();
+    const clear = await fetch(`${srv.url}/api/handfx/cmd`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cmd: 'edit.clear' }) });
+    ok('cmd edit.clear is published', clear.status === 200 && (await clear.json()).ok, '');
+    const bodyStat = await fetch(`${srv.url}/api/handfx/ack`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source: 'body', open: true }) });
+    ok('ack accepts the body page beat', bodyStat.status === 200, `HTTP ${bodyStat.status}`);
+    await bodyStat.arrayBuffer();
+    const maskAck = await fetch(`${srv.url}/api/handfx/ack`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ effect: 'bodyonfire', tracking: false, maskAt: Date.now() }) });
+    await maskAck.arrayBuffer();
+    const withBody = await (await fetch(`${srv.url}/api/handfx/status`)).json();
+    ok('status reports a body mask timestamp, no frames', Boolean(withBody.body && withBody.body.lastMaskAt > 0 && withBody.body.pageOpen === true), JSON.stringify(withBody.body));
+
+    // ── 10. the pane renders the 25 entries, skins and the body row ────────
+    await c.send('Page.navigate', { url: `${srv.url}/#/handfx` });
+    await waitFor(c, `Boolean(document.querySelector('.hfx') && document.querySelectorAll('.hfx-effect').length)`, 12000);
+    const paneAll = await evaluate(c, `({
+      tiles: [...document.querySelectorAll('.hfx-effect')].map((t) => t.querySelector('.hfx-effect-id').textContent),
+      gestures: [...document.querySelectorAll('.hfx-effect .hfx-note')].map((n) => n.textContent).filter((t) => /gesture:/.test(t)).length,
+      skins: document.querySelectorAll('.hfx-effect select').length,
+      bodyRow: [...document.querySelectorAll('.hfx-pill')].map((p) => p.textContent).join(' | '),
+      fireBtn: [...document.querySelectorAll('button')].some((b) => /projectile\\.fire/.test(b.textContent)),
+      clearBtn: [...document.querySelectorAll('button')].some((b) => /edit\\.clear/.test(b.textContent)),
+    })`);
+    ok(`pane renders all ${CANON.length} registry ids with gestures`, paneAll.tiles.length === CANON.length && paneAll.gestures >= CANON.length, `${paneAll.tiles.length} tiles, ${paneAll.gestures} gestures`);
+    ok('pane shows the shoot skin and the body row', paneAll.skins >= 1 && /mask|body/i.test(paneAll.bodyRow) && paneAll.fireBtn && paneAll.clearBtn, JSON.stringify({ skins: paneAll.skins, row: paneAll.bodyRow.slice(0, 120) }));
+
     const pageErr = await evaluate(c, 'window.__err || null');
     ok('no uncaught page exceptions', !pageErr, pageErr || '');
   } finally {
     chrome.kill('SIGKILL');
+    await new Promise((r) => setTimeout(r, 150));
     srv.stop();
   }
 

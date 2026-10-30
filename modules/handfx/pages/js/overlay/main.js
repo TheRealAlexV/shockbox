@@ -16,7 +16,7 @@
 
 import { Tracker, syntheticHands } from '../engine/tracker.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
-import { FxRenderer, EFFECT_ORDER, anchorsFrom } from '../engine/fx.js';
+import { FxRenderer, EFFECTS, anchorsFrom } from '../engine/fx.js';
 
 const $ = (id) => document.getElementById(id);
 const stage = $('stage');
@@ -24,15 +24,25 @@ const canvas = $('fx');
 const badge = $('badge');
 const banner = $('banner');
 
-// Effect → beat. The shipped gestures are the two from the OBS project; the two-hand gestures
-// the classifier can also see are used for the cursor so they never race the lightning arc.
-const GESTURE_EFFECT = {
-  palmUp: 'fireball',
-  bothFingertips: 'lightning',
-  palmFront: 'sparkring',
-  swipe: 'smoke',
-  palmTouch: 'next', // fingertips of both hands touching: step the effect list
-  bothPalmsUp: 'embers', // both palms up: a pile of embers (the "handful of fire" pose)
+/** The cursor's list order is the registry's (engine/fx.js → EFFECTS): one source of truth. */
+export const EFFECT_ORDER = Object.keys(EFFECTS);
+
+// Gesture → the registry ids it beats. The left-hand names are the classifier's own results
+// (`gestures.js`); the right-hand side is the registry's `gesture` documentation. A gesture can
+// beat more than one effect, and the *current* cursor picks which one draws, so eight gestures
+// can drive the whole list without racing each other. `next` steps the cursor (`palmTouch`,
+// the shipped "fingertips touching" gesture, stays the "next effect" action).
+const GESTURE_EFFECTS = {
+  palmUp: ['fireball'],
+  bothFingertips: ['lightning'],
+  palmFront: ['sparkring', 'frost', 'portal', 'electroshock'],
+  swipe: ['smoke', 'inkflow', 'echo'],
+  palmTouch: 'next',
+  bothPalmsUp: ['embers', 'bloomlife'],
+  bothRaised: ['disco', 'meteor'],
+  fist: ['shatter', 'cyber', 'edit'],
+  point: ['shoot'],
+  // `bodyAny` is not a hand gesture: the body page's mask is the trigger (see bodyChannel()).
 };
 
 const state = {
@@ -48,6 +58,9 @@ const state = {
   synthetic: false,
   lastAck: 0,
   startedAt: Date.now(),
+  bodyAt: 0, // last body-mask message (performance.now)
+  bodySeen: false,
+  status: null, // last /api/handfx/status read (the body page's model facts)
 };
 
 const fx = new FxRenderer(canvas, { onError: (msg) => setBanner(`Effects unavailable: ${msg}`, 'bad') });
@@ -83,9 +96,11 @@ function applySettings(status) {
   const s = {};
   for (const [k, d] of Object.entries(status.settings || {})) s[k] = d.value;
   state.settings = s;
+  state.status = status;
   fx.setSettings({
     effects: s.effects && s.effects.length ? s.effects : [],
     intensity: s.intensity || {},
+    skins: s.skins && typeof s.skins === 'object' ? s.skins : {},
     bufferScroll: s.bufferScroll ?? 0.35,
     mirror: s.mirror !== false,
     debugOverlay: s.debugOverlay === true,
@@ -106,10 +121,11 @@ function applySettings(status) {
   renderState();
 }
 
-/** The module's effect list, restricted to ids this build implements, in the served order. */
+/** The module's effect list, restricted to ids this build implements, in the served order. An id
+ *  this build cannot draw stays in the document and the pane shows it as such; it just never gets
+ *  a cursor slot here, so `effect.next` cannot land on a blank. */
 function effectiveEffects() {
-  const list = (state.settings?.effects || []).filter((id) => EFFECT_ORDER.includes(id));
-  return list;
+  return (state.settings?.effects || []).filter((id) => EFFECT_ORDER.includes(id));
 }
 
 function currentEffect() {
@@ -158,6 +174,15 @@ function applyBusCommand(msg) {
   } else if (cmd === 'tracking.toggle') {
     if (state.tracking) stopTracking();
     else startTracking({ fromBus: true });
+  } else if (cmd === 'projectile.fire') {
+    const skin = msg.args && msg.args.skin;
+    if (skin && state.settings) fx.setSettings({ skins: { ...(state.settings.skins || {}), shoot: skin } });
+    const n = spawnShoot(fx.view || null);
+    setBanner(n ? '' : 'projectile.fire: no hand in view — nothing fired', n ? 'ok' : 'warn');
+    ack(performance.now());
+  } else if (cmd === 'edit.clear') {
+    fx.editClear();
+    ack(performance.now());
   } else if (cmd === 'mirror.toggle' || cmd === 'settings.patch') {
     // The server already wrote the document; re-read it so the picture follows the operator.
     scheduleRefresh();
@@ -290,12 +315,10 @@ function onFrame(frame) {
   gate.tick(now);
   const fired = gate.update(result.gesture, now);
   if (fired.fire) {
-    const want = GESTURE_EFFECT[fired.fire];
+    const want = GESTURE_EFFECTS[fired.fire];
     if (want === 'next') {
       stepEffect(1);
       renderState();
-    } else if (want && effectiveEffects().includes(want)) {
-      fx.trigger(want, {});
     }
   }
 
@@ -305,8 +328,22 @@ function onFrame(frame) {
   if (hands.length && effectiveEffects().includes('embers') && !fx.live.has('embers') && result.gesture) {
     fx.trigger('embers', {});
   }
-  const beat = GESTURE_EFFECT[fired.fire || result.gesture];
-  if (beat && beat !== 'next' && effectiveEffects().includes(beat)) fx.trigger(beat, {});
+  // A gesture beats one effect. The cursor's effect wins when the gesture owns it (that is how the
+  // operator keeps a whole list reachable with eight gestures); otherwise the first enabled effect
+  // the gesture owns draws — the shipped "palm up → fireball when it is on" behaviour. The gate
+  // insists on a fresh fire, so a held gesture beats once, never every frame.
+  const cursorId = currentEffect();
+  const own = fired.fire ? GESTURE_EFFECTS[fired.fire] : null;
+  const beat =
+    Array.isArray(own) && own.length
+      ? effectiveEffects().includes(cursorId) && own.includes(cursorId)
+        ? cursorId
+        : own.find((x) => effectiveEffects().includes(x))
+      : null;
+  if (beat) {
+    if (beat === 'shoot') spawnShoot(anchors);
+    else fx.trigger(beat, {});
+  }
   const anchors = anchorsFrom(result.hands);
   if (swipe && swipe.speed > 0.5 && anchors.anchor) anchors.swipe = { ...anchors.anchor, radius: 0.18 };
   fx.view = anchors;
@@ -322,6 +359,107 @@ function onFrame(frame) {
   state.effect = currentEffect();
   renderState(now);
   ack(now);
+}
+
+/** `shoot`: the projectile skin's burst from the pointing hand (or the palm, if only that is
+ *  known). No hand is no shot — the renderer never invents a position. */
+function spawnShoot(anchors) {
+  const a = anchors && (anchors.anchor || anchors.front);
+  if (!a) {
+    setBanner('shoot: no hand to fire from', 'warn');
+    return 0;
+  }
+  const skin = state.settings?.skins?.shoot;
+  const n = fx.spawnBurst('shoot', a, null, skin === 'heart' ? 10 : 18);
+  // The effect is "live" for as long as its particles are: triggering the id keeps the pane's
+  // live marker honest and lets the renderer's own layer loop draw the batch.
+  if (n && effectiveEffects().includes('shoot') && !fx.live.has('shoot')) fx.trigger('shoot', { centre: a });
+  return n;
+}
+
+/* ---------------------------------------------------------------- hand edit */
+
+/** Strokes land only when the edit effect is drawn AND live, so a stray click never marks. */
+function drawWants() {
+  return fx.live.has('edit') && effectiveEffects().includes('edit');
+}
+
+/** Is a stroke in progress? The renderer's pointer record is the one truth. */
+function drawing() {
+  return Boolean(fx.editPointer);
+}
+
+function canvasPoint(ev) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) / Math.max(1, r.width), y: (ev.clientY - r.top) / Math.max(1, r.height) };
+}
+
+// Pointer strokes: only while the edit effect is live, so a stray click on the overlay never
+// leaves a mark. Coordinates are page space (the renderer mirrors for itself).
+canvas.addEventListener('pointerdown', (ev) => {
+  if (!drawWants()) return;
+  const p = canvasPoint(ev);
+  fx.editBegin(p.x, p.y);
+  canvas.setPointerCapture?.(ev.pointerId);
+});
+canvas.addEventListener('pointermove', (ev) => {
+  if (!drawWants() || !drawing()) return;
+  const p = canvasPoint(ev);
+  fx.editMove(p.x, p.y);
+});
+canvas.addEventListener('pointerup', () => {
+  if (!drawWants()) return;
+  fx.editEnd();
+});
+canvas.addEventListener('pointercancel', () => {
+  if (drawing()) fx.editEnd();
+});
+
+/* ---------------------------------------------------------------- body mask channel */
+
+// The body page (pages/body.html) runs pose + segmentation in its own small OBS source and posts
+// one ImageBitmap of the mask per sample on this channel. Nothing crosses HTTP: the bitmap is a
+// transferable in-process object, and the page keeps no copy.
+const bodyChannel = 'BroadcastChannel' in window ? new BroadcastChannel('handfx.body') : null;
+
+function bodyAlive(now = performance.now()) {
+  return state.bodySeen && now - state.bodyAt < 1000;
+}
+
+function releaseBodyEffects() {
+  for (const id of ['bodyonfire', 'bodysmoke', 'frozenbody']) fx.release(id);
+}
+
+if (bodyChannel) {
+  bodyChannel.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'mask' && msg.bitmap) {
+      const ok = fx.setBodyMask(msg.bitmap);
+      // Closing the bitmap is the receiver's job once it is uploaded.
+      if (typeof msg.bitmap.close === 'function') msg.bitmap.close();
+      if (ok) {
+        state.bodyAt = performance.now();
+        if (!state.bodySeen) setBanner('');
+        state.bodySeen = true;
+      }
+      return;
+    }
+    if (msg.type === 'status') {
+      state.bodyPage = msg;
+    }
+  };
+  // The page's camera stops (tab closed, camera released): the mask stops arriving on its own,
+  // the 1 s expiry below is the only needed contract.
+  bodyChannel.postMessage({ type: 'hello' });
+}
+
+function tickBody() {
+  const now = performance.now();
+  if (state.bodySeen && now - state.bodyAt >= 1000) {
+    state.bodySeen = false;
+    releaseBodyEffects();
+    setBanner('body mask stopped arriving (overlay: >1 s) — body effects off', 'warn');
+  }
 }
 
 /* ---------------------------------------------------------------- honest state out */
@@ -340,6 +478,10 @@ function ack(now = performance.now()) {
       hands: state.hands,
       gesture: state.gesture,
       error: state.error,
+      // The mask's receipt time, so the server's status can say "mask arriving" without a frame
+      // ever leaving this page. `body` also lets the pane name the body effects honestly.
+      maskAt: state.bodySeen ? state.bodyAt : 0,
+      body: state.bodySeen,
     }),
   }).catch(() => {});
 }
@@ -415,8 +557,25 @@ function drawDebug(frame, hands, now) {
 
 /* ---------------------------------------------------------------- frame loop */
 
+let bodyTickAt = 0;
 function loop(now) {
-  if (state.settings && state.settings.enabled !== false) fx.render(now, fx.view || {});
+  // The body mask expires 1 s after its last message; checked twice a second, not per frame.
+  if (now - bodyTickAt > 500) {
+    bodyTickAt = now;
+    tickBody();
+  }
+  if (state.settings && state.settings.enabled !== false) {
+    // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
+    // sees something and the channel is up), each enabled body effect stays alive, so a mask that
+    // goes quiet releases them through the expiry above.
+    if (state.bodySeen) {
+      for (const id of ['bodyonfire', 'bodysmoke', 'frozenbody']) {
+        const live = fx.live.get(id);
+        if (effectiveEffects().includes(id) && (!live || !live.active || live.age > 6)) fx.trigger(id, {});
+      }
+    }
+    fx.render(now, fx.view || {});
+  }
   requestAnimationFrame(loop);
 }
 
@@ -476,6 +635,12 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
     stopTracking,
     applyBusCommand,
     currentEffect,
+    effectiveEffects,
+    EFFECT_ORDER,
+    spawnShoot,
+    bodyAlive,
+    // Body-mask status for the pane/test: whether a mask arrived in the last second.
+    body: () => ({ seen: state.bodySeen, at: state.bodyAt }),
     isLive: () => fx.live.size > 0,
     liveIds: () => [...fx.live.keys()],
     ready: Boolean(fx.supported),

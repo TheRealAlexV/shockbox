@@ -1,0 +1,401 @@
+/* Notifications pane.
+ *
+ * Everything here leans on the shell's tokens (public/src/shell.css): same hairlines, same
+ * mono micro-labels, same accent. What this pane owns is the phone strip — a 405×720 canvas
+ * drawn at whatever width the column gives it, with the module's own toasts on it.
+ *
+ * The toasts are not a sketch: they are the module overlay's markup (.toast/.lead/.body/.acts)
+ * and its look classes (.t-ios, .t-android, .t-win11, .t-macos) reproduced at the strip's px
+ * size inside the scaled stage, so a look tuned here is the look OBS draws.
+ */
+
+.nt-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 264px;
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+  margin-top: 12px;
+}
+
+.nt-main { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.nt-side { min-width: 0; display: flex; flex-direction: column; gap: 12px; position: sticky; top: 0; }
+
+/* ------------------------------------------------------------------ quick */
+
+.nt-quick {
+  margin-top: 12px;
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+
+.nt-quick .segmented-sm .seg { font-size: 10px; padding: 0 9px; }
+.nt-quick input[type='range'] { width: 126px; accent-color: var(--accent); }
+.nt-height-val {
+  min-width: 26px;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--fg-2);
+}
+
+/* ----------------------------------------------------------------- stage */
+
+.nt-stage {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding: 12px;
+  border: var(--hair) solid var(--line);
+  background:
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 9px),
+    var(--bg-1);
+  overflow: hidden;
+}
+
+/* The canvas is authored at 405×720 and scaled to the column: every px inside it is a strip
+   px, so the toast sizes read as real numbers, not a fitted approximation. */
+.nt-strip {
+  --nt-scale: 1;
+  --nt-h: 76px;
+  position: relative;
+  flex: 0 0 auto;
+  width: 405px;
+  height: 720px;
+  transform: scale(var(--nt-scale));
+  transform-origin: top center;
+  border: 1px solid var(--line-2);
+  background:
+    linear-gradient(180deg, rgba(177, 140, 255, 0.05), transparent 120px),
+    #101014;
+  border-radius: 10px;
+  overflow: hidden;
+  pointer-events: none;
+  /* the phone's own shadow, so the canvas reads as a surface inside the panel */
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+}
+
+/* --- the preview toast: the overlay's own structure --------------------- */
+
+.nt-strip .toast {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  box-sizing: border-box;
+  border-radius: 14px;
+  pointer-events: none;
+  /* stacked rows keep their server y; a spawn lands on top with a short rise */
+  transition: top 180ms ease;
+}
+
+.nt-strip .toast[data-newest='true'] {
+  animation: nt-in 220ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+
+@keyframes nt-in {
+  from { opacity: 0; transform: translateX(14px) scale(0.99); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nt-strip .toast[data-newest='true'] { animation: none; }
+  .nt-strip .toast { transition: none; }
+}
+
+.nt-strip .lead {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+
+.nt-strip .glyph {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+}
+
+.nt-strip .body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nt-strip .title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nt-strip .text {
+  font-size: 13px;
+  line-height: 1.25;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.nt-strip .acts {
+  flex: 0 0 auto;
+  align-self: center;
+  display: flex;
+  gap: 6px;
+}
+
+.nt-strip .btn {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border-radius: 7px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+/* --- the four looks, copied from the overlay ---------------------------- */
+
+.nt-strip .t-ios {
+  background: rgba(246, 246, 248, 0.97);
+  color: #101014;
+  border-radius: 16px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.32), inset 0 0 0 1px rgba(255, 255, 255, 0.7);
+}
+
+.nt-strip .t-ios .lead { background: #e9e9ee; color: #3a3a40; }
+
+.nt-strip .t-android {
+  background: #f7f7f9;
+  color: #14161a;
+  border-radius: 20px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
+}
+
+.nt-strip .t-android .lead { background: #dfe3ea; color: #2c313a; }
+
+.nt-strip .t-win11 {
+  background: #f3f3f3;
+  color: #1a1a1a;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  border-right: 4px solid #2b88d8;
+}
+
+.nt-strip .t-win11 .lead { background: #e5e5e5; color: #0078d4; }
+
+.nt-strip .t-macos {
+  background: rgba(236, 236, 238, 0.96);
+  color: #1b1b1d;
+  border-radius: 12px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(10px);
+}
+
+.nt-strip .t-macos .lead { background: #dcdcdf; color: #3b3b3f; }
+
+/* --- ruler + empty state ------------------------------------------------ */
+
+/* One tick per stack slot down the left edge: the capacity has a shape, not just a number. */
+.nt-ruler {
+  position: absolute;
+  left: 3px;
+  top: 14px;
+  bottom: 14px;
+  width: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nt-ruler-tick {
+  flex: 1 1 0;
+  min-height: 6px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.nt-ruler-tick[hidden] { display: none; }
+
+.nt-empty {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg-4);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.nt-empty[hidden] { display: none; }
+
+.nt-empty-mark {
+  width: 22px;
+  height: 2px;
+  background: var(--line-3);
+}
+
+/* --- panel head bits ---------------------------------------------------- */
+
+.nt-stack-count {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--fg-2);
+}
+
+.nt-stack-count[data-state='full'] { color: var(--warn); }
+
+.nt-mode {
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding: 1px 6px;
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--r);
+}
+
+/* ----------------------------------------------------------------- storm */
+
+.nt-storm-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 10px 12px 12px;
+}
+
+.nt-storm-body .look-label { font-size: 9.5px; }
+.nt-storm-body .control-spacer { flex: 1 1 auto; }
+.nt-storm-body .segmented-sm .seg { font-size: 10px; padding: 0 8px; }
+.nt-unit { font-size: 9.5px; }
+.nt-storm-body .input-num { width: 64px; }
+
+.nt-storm .panel-head { min-height: 26px; }
+
+/* count is meaningless in fill mode: still clickable, visibly disabled */
+.nt-storm-body [data-disabled='true'] { opacity: 0.45; }
+
+/* ------------------------------------------------------------------ send */
+
+.nt-send-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  min-width: 0;
+}
+
+.nt-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  padding: 0 8px;
+  height: 30px;
+}
+
+/* ------------------------------------------------------------------ list */
+
+.nt-live > .panel-body,
+.nt-live ol { margin: 0; padding: 0; list-style: none; }
+
+.nt-log { display: flex; flex-direction: column; }
+
+.nt-log-row {
+  display: grid;
+  grid-template-columns: 6px auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border-bottom: var(--hair) solid var(--line);
+  cursor: pointer;
+  min-width: 0;
+}
+
+.nt-log-row:last-child { border-bottom: 0; }
+.nt-log-row:hover { background: var(--bg-2); }
+
+.nt-log-type {
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  color: var(--fg-3);
+}
+
+.nt-log-text {
+  font-size: 11.5px;
+  color: var(--fg-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.nt-log-when {
+  font-size: 9.5px;
+  color: var(--fg-4);
+}
+
+.nt-log-empty {
+  padding: 14px 12px;
+  font-size: 11px;
+  color: var(--fg-4);
+}
+
+/* ---------------------------------------------------------------- status */
+
+.nt-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 10px 12px 12px;
+}
+
+.nt-status .look-label { font-size: 9.5px; }
+
+.nt-stream {
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  color: var(--fg-4);
+}
+
+.nt-stream[data-state='live'] { color: var(--ok); }
+.nt-stream[data-state='idle'] { color: var(--warn); }
+
+/* --------------------------------------------------------------- settings */
+
+.nt-settings { margin-top: 0; }
+
+/* ------------------------------------------------------------------ narrow */
+
+@media (max-width: 1180px) {
+  .nt-body { grid-template-columns: minmax(0, 1fr); }
+  .nt-side { position: static; }
+  .nt-side { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+}
+
+@media (max-width: 760px) {
+  .nt-side { grid-template-columns: minmax(0, 1fr); }
+  .nt-stage { padding: 8px; }
+}

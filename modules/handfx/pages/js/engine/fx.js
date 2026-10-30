@@ -6,16 +6,78 @@
 //   2  bloom     — a 4× downsample of scene, blurred, added by the final pass
 //   3  debug     — camera + landmarks drawn with 2-D canvas primitives (only in debug mode)
 //
-// An effect is a plain object with `program` (its GLSL), `setFrame(gl, uniforms, frame)` to fill
-// its uniforms, `mode` (0 add light, 1 source-over) and `weight(frame)`. Effects are listed in one
-// registry so the server can name them (ids only) and the page can order/toggle them. The renderer
-// knows nothing about hands: main.js reduces a frame to per-effect parameters (a palm position, a
-// pair of fingertip points) and hands them over.
+// An effect is a plain object with `program` (its GLSL), `mode` (0 add light, 1 source-over) and a
+// `layer` ('hands' | 'body' | 'spectacle'): effects are drawn grouped by layer in that order, and
+// inside a layer the operator's `settings.effects` order is kept. The renderer fills each effect's
+// uniforms itself (see `_drawEffect`) — there is no per-effect `setFrame` callback to keep in sync.
+// Effects are listed in one registry so the server can name them (ids only) and the page can
+// order/toggle them. The renderer knows nothing about hands: main.js reduces a frame to
+// per-effect anchors (palms, fingertip pairs, a palm towards the camera, a swipe) and hand
+// landmarks, and hands them over in `view`.
+//
+// Texture units — one map, because the samplers are bound by number and a unit that still points
+// at the previous pass's texture is how a black camera picture happens:
+//   0  camera / generic blit source            (_blit, _blitCamera, camera)
+//   1  layer / composite source                (_composite, _blitCamera)
+//   2  body mask      (u_body, body effects)   TEXTURE_UNIT_BODY
+//   3  history (ping-pong) (u_prev, inkflow)   TEXTURE_UNIT_HISTORY
+//   4  scene snapshot (u_src, electroshock)    TEXTURE_UNIT_SNAP
+//   5  particles source (u_body/u_prev/u_src   TEXTURE_UNIT_NEUTRAL, nil)
+// The final pass uses 0 (scene) and 1 (bloom).
 
 import { VERT, FIREBALL, LIGHTNING, SPARKRING, EMBERS, SMOKE, COMPOSITE, FINAL, BLIT } from './fx-glsl.js';
+import {
+  WIRES,
+  AURA,
+  FROST,
+  PORTAL,
+  DISCO,
+  SLIME,
+  INKFLOW,
+  SHATTER,
+  ECHO,
+  BODYFIRE,
+  BODYSMOKE,
+  ELECTOWAVE,
+  FROZENBODY,
+  CYBER,
+  BLOOMLIFE,
+  METEOR,
+  HEART,
+  PROJECTILE,
+} from './fx-glsl2.js';
 import { palmCentre, handScale } from './tracker.js';
 
 const EFFECT_ORDER = ['fireball', 'lightning', 'sparkring', 'embers', 'smoke'];
+
+/** Layer draw order. Effects are drawn grouped by layer in this order, never interleaved. */
+const LAYER_ORDER = ['hands', 'body', 'spectacle'];
+
+/**
+ * The twenty-one MediaPipe landmarks as one shape: one hand's 2-D points plus its scale and
+ * handedness. `view.hands` carries these (already mirrored, page space) and every effect that needs
+ * a skeleton or a per-hand blob reads them from here — nothing invents a position when there is no
+ * hand: `view.hands` is simply empty.
+ */
+export const GESTURE_BONES = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [17, 18], [18, 19], [19, 20],
+  [0, 9], [0, 13], [0, 17],
+];
+
+const TEXTURE_UNIT_BODY = 2;
+const TEXTURE_UNIT_HISTORY = 3;
+const TEXTURE_UNIT_SNAP = 4;
+const TEXTURE_UNIT_NEUTRAL = 5;
+
+/** Per-upload EMA weight for the body mask (see setBodyMask). */
+const BODY_EMA = 0.35;
+
+/** How long a history-needing effect may be absent before its ping-pong targets are cleared. */
+const HISTORY_IDLE_FRAMES = 30;
 
 export const EFFECTS = {
   fireball: {
@@ -23,6 +85,7 @@ export const EFFECTS = {
     title: 'Fireball',
     gesture: 'palmUp',
     mode: 0,
+    layer: 'hands',
     program: FIREBALL,
   },
   lightning: {
@@ -30,6 +93,7 @@ export const EFFECTS = {
     title: 'Lightning fingers',
     gesture: 'bothFingertips',
     mode: 0,
+    layer: 'hands',
     program: LIGHTNING,
   },
   sparkring: {
@@ -37,6 +101,7 @@ export const EFFECTS = {
     title: 'Spark ring',
     gesture: 'palmFront',
     mode: 0,
+    layer: 'hands',
     program: SPARKRING,
   },
   embers: {
@@ -44,6 +109,7 @@ export const EFFECTS = {
     title: 'Ember rise',
     gesture: 'any',
     mode: 0,
+    layer: 'hands',
     program: EMBERS,
   },
   smoke: {
@@ -51,9 +117,162 @@ export const EFFECTS = {
     title: 'Smoke veil',
     gesture: 'swipe',
     mode: 1,
+    layer: 'hands',
     program: SMOKE,
   },
+  aura: {
+    id: 'aura',
+    title: 'Aura outline',
+    gesture: 'any',
+    mode: 0,
+    layer: 'hands',
+    program: AURA,
+  },
+  wires: {
+    id: 'wires',
+    title: 'Wire skeleton',
+    gesture: 'any',
+    mode: 0,
+    layer: 'hands',
+    program: WIRES,
+  },
+  frost: {
+    id: 'frost',
+    title: 'Frost creep',
+    gesture: 'palmFront',
+    mode: 0,
+    layer: 'hands',
+    program: FROST,
+  },
+  portal: {
+    id: 'portal',
+    title: 'Portal ring',
+    gesture: 'openPalmFront',
+    mode: 0,
+    layer: 'hands',
+    program: PORTAL,
+  },
+  disco: {
+    id: 'disco',
+    title: 'Disco ball',
+    gesture: 'bothRaised',
+    mode: 0,
+    layer: 'hands',
+    program: DISCO,
+  },
+  slime: {
+    id: 'slime',
+    title: 'Slime drip',
+    gesture: 'palmTouch',
+    mode: 1,
+    layer: 'hands',
+    program: SLIME,
+  },
+  inkflow: {
+    id: 'inkflow',
+    title: 'Ink flow',
+    gesture: 'swipe',
+    mode: 1,
+    layer: 'hands',
+    program: INKFLOW,
+  },
+  shatter: {
+    id: 'shatter',
+    title: 'Shatter shards',
+    gesture: 'fist',
+    mode: 0,
+    layer: 'hands',
+    program: SHATTER,
+  },
+  cyber: {
+    id: 'cyber',
+    title: 'Cyber glitch',
+    gesture: 'fist',
+    mode: 0,
+    layer: 'hands',
+    program: CYBER,
+  },
+  bloomlife: {
+    id: 'bloomlife',
+    title: 'Bloom life',
+    gesture: 'bothPalmsUp',
+    mode: 0,
+    layer: 'hands',
+    program: BLOOMLIFE,
+  },
+  echo: {
+    id: 'echo',
+    title: 'Echo trails',
+    gesture: 'any',
+    mode: 1,
+    layer: 'hands',
+    program: ECHO,
+  },
+  bodyonfire: {
+    id: 'bodyonfire',
+    title: 'Body on fire',
+    gesture: 'bodyAny',
+    mode: 0,
+    layer: 'body',
+    program: BODYFIRE,
+  },
+  bodysmoke: {
+    id: 'bodysmoke',
+    title: 'Body smoke',
+    gesture: 'bodyAny',
+    mode: 1,
+    layer: 'body',
+    program: BODYSMOKE,
+  },
+  frozenbody: {
+    id: 'frozenbody',
+    title: 'Frozen body',
+    gesture: 'bodyAny',
+    mode: 0,
+    layer: 'body',
+    program: FROZENBODY,
+  },
+  edit: {
+    id: 'edit',
+    title: 'Hand edit',
+    gesture: 'fist',
+    mode: 0,
+    layer: 'spectacle',
+    program: null, // the pointer's own strokes, drawn straight onto the scene
+  },
+  electroshock: {
+    id: 'electroshock',
+    title: 'Electro shockwave',
+    gesture: 'palmFront',
+    mode: 0,
+    layer: 'spectacle',
+    program: ELECTOWAVE,
+  },
+  meteor: {
+    id: 'meteor',
+    title: 'Meteor',
+    gesture: 'bothRaised',
+    mode: 0,
+    layer: 'spectacle',
+    program: METEOR,
+  },
+  shoot: {
+    id: 'shoot',
+    title: 'Shoot',
+    gesture: 'point',
+    mode: 0,
+    layer: 'spectacle',
+    program: null, // drawn as particles with the PROJECTILE / HEART program
+  },
 };
+
+/** Effects whose fragment program samples the previous frame (history ping-pong). */
+const HISTORY_EFFECTS = new Set(['inkflow', 'echo']);
+/** Effects that sample a snapshot of the accumulated scene (taken once per frame, only when one of
+ *  these is live, and only after the layer it belongs to has been composited). */
+const SNAPSHOT_EFFECTS = new Set(['electroshock', 'echo']);
+/** Effects that read the body mask; they do not draw at all until a mask has been set. */
+const BODY_EFFECTS = new Set(['bodyonfire', 'bodysmoke', 'frozenbody']);
 
 function compile(gl, type, src, label) {
   const sh = gl.createShader(type);
@@ -92,6 +311,21 @@ function texture(gl, w, h) {
   return t;
 }
 
+function texFbo(gl, w, h) {
+  const tex = texture(gl, w, h);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fbo };
+}
+
+function clearPair(gl, pair) {
+  if (!pair) return;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, pair.fbo);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+}
+
 /**
  * One effect's live state. `age` counts up while the gesture is held, `fade` ramps in/out so an
  * effect never pops, and `gone` retires it after the fade so nothing keeps drawing.
@@ -108,6 +342,95 @@ class Live {
     this.fade = 0;
     this.energy = 0;
     this.extra = {};
+    /** Layer this effect belongs to ('hands' | 'body' | 'spectacle'): effects are drawn grouped by
+     *  layer, so one layer's pass (ink history, body mask) can be shared by its effects. */
+    this.layer = 'hands';
+    /** Bumped whenever this effect starts drawing again, so a layer's history starts clean
+     *  instead of advecting whatever the previous spawn left behind. */
+    this.epoch = (Live.epoch = (Live.epoch || 0) + 1);
+  }
+}
+
+/* ------------------------------------------------------------------ edit stroke */
+
+/** Program for the hand-edit brush: the shared quad positioned at the pointer, soft-edged. */
+function strokeProgram(gl) {
+  const vs = compile(gl, gl.VERTEX_SHADER, EDIT_STROKE, 'edit-stroke vertex');
+  const fs = compile(gl, gl.FRAGMENT_SHADER, EDIT_FRAG, 'edit-stroke');
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.bindAttribLocation(p, 0, 'a_pos');
+  gl.linkProgram(p);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`edit-stroke program failed: ${gl.getProgramInfoLog(p)}`);
+  return p;
+}
+
+const EDIT_STROKE = `#version 300 es
+in vec2 a_pos;
+uniform vec2 u_center;   // field space (uv.x * aspect, 1 - page y)
+uniform float u_size;    // half the brush's field-space size
+uniform float u_aspect;
+out vec2 v_uv;
+void main() {
+  vec2 q = u_center + a_pos * u_size;
+  v_uv = a_pos * 0.5 + 0.5;
+  gl_Position = vec4(q.x / u_aspect * 2.0 - 1.0, q.y * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const EDIT_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform vec3 u_colour;
+out vec4 outColor;
+void main() {
+  float d = length(v_uv - 0.5) * 2.0;
+  float a = smoothstep(1.0, 0.55, d);
+  outColor = vec4(u_colour * a, a);
+}`;
+
+/* ------------------------------------------------------------------ particles */
+
+const PARTICLES = 512;
+const P_FIELDS = ['x', 'y', 'vx', 'vy', 'age', 'life', 'size', 'skin'];
+
+/**
+ * A tiny CPU particle store, flat `Float32Array` records so a headless test can count and a batched
+ * draw can read one buffer. `skin` is 0 (projectile) or 1 (heart). Positions are page space and the
+ * renderer converts them per draw, like every other anchor.
+ */
+class ParticleStore {
+  constructor(capacity = PARTICLES) {
+    this.capacity = capacity;
+    this.data = new Float32Array(capacity * P_FIELDS.length);
+    this.count = 0; // records in use; compacted when one dies
+    this.cursor = 0;
+  }
+  /** Allocate one record; overwrites the oldest when full (a burst never stalls the frame). */
+  alloc() {
+    if (this.count < this.capacity) {
+      const i = this.count++ * P_FIELDS.length;
+      this.data.fill(0, i, i + P_FIELDS.length);
+      return i;
+    }
+    const i = this.cursor * P_FIELDS.length;
+    this.cursor = (this.cursor + 1) % this.capacity;
+    this.data.fill(0, i, i + P_FIELDS.length);
+    return i;
+  }
+  /** Remove record `i` by moving the last record into its slot (order does not matter here). */
+  kill(i) {
+    const L = P_FIELDS.length;
+    const last = (this.count - 1) * L;
+    if (i !== last) this.data.copyWithin(i, last, last + L);
+    this.count--;
+  }
+  clear() {
+    this.count = 0;
+    this.cursor = 0;
+    this.data.fill(0);
   }
 }
 
@@ -124,6 +447,10 @@ export class FxRenderer {
     this.frame = 0;
     this.debugGl = false; // set true from the browser test to collect the first error per stage
     this.debugLog = [];
+    this.particles = new ParticleStore(PARTICLES);
+    this.bodyMaskSeen = false;
+    this.historyAge = 0;
+    this.historyEpoch = 0;
   }
 
   init() {
@@ -147,12 +474,23 @@ export class FxRenderer {
         blit: program(gl, BLIT, 'blit'),
         effects: {},
       };
-      for (const id of Object.keys(EFFECTS)) this.progs.effects[id] = program(gl, EFFECTS[id].program, id);
+      for (const id of Object.keys(EFFECTS)) {
+        if (!EFFECTS[id].program) continue;
+        this.progs.effects[id] = program(gl, EFFECTS[id].program, id);
+      }
+      this.progs.skins = {
+        projectile: program(gl, PROJECTILE, 'projectile'),
+        heart: program(gl, HEART, 'heart'),
+      };
+      // The edit stroke needs its own program: the quad is positioned in the vertex shader (a_pos
+      // is ±1, scaled by u_size and offset by u_center), so the brush lands where the pointer is.
+      this._editProg = strokeProgram(gl);
     } catch (err) {
       this.error = err.message;
       this.onError(this.error);
       return false;
     }
+    this._uniformCache = new WeakMap();
     // Unit quad: two triangles, -1..1. One VAO, drawn for every pass.
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -162,6 +500,36 @@ export class FxRenderer {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     this.vao = vao;
+    // One 1x1 black texture every sampler unit falls back to when its effect is skipped, and one
+    // white 1x1 for the edit canvas's "add" command (white x alpha = paint).
+    this.neutralTex = texture(gl, 1, 1);
+    gl.activeTexture(gl.TEXTURE0 + TEXTURE_UNIT_NEUTRAL);
+    gl.bindTexture(gl.TEXTURE_2D, this.neutralTex);
+    this.whiteTex = texture(gl, 1, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+    gl.activeTexture(gl.TEXTURE0);
+    // A lost context comes back with every object gone: rebuild rather than draw into nothing.
+    this._onLost = (ev) => {
+      ev.preventDefault();
+      this.supported = false;
+      this._lost = true;
+      if (!this.error) {
+        this.error = 'WebGL2 context lost';
+        this.onError(this.error);
+      }
+    };
+    this._onRestored = () => {
+      this._lost = false;
+      this.error = null;
+      this.progs = null;
+      this.w = 0;
+      this.h = 0;
+      this.history = null;
+      this._historyEpoch = -1;
+      if (this.init()) this.onError(null);
+    };
+    this.canvas.addEventListener('webglcontextlost', this._onLost);
+    this.canvas.addEventListener('webglcontextrestored', this._onRestored);
     this.supported = true;
     this._resize();
     return true;
@@ -173,6 +541,9 @@ export class FxRenderer {
       ...s,
       effects: Array.isArray(s.effects) ? s.effects : this.settings.effects,
       intensity: Object.assign({}, this.settings.intensity, s.intensity || {}),
+      // `skins` is optional everywhere (absent means the default projectile orb); when it is
+      // given it replaces the map, so removing a key falls back to the default.
+      ...(s.skins && typeof s.skins === 'object' ? { skins: { ...s.skins } } : {}),
     };
     // Effects removed from the list stop drawing at once (their fade-out is not worth keeping
     // when the operator has switched the effect off; the server calls that state the truth).
@@ -190,28 +561,41 @@ export class FxRenderer {
     this.h = h;
     this.canvas.width = w;
     this.canvas.height = h;
-    if (this.sceneTex) gl.deleteTexture(this.sceneTex);
-    if (this.layerTex) gl.deleteTexture(this.layerTex);
-    if (this.bloomTex) gl.deleteTexture(this.bloomTex);
-    if (this.sceneFbo) gl.deleteFramebuffer(this.sceneFbo);
-    if (this.layerFbo) gl.deleteFramebuffer(this.layerFbo);
-    if (this.bloomFbo) gl.deleteFramebuffer(this.bloomFbo);
-    const make = (w2, h2) => {
-      const tex = texture(gl, w2, h2);
-      const fbo = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-      return { tex, fbo };
-    };
-    const scene = make(w, h);
-    const layer = make(w, h);
-    const bloom = make(Math.max(2, w >> 2), Math.max(2, h >> 2));
+    for (const t of [this.sceneTex, this.layerTex, this.bloomTex, this.snapTex]) if (t) gl.deleteTexture(t);
+    for (const f of [this.sceneFbo, this.layerFbo, this.bloomFbo, this.snapFbo]) if (f) gl.deleteFramebuffer(f);
+    if (this.history) for (const p of this.history) if (p) {
+      gl.deleteTexture(p.tex);
+      gl.deleteFramebuffer(p.fbo);
+    }
+    const scene = texFbo(gl, w, h);
+    const layer = texFbo(gl, w, h);
+    const bloom = texFbo(gl, Math.max(2, w >> 2), Math.max(2, h >> 2));
     this.sceneTex = scene.tex;
     this.sceneFbo = scene.fbo;
     this.layerTex = layer.tex;
     this.layerFbo = layer.fbo;
     this.bloomTex = bloom.tex;
     this.bloomFbo = bloom.fbo;
+    // Spectacle snapshot: a copy of the scene before a spectacle effect is applied.
+    const snap = texFbo(gl, w, h);
+    this.snapTex = snap.tex;
+    this.snapFbo = snap.fbo;
+    this._snapTaken = false;
+    // History ping-pong: full-res RGBA8, cleared on every (re)size and when the effect respawns.
+    this.history = [texFbo(gl, w, h), texFbo(gl, w, h)];
+    this.historyCur = 0;
+    this.historyAge = 0;
+    this.historyEpoch = 0;
+    for (const p of this.history) clearPair(gl, p);
+    clearPair(gl, snap);
+    // The hand-edit canvas: full-res, wiped on resize; `edit.clear()` wipes it on demand.
+    if (this.edit) {
+      gl.deleteTexture(this.edit.tex);
+      gl.deleteFramebuffer(this.edit.fbo);
+    }
+    this.edit = texFbo(gl, w, h);
+    this.editPointer = null;
+    clearPair(gl, this.edit);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
@@ -221,16 +605,28 @@ export class FxRenderer {
     if (!this.settings.effects.includes(id)) return false;
     const intensity = clamp(Number(this.settings.intensity[id] ?? 1), 0, 2);
     if (intensity <= 0.001) return false;
+    // A body effect has nothing to draw without a mask; say so instead of drawing an empty pass.
+    if (BODY_EFFECTS.has(id) && !this.bodyMaskSeen) return false;
     let live = this.live.get(id);
     if (!live) {
       live = new Live(id, intensity, centre);
+      live.layer = EFFECTS[id].layer || 'hands';
       this.live.set(id, live);
     } else {
       live.active = true;
       live.intensity = intensity;
+      live.epoch = (Live.epoch = (Live.epoch || 0) + 1);
+      live.extra = {};
       if (centre) live.centre = centre;
     }
     if (radius) live.radius = radius;
+    // The hand-edit canvas is a scratch picture: a new session starts on a clean canvas, because
+    // the previous gesture's strokes belong to the previous effect, not this one.
+    if (id === 'edit') this.editClear();
+    // `shoot` and `meteor` throw particles from the anchor the gesture fired at.
+    if (id === 'shoot' || id === 'meteor') {
+      this.spawnBurst(id, centre || live.centre, null, id === 'shoot' ? 24 : 16);
+    }
     return true;
   }
 
@@ -244,24 +640,366 @@ export class FxRenderer {
     for (const live of this.live.values()) live.active = false;
   }
 
+  /* ------------------------------------------------------------ body mask */
+
+  /**
+   * Give the renderer the body silhouette mask. Accepted sources: anything `texImage2D` takes (an
+   * ImageBitmap, ImageData, canvas, OffscreenCanvas, video) uploaded as RGBA with its alpha as the
+   * mask — or `{ width, height, data }` with a Uint8Array of one channel (w*h, an R8 mask) or four
+   * (w*h*4, RGBA).
+   *
+   * The mask is smoothed with an exponential running average *on upload*, not in a blit pass: the
+   * tracker hands it over once per camera frame at a fraction of the canvas size, so the few
+   * hundred kilobytes of lerp in JS cost less than a full-resolution blend target that would have
+   * to be cleared and re-read every frame — and an upload-time EMA has to happen exactly once per
+   * sample, which is the rate a blit cannot see from here. `BODY_EMA = 0.35` keeps a flickering
+   * silhouette from popping: `out = prev + (in - prev) * 0.35`.
+   */
+  setBodyMask(source) {
+    return this._uploadBodyMask(source, true);
+  }
+
+  /** One upload. `smooth` runs the EMA; `false` seeds it (first mask, or a deliberate reset). */
+  _uploadBodyMask(source, smooth) {
+    const gl = this.gl;
+    if (!gl || !source) return false;
+    const w = Math.max(1, Math.round(source.width || source.displayWidth || 0));
+    const h = Math.max(1, Math.round(source.height || source.displayHeight || 0));
+    let px = null;
+    if (ArrayBuffer.isView(source.data)) {
+      const n = source.data.length;
+      if (n === w * h) {
+        px = new Uint8Array(w * h * 4);
+        for (let i = 0, j = 0; i < n; i++, j += 4) px[j] = px[j + 1] = px[j + 2] = px[j + 3] = source.data[i];
+      } else if (n === w * h * 4) {
+        px = new Uint8Array(source.data.buffer || source.data, source.data.byteOffset || 0, n);
+      }
+    }
+    if (px && smooth && this._bodyRaw && this._bodyRaw.length === px.length) {
+      const a = BODY_EMA;
+      const prev = this._bodyRaw;
+      for (let i = 0; i < px.length; i++) px[i] = prev[i] + (px[i] - prev[i]) * a;
+    }
+    if (px) this._bodyRaw = Uint8Array.from(px);
+    if (!this.bodyTex) this.bodyTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.bodyTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    try {
+      if (px) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    } catch (err) {
+      // A source the driver refuses (a dead video element, an empty bitmap): keep the old mask.
+      return false;
+    }
+    this.bodyW = w;
+    this.bodyH = h;
+    this.bodyMaskSeen = true;
+    return true;
+  }
+
+  /* ------------------------------------------------------------ particles */
+
+  /**
+   * `shoot` and `meteor` spawn from here. `kind` picks the skin and the spread, `anchor` is page
+   * space, `dir` (optional) is the launch direction in page space, `count` the burst size. Kept
+   * public and small so a headless test can spawn and count without a camera.
+   */
+  spawnBurst(kind, anchor, dir, count) {
+    const n = Math.max(1, Math.min(128, count | 0));
+    // No anchor is no burst: the renderer never invents a position (same rule as live.centre).
+    if (!anchor || !Number.isFinite(anchor.x) || !Number.isFinite(anchor.y)) return 0;
+    const a = anchor;
+    const d = dir && (Number.isFinite(dir.x) || Number.isFinite(dir.y)) ? Math.hypot(dir.x, dir.y) || 1 : 0;
+    const launched = kind === 'meteor' || kind === 'shoot';
+    for (let i = 0; i < n; i++) {
+      const o = this.particles.alloc();
+      const ang = Math.random() * Math.PI * 2;
+      const speed = (kind === 'meteor' ? 0.55 : 0.35) * (0.4 + Math.random());
+      let vx = Math.cos(ang) * speed;
+      let vy = Math.sin(ang) * speed;
+      if (launched) {
+        // Down/up of page space: y grows downward, so an upward launch is negative vy.
+        vx = (d ? dir.x / d : 0) * speed * 1.6;
+        vy = (d ? dir.y / d : -1) * speed * 1.6;
+      }
+      const skin = kind === 'shoot' ? this._skinIndex('shoot') : 0;
+      const data = this.particles.data;
+      data[o + 0] = a.x;
+      data[o + 1] = a.y;
+      data[o + 2] = vx;
+      data[o + 3] = vy;
+      data[o + 4] = 0;
+      data[o + 5] = launched ? 0.9 + Math.random() * 0.8 : 0.5 + Math.random() * 0.8;
+      // field-space radius: page-space sizes scale with the shorter side, like every other anchor
+      data[o + 6] = (skin === 1 ? 0.035 : 0.018) * (0.7 + Math.random() * 0.7);
+      data[o + 7] = skin;
+    }
+    return n;
+  }
+
+  /**
+   * Which skin an effect wears. `settings.skins` is optional (id → 'heart' | 'projectile'); a
+   * missing id, an absent settings object or an id this build does not draw all mean the default
+   * projectile orb — the setting never invents a skin.
+   */
+  _skinIndex(id) {
+    const skins = this.settings?.skins;
+    const want = skins && typeof skins === 'object' ? skins[id] : null;
+    return want === 'heart' ? 1 : 0;
+  }
+
+  /** Records currently live. Headless tests read this to prove the burst integrated. */
+  particleCount() {
+    return this.particles.count;
+  }
+
+  /** Advance the particle store by `dt` seconds and retire what expired. */
+  _integrateParticles(dt) {
+    const data = this.particles.data;
+    const L = P_FIELDS.length;
+    for (let r = this.particles.count - 1; r >= 0; r--) {
+      const o = r * L;
+      data[o + 4] += dt;
+      if (data[o + 4] >= data[o + 5]) {
+        this.particles.kill(o);
+        continue;
+      }
+      data[o + 0] += data[o + 2] * dt;
+      data[o + 1] += data[o + 3] * dt;
+      // Drag and a little buoyancy: a projectile's trail settles rather than flying off the frame.
+      data[o + 2] *= 1 - Math.min(0.9, dt * 1.8);
+      data[o + 3] = data[o + 3] * (1 - Math.min(0.9, dt * 1.8)) - dt * 0.05;
+    }
+  }
+
+  /**
+   * Draw the particle store, one program per skin. Every particle gets its own textured quad — the
+   * skin's own fragment program, fed that particle's centre/size/fade — which is the cheapest batch
+   * that shares a program and the uniform header: instancing would need a second vertex buffer and
+   * a per-particle attribute stream for a store that is often empty, while a positioned quad costs
+   * one draw and no new state. Additive, like the light effects.
+   */
+  _drawParticles(view, t) {
+    const gl = this.gl;
+    if (!this.particles.count) return 0;
+    const data = this.particles.data;
+    const L = P_FIELDS.length;
+    let draws = 0;
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    for (const [skin, progKey] of [[0, 'projectile'], [1, 'heart']]) {
+      const prog = this.progs.skins[progKey];
+      if (!prog) continue;
+      let used = false;
+      gl.useProgram(prog);
+      gl.bindVertexArray(this.vao);
+      for (let r = 0; r < this.particles.count; r++) {
+        const o = r * L;
+        if (Math.round(data[o + 7]) !== skin) continue;
+        if (!used) {
+          // the header and per-program uniforms are filled once per batch
+          this._uniformHeader(prog, t, 7.0 + skin);
+          used = true;
+        }
+        const life = Math.max(0.001, data[o + 5]);
+        const age = data[o + 4];
+        // fade in over the first 0.12 s and out over the last 60% of the life
+        const fade = Math.min(1, age / 0.12) * Math.min(1, (life - age) / (life * 0.6));
+        const size = data[o + 6] * (1 - (age / life) * 0.5);
+        const [u, v] = toUv(data[o + 0], data[o + 1], this.w / this.h);
+        // The orb's trail points back along its own velocity, so the streak follows the throw
+        // instead of always hanging downward. Field space, like METEOR's u_dir.
+        const vx = data[o + 2] * (this.w / this.h);
+        const vy = -data[o + 3];
+        const vm = Math.hypot(vx, vy) || 1;
+        loc(gl, prog, 'u_center', this._uniformCache, (l) => gl.uniform2f(l, u, v));
+        loc(gl, prog, 'u_radius', this._uniformCache, (l) => gl.uniform1f(l, size));
+        loc(gl, prog, 'u_dir', this._uniformCache, (l) => gl.uniform2f(l, vx / vm, vy / vm));
+        loc(gl, prog, 'u_energy', this._uniformCache, (l) => gl.uniform1f(l, 1.4));
+        loc(gl, prog, 'u_fade', this._uniformCache, (l) => gl.uniform1f(l, Math.max(0, fade)));
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        draws++;
+      }
+    }
+    gl.disable(gl.BLEND);
+    return draws;
+  }
+
+  /**
+   * The landmarks `wires` draws: the first hand's, already page space and mirrored by main.js.
+   * Kept on the renderer as the last seen skeleton so the wires hold their place between tracker
+   * frames; with no hand ever seen it is null and the effect draws nothing (never a guess).
+   */
+  _handLandmarks(view) {
+    const hand = view.hands && view.hands[0];
+    const lm = hand && (hand.landmarks || hand.points);
+    if (lm && lm.length >= 21) {
+      this._lastLandmarks = lm;
+      return lm;
+    }
+    return this._lastLandmarks || null;
+  }
+
+  /* ------------------------------------------------------------ history */
+
+  /**
+   * Bind the history read target and the write target before a history effect draws: the effect
+   * draws into `history[cur]`, and samples `history[1-cur]` (bound to TEXTURE_UNIT_HISTORY) as
+   * `u_prev`. Returns the top-left texco of the write target, for a caller that needs it.
+   */
+  _beginHistory() {
+    const gl = this.gl;
+    if (!this.history) this._resize();
+    const pair = this.history[this.historyCur];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, pair.fbo);
+    gl.viewport(0, 0, this.w, this.h);
+    gl.activeTexture(gl.TEXTURE0 + TEXTURE_UNIT_HISTORY);
+    gl.bindTexture(gl.TEXTURE_2D, this.history[1 - this.historyCur].tex);
+    this.historyAge = 0;
+    return this.history[1 - this.historyCur].tex;
+  }
+
+  /** After a history effect drew: its write target becomes the next frame's read target. */
+  _swapHistory() {
+    this.historyCur = 1 - this.historyCur;
+    this.historyAge = 0;
+  }
+
+  /** Clear both history targets (a resize, or a respawn of the effect that was advecting them). */
+  _clearHistory() {
+    const gl = this.gl;
+    if (!this.history) return;
+    for (const p of this.history) clearPair(gl, p);
+    this.historyCur = 0;
+    this.historyAge = 0;
+  }
+
+  /** Copy the accumulated scene into `snapTex` (before a spectacle effect is applied over it). */
+  _snapshotScene() {
+    const gl = this.gl;
+    if (!this.snapFbo) return;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.snapFbo);
+    gl.viewport(0, 0, this.w, this.h);
+    this._blit(this.sceneTex); // opaque full-frame copy: no clear needed
+    this._snapTaken = true;
+  }
+
+  /* ------------------------------------------------------------ hand edit */
+
+  /**
+   * The pointer's own strokes for the `edit` effect. The page calls these from pointer events (a
+   * mouse, a wand, a tablet stylus — whatever the operator paints with) and the renderer stamps
+   * each segment into a full-resolution canvas texture, added to the scene once per frame. No
+   * trail history: the canvas *is* the picture, and `editClear()` is the eraser.
+   */
+  editBegin(x, y, { colour, width } = {}) {
+    this.editPointer = { x, y, colour: colour || [1, 1, 1], width: Number.isFinite(width) ? width : 0.012 };
+    this._editLoc = null;
+    return Boolean(this.gl) && Boolean(this.edit);
+  }
+
+  /** A stroke step. A fast drag is interpolated so the stroke is a line, not a row of dots. */
+  editMove(x, y) {
+    const p = this.editPointer;
+    if (!p || !this.gl || !this.edit) return false;
+    const d = Math.hypot(x - p.x, y - p.y);
+    if (d < 0.0015) return false;
+    const steps = Math.min(255, Math.max(1, Math.ceil(d / (p.width * 0.6))));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      this._stamp(p.x + (x - p.x) * t, p.y + (y - p.y) * t, p);
+    }
+    p.x = x;
+    p.y = y;
+    return true;
+  }
+
+  editEnd() {
+    this.editPointer = null;
+    return true;
+  }
+
+  /** Wipe the edit canvas (a new stroke session, or the operator asking for a clean slate). */
+  editClear() {
+    const gl = this.gl;
+    if (!gl || !this.edit) return false;
+    clearPair(gl, this.edit);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return true;
+  }
+
+  /**
+   * One disc of the stroke. The shared quad's vertices are a_pos = ±1, so the stroke program scales
+   * them by `u_size` (field space) and offsets by `u_center` before the usual uv mapping: the brush
+   * is a small quad at the pointer, drawn source-over in the stroke colour.
+   */
+  _stamp(x, y, p) {
+    const gl = this.gl;
+    if (!this._editProg) return;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.edit.fbo);
+    gl.viewport(0, 0, this.w, this.h);
+    const prog = this._editProg;
+    gl.useProgram(prog);
+    gl.bindVertexArray(this.vao);
+    const set = (n, f) => {
+      const l = uniformLoc(gl, prog, n, this._uniformCache);
+      if (l) f(l);
+    };
+    const r = p.width * 0.5;
+    set('u_center', (l) => gl.uniform2f(l, x * (this.w / this.h), 1 - y));
+    set('u_size', (l) => gl.uniform1f(l, r));
+    set('u_aspect', (l) => gl.uniform1f(l, this.w / this.h));
+    set('u_colour', (l) => gl.uniform3f(l, p.colour[0], p.colour[1], p.colour[2]));
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.whiteTex);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disable(gl.BLEND);
+    // Leave the default framebuffer bound: the edit FBO must not leak into the next frame's scene
+    // clear, or the stroke (and everything else painted after it) is wiped by the clear.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /** Add the edit canvas to the scene, source-over (it is paint, not light). */
+  _drawEdit(live, view, t) {
+    const gl = this.gl;
+    if (!this.edit) this._resize();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
+    gl.viewport(0, 0, this.w, this.h);
+    this._composite(this.edit.tex, 1);
+  }
+
+  /* ------------------------------------------------------------ frame */
+
   /**
    * One frame. `view` carries where things are, in page space (0..1, already mirrored):
-   *   palms: [{x, y, radius}]   open palms up
-   *   fingertipPairs: [[a,b]]   index/middle fingertip pairs for lightning
-   *   front: {x, y, radius}     a palm towards the camera
-   *   swipe: {x, y, dir}        a sideways hand
-   * Nothing here invents a position: an effect is only drawn where a hand actually is.
+   *   palms: [{x, y, radius}]        open palms up
+   *   fingertipPairs: [[a,b]]        index/middle fingertip pairs for lightning
+   *   front: {x, y, radius}          a palm towards the camera
+   *   swipe: {x, y, dir}             a sideways hand
+   *   anchor / hands: also read; `hands` is [GESTURE_BONES] per hand, which is what `wires` needs.
+   * Nothing here invents a position: an effect is only drawn where a hand (or its own last
+   * anchor) actually is.
    */
   render(now, view = {}) {
     if (!this.supported) return;
     const gl = this.gl;
     // A context can be lost (a GPU reset, a driver crash) without the page noticing: report it,
     // once, instead of leaving a black canvas that looks like a working overlay.
-    if (gl.isContextLost && gl.isContextLost() && !this.error) {
-      this.error = 'WebGL2 context lost';
-      this.onError(this.error);
+    if (gl.isContextLost && gl.isContextLost()) {
+      if (!this.error) {
+        this.error = 'WebGL2 context lost';
+        this.onError(this.error);
+      }
       return;
     }
+    if (this._lost) return;
+    this.view = view;
     // Read once per stage only when asked (the browser test sets debugGl): getError() forces a
     // pipeline sync, and a per-frame sync is exactly what a stream overlay cannot afford.
     const checkpoint = (stage) => {
@@ -286,6 +1024,7 @@ export class FxRenderer {
       }
       live.energy = live.intensity * live.fade;
     }
+    this._integrateParticles(dt);
 
     // Scene: transparent (OBS source) or, in debug mode, the camera picture.
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
@@ -296,21 +1035,70 @@ export class FxRenderer {
     if (this.settings.debugOverlay && this.cameraTex) this._blitCamera();
     checkpoint('camera');
 
-    // Effects, in the operator's order: each draws into the layer, then composites onto scene.
+    // Effects, grouped by layer, the operator's order kept inside a layer.
+    this._snapTaken = false;
+    const groups = { hands: [], body: [], spectacle: [] };
     for (const id of this.settings.effects) {
       const live = this.live.get(id);
       if (!live) continue;
-      const def = EFFECTS[id];
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
-      gl.viewport(0, 0, this.w, this.h);
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      this._drawEffect(id, live, view, t);
-      checkpoint(`draw:${id}`);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
-      gl.viewport(0, 0, this.w, this.h);
-      this._composite(this.layerTex, def.mode === 1 ? 1 : 0);
-      checkpoint(`composite:${id}`);
+      const layer = live.layer || EFFECTS[id]?.layer || 'hands';
+      (groups[layer] || groups.hands).push(live);
+    }
+    let historyUsed = false;
+    for (const layer of LAYER_ORDER) {
+      for (const live of groups[layer]) {
+        const id = live.id;
+        const def = EFFECTS[id];
+        if (!def) continue;
+        if (id === 'shoot') {
+          // No layer pass: the particles composite themselves onto the scene directly. They wear
+          // the operator's skin for the whole effect, recorded per particle when it spawned, so a
+          // burst already in flight keeps the look it was thrown with.
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
+          gl.viewport(0, 0, this.w, this.h);
+          this._drawParticles(view, t);
+          checkpoint('particles');
+          continue;
+        }
+        if (id === 'edit') {
+          this._drawEdit(live, view, t);
+          checkpoint('edit');
+          continue;
+        }
+        if (SNAPSHOT_EFFECTS.has(id) && !this._snapTaken) {
+          this._snapshotScene();
+          checkpoint('snapshot');
+        }
+        const history = HISTORY_EFFECTS.has(id);
+        if (history) {
+          historyUsed = true;
+          if (this._historyEpoch !== live.epoch) {
+            this._clearHistory();
+            this._historyEpoch = live.epoch;
+          }
+          this._beginHistory();
+        } else {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
+          gl.viewport(0, 0, this.w, this.h);
+        }
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        const drew = this._drawEffect(id, live, view, t);
+        checkpoint(`draw:${id}`);
+        // A history effect wrote into its own ping-pong target; that target is what composites.
+        const target = history ? this.history[this.historyCur].tex : this.layerTex;
+        if (history) this._swapHistory();
+        if (!drew) continue;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFbo);
+        gl.viewport(0, 0, this.w, this.h);
+        this._composite(target, def.mode === 1 ? 1 : 0);
+        checkpoint(`composite:${id}`);
+      }
+    }
+    // History that nobody read this frame ages out, so a re-enable starts from a clean slate.
+    if (!historyUsed) {
+      this.historyAge++;
+      if (this.historyAge === HISTORY_IDLE_FRAMES) this._clearHistory();
     }
 
     // Bloom: a 4× downsample of the scene (bilinear), added back by the final pass.
@@ -346,6 +1134,10 @@ export class FxRenderer {
     set('u_seed', (l) => gl.uniform3f(l, 1, 2, 3));
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     checkpoint('final');
+    // Back to the neutral bindings so nothing outside a draw inherits an effect's units.
+    gl.activeTexture(gl.TEXTURE0 + TEXTURE_UNIT_BODY);
+    gl.bindTexture(gl.TEXTURE_2D, this.bodyTex || this.neutralTex);
+    gl.activeTexture(gl.TEXTURE0);
     // Surface a GL error as an error, not as silence. Read once per frame; the flag stops the
     // render loop from piling up log rows if it keeps erroring.
     const err = gl.getError();
@@ -360,99 +1152,62 @@ export class FxRenderer {
   _uniformHeader(prog, t, seed) {
     const gl = this.gl;
     const set = (n, f) => {
-      const loc = gl.getUniformLocation(prog, n);
+      const loc = uniformLoc(gl, prog, n, this._uniformCache);
       if (loc) f(loc);
     };
-    set('u_res', (l) => gl.uniform2f(l, this.w, this.h));
-    set('u_time', (l) => gl.uniform1f(l, t));
-    set('u_aspect', (l) => gl.uniform1f(l, this.w / this.h));
-    set('u_seed', (l) => gl.uniform3f(l, 1, 2, 3));
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    checkpoint('final');
-    // Surface a GL error as an error, not as silence. Read once per frame; the flag stops the
-    // render loop from piling up log rows if it keeps erroring.
-    const err = gl.getError();
-    if (err !== 0 && err !== this.lastGlError) {
-      this.lastGlError = err;
-      this.error = `WebGL error 0x${err.toString(16)} while compositing`;
-      this.onError(this.error);
-    }
-    this.frame++;
-  }
-
-  _uniformHeader(prog, t, seed) {
-    const gl = this.gl;
-    const set = (n, f) => {
-      const loc = gl.getUniformLocation(prog, n);
-      if (loc) f(loc);
-    };
-    set('u_res', (l) => gl.uniform2f(l, this.w, this.h));
-    set('u_time', (l) => gl.uniform1f(l, t));
-    set('u_aspect', (l) => gl.uniform1f(l, this.w / this.h));
-    set('u_seed', (l) => gl.uniform3f(l, 1, 2, 3));
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    checkpoint('final');
-    // Surface a GL error as an error, not as silence. Read once per frame; the flag stops the
-    // render loop from piling up log rows if it keeps erroring.
-    const err = gl.getError();
-    if (err !== 0 && err !== this.lastGlError) {
-      this.lastGlError = err;
-      this.error = `WebGL error 0x${err.toString(16)} while compositing`;
-      this.onError(this.error);
-    }
-    this.frame++;
-  }
-
-  _uniformHeader(prog, t, seed) {
-    const gl = this.gl;
-    const set = (n, f) => {
-      const loc = gl.getUniformLocation(prog, n);
-      if (loc) f(loc);
-    };
-    set('u_res', (l) => gl.uniform2f(l, this.w, this.h));
-    set('u_time', (l) => gl.uniform1f(l, t));
-    set('u_aspect', (l) => gl.uniform1f(l, this.w / this.h));
-    set('u_seed', (l) => gl.uniform3f(l, 1, 2, 3));
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    checkpoint('final');
-    // Surface a GL error as an error, not as silence. Read once per frame; the flag stops the
-    // render loop from piling up log rows if it keeps erroring.
-    const err = gl.getError();
-    if (err !== 0 && err !== this.lastGlError) {
-      this.lastGlError = err;
-      this.error = `WebGL error 0x${err.toString(16)} while compositing`;
-      this.onError(this.error);
-    }
-    this.frame++;
-  }
-
-  _uniformHeader(prog, t, seed) {
-    const gl = this.gl;
-    const set = (n, f) => {
-      const loc = gl.getUniformLocation(prog, n);
-      if (loc) f(loc);
-    };
-    // Every effect is a procedural fragment: no sampler uniforms, so a texture left bound from a
-    // previous pass cannot leak into one. The composite is a blit program of its own.
+    // The header every effect program shares. Effects that sample a texture (history, the body
+    // mask, the camera) bind their samplers in `_drawEffect`; programs that declare none cannot be
+    // fed a stale unit, so the header stays free of sampler assignment.
     set('u_res', (l) => gl.uniform2f(l, this.w, this.h));
     set('u_time', (l) => gl.uniform1f(l, t));
     set('u_aspect', (l) => gl.uniform1f(l, this.w / this.h));
     set('u_seed', (l) => gl.uniform3f(l, seed, seed * 1.7, seed * 2.3));
   }
 
+  /**
+   * Fill one effect's uniforms and draw it into the currently bound layer (or history) target.
+   * Returns false when the effect had nothing to draw (no body mask, no hand for a skeleton), in
+   * which case the caller skips its composite pass entirely.
+   */
   _drawEffect(id, live, view, t) {
     const gl = this.gl;
     const prog = this.progs.effects[id];
+    if (!prog) return false;
+    const def = EFFECTS[id];
     gl.useProgram(prog);
     gl.bindVertexArray(this.vao);
     this._uniformHeader(prog, t, live.t0 % 100);
     const set = (n, f) => {
-      const loc = gl.getUniformLocation(prog, n);
+      const loc = uniformLoc(gl, prog, n, this._uniformCache);
       if (loc) f(loc);
     };
     // Page space (0..1, y down) is what main.js gives; the shaders think in uv (y up), and the
     // fragment field scales uv.x by aspect, so a centre goes in as (x * aspect, 1 - y).
-    const toUv = (p) => [p.x * (this.w / this.h), 1 - p.y];
+    const toUv = (p) => toUvPoint(p, this.w / this.h);
+    const body = BODY_EFFECTS.has(id);
+    if (body && !this.bodyMaskSeen) return false;
+    // Every sampler unit is bound to its documented texture (or the neutral 1x1) before the effect
+    // draws, so a skipped branch above can never inherit the last program's binding.
+    const bindUnit = (unit, tex) => {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, tex || this.neutralTex);
+    };
+    bindUnit(TEXTURE_UNIT_BODY, this.bodyTex);
+    bindUnit(TEXTURE_UNIT_HISTORY, this.history ? this.history[1 - this.historyCur].tex : this.neutralTex);
+    bindUnit(TEXTURE_UNIT_SNAP, this.snapTex);
+    // The hand blob effects (aura, portal, slime, bloom) share one anchor rule: the first open
+    // palm, else the first hand's palm, else the effect's own last centre.
+    const anchor =
+      (view.palms && view.palms[0]) ||
+      (view.hands && view.hands[0] && view.hands[0].palm) ||
+      view.anchor ||
+      null;
+    const centreOf = (c) => (c && Number.isFinite(c.x) ? c : live.centre);
+    const radiusOf = (c, floor) => Math.max(floor, (c && c.radius) || live.radius);
+    const energySet = () => {
+      set('u_energy', (l) => gl.uniform1f(l, live.energy));
+      set('u_fade', (l) => gl.uniform1f(l, live.fade));
+    };
     if (id === 'fireball') {
       const palm = view.palms && view.palms[0];
       const c = palm ? { x: palm.x, y: palm.y, radius: palm.radius } : live.centre;
@@ -486,24 +1241,112 @@ export class FxRenderer {
       const [u, v] = toUv(c);
       set('u_center', (l) => gl.uniform2f(l, u, v));
       set('u_radius', (l) => gl.uniform1f(l, Math.max(0.05, (c.radius || live.radius) * 1.9)));
-      set('u_energy', (l) => gl.uniform1f(l, live.energy));
-      set('u_fade', (l) => gl.uniform1f(l, live.fade));
+      energySet();
     } else if (id === 'embers') {
       const c = view.anchor || live.centre;
       const [u, v] = toUv(c);
       set('u_center', (l) => gl.uniform2f(l, u, v));
       set('u_spread', (l) => gl.uniform1f(l, Math.max(0.15, (c.radius || 0.1) * 3.2)));
-      set('u_energy', (l) => gl.uniform1f(l, live.energy));
-      set('u_fade', (l) => gl.uniform1f(l, live.fade));
+      energySet();
     } else if (id === 'smoke') {
       const c = view.swipe || view.anchor || live.centre;
       const [u, v] = toUv(c);
       set('u_center', (l) => gl.uniform2f(l, u, v));
       set('u_width', (l) => gl.uniform1f(l, Math.max(0.12, (c.radius || 0.12) * 2.6)));
-      set('u_energy', (l) => gl.uniform1f(l, live.energy));
-      set('u_fade', (l) => gl.uniform1f(l, live.fade));
+      energySet();
+    } else if (id === 'wires') {
+      // One skeleton per draw: the frame's own landmarks, page space (mirrored by main.js), x
+      // scaled by aspect because the shader's field() does the same. Missing points stay (0,0) —
+      // the tracker's "not seen" sentinel — and the shader skips every bone that touches one.
+      // With a hand the skeleton follows it; without one `_handPoint` hands back the last hit, so
+      // the wires stay on the operator's digit (the same rule as `live.centre`, never a guess).
+      const pts = new Float32Array(42);
+      const lm = this._handLandmarks(view);
+      for (let i = 0; i < 21; i++) {
+        const q = lm && lm[i];
+        pts[i * 2] = q ? q.x * (this.w / this.h) : 0;
+        pts[i * 2 + 1] = q ? 1 - q.y : 0;
+      }
+      set('u_p', (l) => gl.uniform2fv(l, pts));
+      set('u_count', (l) => gl.uniform1i(l, GESTURE_BONES.length));
+      energySet();
+    } else if (id === 'aura' || id === 'portal' || id === 'slime' || id === 'bloomlife') {
+      // The blob follows the hand's centre; its size follows the hand's scale where the shader reads
+      // a radius. Slime's goo sags from the centre, so it wants the palm-sized radius, not a ring's.
+      const c = centreOf(anchor);
+      const [u, v] = toUv(c);
+      const handRadius = Math.max(0.06, (anchor && anchor.radius) || live.radius * 2);
+      const r = id === 'aura' ? handRadius * 5 : id === 'portal' ? handRadius * 6 : id === 'slime' ? handRadius : handRadius * 6;
+      set('u_center', (l) => gl.uniform2f(l, u, v));
+      set('u_radius', (l) => gl.uniform1f(l, r));
+      energySet();
+    } else if (id === 'frost') {
+      const c = centreOf(anchor);
+      const [u, v] = toUv(c);
+      set('u_center', (l) => gl.uniform2f(l, u, v));
+      // Growth curve: reach rises fast in the first half second (the creep is visible immediately)
+      // and saturates by ~2.5 s; smoothstep keeps the tip soft instead of a hard edge.
+      const grow = smoothstep01(live.age / 2.5);
+      set('u_grow', (l) => gl.uniform1f(l, grow));
+      energySet();
+    } else if (id === 'disco') {
+      const c = centreOf(anchor);
+      const [u, v] = toUv(c);
+      set('u_center', (l) => gl.uniform2f(l, u, v));
+      energySet();
+    } else if (id === 'cyber' || id === 'shatter') {
+      const c = centreOf(anchor);
+      const [u, v] = toUv(c);
+      set('u_center', (l) => gl.uniform2f(l, u, v));
+      energySet();
+    } else if (id === 'inkflow' || id === 'echo') {
+      // Both read the previous frame from the history unit; `_beginHistory` chose the targets and
+      // bound the read side there. Echo is the same dye on a different source: the edit canvas, so
+      // the operator's own strokes bleed instead of an invented colour field.
+      const c = centreOf(anchor);
+      const [u, v] = toUv(c);
+      set('u_center', (l) => gl.uniform2f(l, u, v));
+      set('u_prev', (l) => gl.uniform1i(l, TEXTURE_UNIT_HISTORY));
+      set('u_src', (l) => gl.uniform1i(l, TEXTURE_UNIT_SNAP));
+      if (id === 'echo') set('u_radius', (l) => gl.uniform1f(l, live.radius * 9.0));
+      energySet();
+    } else if (id === 'electroshock') {
+      const c = centreOf(view.front || anchor);
+      const [u, v] = toUv(c);
+      set('u_center', (l) => gl.uniform2f(l, u, v));
+      // The wavefront expands with age: 0.5 s to cross the short side, then it lingers and dies in
+      // the fade. Radius is in field units (x in aspect-scaled uv, y in uv).
+      set('u_radius', (l) => gl.uniform1f(l, 0.02 + live.age * 1.6));
+      set('u_src', (l) => gl.uniform1i(l, TEXTURE_UNIT_SNAP));
+      energySet();
+    } else if (id === 'meteor') {
+      // One meteor per `meteor` live, thrown from the anchor where the gesture fired: it climbs up
+      // and to the side, the side following the swipe direction when the frame has one. `u_arc`
+      // walks the head along the path (0..1 over ~1.1 s), then the fade retires it.
+      const c = centreOf(anchor);
+      const [fu, fv] = toUv(c);
+      const side = view.swipe && Number.isFinite(view.swipe.dir) && view.swipe.dir !== 0 ? Math.sign(view.swipe.dir) : 0.35;
+      const m = Math.hypot(side, 1) || 1;
+      const dir = { x: side / m, y: -1 / m };
+      // The anchor is a page-space point; the direction is converted to field space (x times the
+      // aspect, y flipped for uv) so the shader's normalise() keeps it a unit vector either way.
+      const aspect = this.w / this.h;
+      set('u_from', (l) => gl.uniform2f(l, fu, fv));
+      set('u_dir', (l) => gl.uniform2f(l, dir.x * aspect, -dir.y));
+      set('u_arc', (l) => gl.uniform1f(l, Math.min(1.0, live.age / 1.1)));
+      energySet();
+    } else if (id === 'bodyonfire' || id === 'bodysmoke' || id === 'frozenbody') {
+      const c = centreOf(anchor);
+      const [u, v] = toUv(c);
+      set('u_center', (l) => gl.uniform2f(l, u, v));
+      set('u_body', (l) => gl.uniform1i(l, TEXTURE_UNIT_BODY));
+      energySet();
+    } else {
+      // shoot (particles) and anything not yet wired: draw nothing rather than a black pass.
+      return false;
     }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return true;
   }
 
   /**
@@ -595,30 +1438,82 @@ export class FxRenderer {
   dispose() {
     const gl = this.gl;
     if (!gl) return;
-    for (const t of [this.sceneTex, this.layerTex, this.bloomTex, this.cameraTex]) if (t) gl.deleteTexture(t);
-    for (const f of [this.sceneFbo, this.layerFbo, this.bloomFbo]) if (f) gl.deleteFramebuffer(f);
+    const textures = [this.sceneTex, this.layerTex, this.bloomTex, this.cameraTex, this.neutralTex, this.whiteTex, this.snapTex, this.bodyTex, this.edit && this.edit.tex];
+    if (this.history) for (const p of this.history) textures.push(p.tex);
+    for (const t of textures) if (t) gl.deleteTexture(t);
+    const fbos = [this.sceneFbo, this.layerFbo, this.bloomFbo, this.snapFbo, this.edit && this.edit.fbo];
+    if (this.history) for (const p of this.history) fbos.push(p.fbo);
+    for (const f of fbos) if (f) gl.deleteFramebuffer(f);
     for (const p of Object.values(this.progs?.effects || {})) gl.deleteProgram(p);
+    for (const p of Object.values(this.progs?.skins || {})) gl.deleteProgram(p);
     if (this.progs) {
       gl.deleteProgram(this.progs.composite);
       gl.deleteProgram(this.progs.final);
       gl.deleteProgram(this.progs.blit);
     }
+    if (this._editProg) gl.deleteProgram(this._editProg);
+    if (this.vao) gl.deleteVertexArray(this.vao);
+    if (this.canvas) {
+      this.canvas.removeEventListener('webglcontextlost', this._onLost);
+      this.canvas.removeEventListener('webglcontextrestored', this._onRestored);
+    }
+    this.history = null;
     this.supported = false;
   }
 }
 
-export { EFFECT_ORDER };
+function uniformLoc(gl, prog, name, cache) {
+  const key = name;
+  let m = cache && cache.get(prog);
+  if (!m) {
+    m = new Map();
+    if (cache) cache.set(prog, m);
+  }
+  if (m.has(key)) return m.get(key);
+  const loc = gl.getUniformLocation(prog, name);
+  m.set(key, loc);
+  return loc;
+}
+
+/** Uniform location through the per-program cache (the Map is shared, the key is the name). */
+function loc(gl, prog, name, cache, fn) {
+  const l = uniformLoc(gl, prog, name, cache);
+  if (l) fn(l);
+}
+
+function toUv(x, y, aspect) {
+  return [x * aspect, 1 - y];
+}
+
+/** Page-space point -> field-space [x * aspect, 1 - y]. */
+function toUvPoint(p, aspect) {
+  return [p.x * aspect, 1 - p.y];
+}
+
+function smoothstep01(x) {
+  const t = Math.max(0, Math.min(1, x));
+  return t * t * (3 - 2 * t);
+}
+
+export { EFFECT_ORDER, LAYER_ORDER };
 
 /** Reduce a classify() result to the anchors the effects draw at. Positions stay in camera space
- *  here; the caller mirrors them (the renderer must never guess which way the camera faces). */
+ *  here; the caller mirrors them (the renderer must never guess which way the camera faces).
+ *  `hands` carries one 21-point skeleton per hand (page space, mirrored) for `wires`; `palm` is the
+ *  same hand's palm centre, so an effect that wants a blob can use it without re-reading the list. */
 export function anchorsFrom(readings) {
-  const out = { palms: [], fingertipPairs: [], front: null, anchor: null, swipe: null };
+  const out = { palms: [], fingertipPairs: [], front: null, anchor: null, swipe: null, hands: [] };
   for (const h of readings || []) {
     const c = palmCentre(h.landmarks);
     const s = handScale(h.landmarks);
     out.palms.push({ x: c.x, y: c.y, radius: Math.max(0.04, s * 1.6), hand: h });
     if (!out.anchor) out.anchor = { x: c.x, y: c.y, radius: Math.max(0.08, s * 2.2) };
     if (h.palmFront && !out.front) out.front = { x: c.x, y: c.y, radius: Math.max(0.05, s * 1.6) };
+    out.hands.push({
+      landmarks: (h.landmarks || []).map((p) => ({ x: p.x, y: p.y, z: p.z })),
+      palm: { x: c.x, y: c.y, radius: Math.max(0.05, s * 1.6) },
+      handedness: h.handedness || null,
+    });
   }
   if ((readings || []).length >= 2) {
     const [a, b] = readings;
