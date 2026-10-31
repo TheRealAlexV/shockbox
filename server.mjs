@@ -66,7 +66,15 @@ fs.mkdirSync(STATE_DIR, { recursive: true });
 // file uses the same dated name so one day is one log. The byte budget in createLog is the
 // per-file fallback for a long-running day (`shockbox-YYYY-MM-DD.log.1`); the ceiling that
 // actually holds is the directory prune below, because it also covers the launcher's redirection.
-const LOG_FILE = path.join(LOG_DIR, `shockbox-${new Date().toISOString().slice(0, 10)}.log`);
+// The day in local time, not UTC. The launcher names its own file by local date, so a UTC name
+// splits one evening across two files either side of midnight UTC. Timestamps inside the log stay
+// UTC; only the name in the directory is local, because that name is read by people and by run.cmd.
+function localDay(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+const LOG_FILE = path.join(LOG_DIR, `shockbox-${localDay()}.log`);
 const log = createLog({ dir: LOG_DIR, file: LOG_FILE });
 const root = log.scope('core');
 

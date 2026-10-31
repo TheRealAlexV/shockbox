@@ -125,8 +125,11 @@ rem not an option because Windows 11 24H2 does not have it.
 rem The app cannot see this cleanup: Remove-Item on a file whose handle is still open fails
 rem silently, which is why every operation is -ErrorAction SilentlyContinue. A
 rem locked file just keeps the folder over the ceiling for one more cycle.
+rem It prints one line whatever happens, because a prune nobody can see is a prune nobody
+rem can trust. The count is what actually went, not what was attempted: a file the app still
+rem has open stays behind, so "removed" is measured against the list after the delete.
 if not defined PS goto :eof
 rem STAMP is set by :loop above. -Command is one argument, so its quoting stays as written.
-"%PS%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$d='%LOGS%'; $f=@(Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'shockbox-*' -or $_.Name -like 'launcher-*' } | Sort-Object LastWriteTime -Descending); $keep=$f | Select-Object -First 4; $f | Where-Object { $keep -notcontains $_ } | Remove-Item -Force -ErrorAction SilentlyContinue; $t=($keep | Measure-Object Length -Sum).Sum; if ($t -gt 64MB) { $keep | Sort-Object LastWriteTime | Select-Object -First 3 | ForEach-Object { try { [System.IO.File]::WriteAllText($_.FullName,'') } catch {} } }" >>"%LOGS%\launcher-%STAMP:~0,10%.log" 2>&1
+"%PS%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$d='%LOGS%'; $f=@(Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'shockbox-*' -or $_.Name -like 'launcher-*' } | Sort-Object LastWriteTime -Descending); $keep=@($f | Select-Object -First 4); $old=@($f | Where-Object { $keep -notcontains $_ }); $old | Remove-Item -Force -ErrorAction SilentlyContinue; $gone=@($old | Where-Object { -not (Test-Path -LiteralPath $_.FullName) }); $locked=$old.Count - $gone.Count; $kept=@($keep | Where-Object { Test-Path -LiteralPath $_.FullName }); $t=0; foreach ($k in $kept) { $t=$t + $k.Length }; $cut=0; if ($t -gt 64MB) { foreach ($k in @($kept | Sort-Object LastWriteTime | Select-Object -First 3)) { try { [System.IO.File]::WriteAllText($k.FullName,''); $cut=$cut + 1 } catch {} } }; $t=0; foreach ($k in $kept) { $t=$t + (New-Object System.IO.FileInfo($k.FullName)).Length }; Write-Output ('log prune: removed ' + $gone.Count + ' of ' + $old.Count + ' (' + $locked + ' locked), truncated ' + $cut + ' to ' + [math]::Round($t / 1MB, 1) + ' MiB kept')" 1>>"%LOGS%\launcher-%STAMP:~0,10%.log" 2>&1
 goto :eof
 
