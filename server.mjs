@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createLog } from './core/log.mjs';
+import { createLog, compactDir } from './core/log.mjs';
 import { createEvents } from './core/events.mjs';
 import { loadRegistry } from './core/registry.mjs';
 import { createObsClient } from './core/obs.mjs';
@@ -63,8 +63,9 @@ const OBS_ENABLED = cfg.obs?.enabled !== false;
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 // The launcher writes stdout/stderr to `shockbox-YYYY-MM-DD.log` beside this; the app's own log
-// file uses the same dated name so one day is one log, and the rotation stays as the fallback
-// for a long-running day (`shockbox-YYYY-MM-DD.log.1`).
+// file uses the same dated name so one day is one log. The byte budget in createLog is the
+// per-file fallback for a long-running day (`shockbox-YYYY-MM-DD.log.1`); the ceiling that
+// actually holds is the directory prune below, because it also covers the launcher's redirection.
 const LOG_FILE = path.join(LOG_DIR, `shockbox-${new Date().toISOString().slice(0, 10)}.log`);
 const log = createLog({ dir: LOG_DIR, file: LOG_FILE });
 const root = log.scope('core');
@@ -73,6 +74,41 @@ log.info(`ShockBox ${VERSION} — pid ${process.pid}, node ${process.version}`);
 log.info(`state ${STATE_DIR}`);
 log.info(`log ${LOG_DIR}`);
 log.info(`public ${PUBLIC_DIR}`);
+
+// The launcher's `>>` redirection appends to the same dated file outside the writer, so in a
+// crash-and-restart loop the app sees a small file each run while the shell keeps adding bytes.
+// The writer's per-file budget cannot see those, so the only bound that covers them is a prune of
+// the whole directory, run here and on a timer.
+//
+// 64 MiB for the whole directory: the shockbox-* family (4 kept, oldest truncated if still over)
+// and the launcher-* family, each with its own ceiling so neither can starve the other.
+const LOG_CEILING = 64 * 1024 * 1024;
+const LOG_PRUNE_MS = 15 * 60 * 1000;
+// Last result, for /health and for anyone asking what the prune just did.
+let lastPrune = null;
+
+function pruneLogs() {
+  let shockbox = null;
+  try {
+    shockbox = compactDir({ dir: LOG_DIR, prefix: 'shockbox-', maxTotal: LOG_CEILING, keep: 4, log: root });
+  } catch (err) {
+    root.warn(`log prune shockbox-: ${err.message}`);
+  }
+  try {
+    compactDir({ dir: LOG_DIR, prefix: 'launcher-', maxTotal: LOG_CEILING, keep: 4, log: root });
+  } catch (err) {
+    root.warn(`log prune launcher-: ${err.message}`);
+  }
+  lastPrune = shockbox;
+  return shockbox;
+}
+
+// The first prune runs right after the banner above, so a restart loop is bounded from the very
+// first start rather than one interval later.
+pruneLogs();
+const pruneTimer = setInterval(pruneLogs, LOG_PRUNE_MS);
+// Unref'd: a housekeeping timer must never be the reason the process stays alive.
+pruneTimer.unref();
 
 const events = createEvents({ log: log.scope('events') });
 
@@ -182,7 +218,9 @@ const httpServer = createServer({
     channels: ['pool','core'],
     obsStatus: () => ({
       enabled: coreSettings.get('obsEnabled'),
-      state: obs.state,
+      // diag() carries why: 'closed' alone could not tell a wrong password from a server that
+      // is not listening, and both looked like the app's fault from the outside.
+      ...obs.diag(),
       scene: obs.scene,
       forceScenes: coreSettings.get('forceScenes'),
     }),
@@ -232,6 +270,8 @@ async function shutdown(sig) {
   if (closing) return;
   closing = true;
   log.info(`${sig} — shutting down`);
+  // Unref'd, so this is only for clarity: a closing process has no more pruning to do.
+  clearInterval(pruneTimer);
   try {
     coreSettings.flush();
     await registry.dispose();
