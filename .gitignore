@@ -26,6 +26,15 @@ node_modules/
 public/assets/
 .vite/
 dist/
+
+# Python: the TUI's own venvs (the dev one in tools/tui and the rig's .tui-venv --
+# both hold absolute paths from the machine that made them, so neither can ship)
+.venv/
+.tui-venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
 # public/index.html is the shell's entry document (source, not a build output): it is served
 # directly from public/, and an untracked copy means CI checks out a repo with no shell at all.
 
