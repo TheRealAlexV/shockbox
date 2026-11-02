@@ -10,9 +10,12 @@
 //     intensities live and die in this page. /ack is a status line (effect, tracking, model,
 //     hands, gesture), not a frame.
 //
-// Camera privacy: the camera opens on the overlay's own start button, or on `tracking.toggle`
-// only if this document already holds permission — a deck key can start a session the operator
-// armed, it can never prompt for the camera without a gesture in this page.
+// Camera privacy: the overlay is the page that asks for the camera. It opens one on load (an OBS
+// browser source nobody clicks must still see hands), on its own start button, or on
+// `tracking.toggle` only if this document already holds permission — a deck key can start a
+// session the operator armed, it can never prompt for the camera without a gesture in this page.
+// No camera, no blank page: the synthetic rig draws until a real track runs, and comes back when
+// that track fails or ends.
 
 import { Tracker, syntheticHands } from '../engine/tracker.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
@@ -196,7 +199,8 @@ function applyBusCommand(msg) {
       ack();
     }
   } else if (cmd === 'tracking.toggle') {
-    if (state.tracking) stopTracking();
+    // The synthetic rig runs from load; only a real camera session counts as "started" here.
+    if (state.tracking && !state.synthetic) stopTracking();
     else startTracking({ fromBus: true });
   } else if (cmd === 'projectile.fire') {
     const skin = msg.args && msg.args.skin;
@@ -265,11 +269,82 @@ function noteStartClick() {
   startClicks.at = performance.now();
 }
 
+/** The operator pressed Stop: a stop is not a camera failure, so the synthetic rig stays off. */
+let userStopped = false;
+/** A camera session owned the page and has not handed it back yet (fallback is due when it does). */
+let camWasLive = false;
+/** A real camera acquisition was started: a failure of it goes back to the synthetic rig. */
+let camAttempted = false;
+
+/**
+ * Hand the page back to the synthetic rig after a camera failed or its track ended, so the overlay
+ * keeps animating instead of freezing on the last camera frame. Never on the operator's own Stop.
+ */
+function fallBackToSynthetic() {
+  if (userStopped) return false;
+  if (state.tracking && !state.synthetic) return false; // another camera session owns the view
+  const drew = ensureSyntheticAnchors();
+  if (drew) {
+    setBanner(state.error ? `${state.error} — drawing on synthetic hands` : 'No camera — drawing on synthetic hands', 'warn');
+    ack();
+  }
+  return drew;
+}
+
+/**
+ * The load attempt, and the one retry when the page is shown again. No gesture, no click: a page
+ * nobody can click (an OBS browser source) still asks for the camera. Enumerate first, so a
+ * machine with no video input is reported as such instead of prompting for a device it lacks.
+ * Two attempts at most, at least 5 s apart, never in a loop.
+ */
+const AUTO_CAM_ATTEMPTS = 2;
+const AUTO_CAM_GAP = 5000;
+const autoCam = { attempts: 0, lastAt: 0, busy: false };
+
+async function autoCamera() {
+  if (autoCam.busy || autoCam.attempts >= AUTO_CAM_ATTEMPTS) return false;
+  if (document.visibilityState !== 'visible') return false;
+  if (state.tracking && !state.synthetic) return false; // a camera already owns the page
+  // Nowhere for a camera to open: boot already said why, and asking would only relabel it.
+  if (!window.isSecureContext || !navigator.mediaDevices?.enumerateDevices) return false;
+  const now = Date.now();
+  if (autoCam.lastAt && now - autoCam.lastAt < AUTO_CAM_GAP) return false;
+  autoCam.attempts += 1;
+  autoCam.lastAt = now;
+  autoCam.busy = true;
+  try {
+    let devices = [];
+    try {
+      devices = (await navigator.mediaDevices.enumerateDevices()) || [];
+    } catch (err) {
+      setCameraError('enumerate', err && err.name, err && err.message);
+    }
+    if (!devices.some((d) => d.kind === 'videoinput')) {
+      if (!state.cameraError) {
+        setCameraError('enumerate', 'NoCamera', 'No video input device is present — drawing on synthetic hands.');
+        setBanner('No camera device — drawing on synthetic hands', 'warn');
+      }
+      return false;
+    }
+    userStopped = false;
+    camAttempted = true;
+    await startTracking();
+    if (state.tracking && !state.synthetic) return true;
+    fallBackToSynthetic();
+    return false;
+  } finally {
+    autoCam.busy = false;
+    renderState();
+    ack();
+  }
+}
+
 async function startTracking({ fromBus = false, synthetic = false } = {}) {
   // A running camera owns the view; a running synthetic rig gives way to a real camera (the
   // overlay starts on synthetic when no camera arrives, so the Start button must still work).
   if (state.tracking && !state.synthetic) return;
-  if (state.tracking) stopTracking();
+  if (state.tracking) stopTracking({ manual: false, keepView: true });
+  userStopped = false;
   if (fromBus && !canStartFromBus()) {
     setBanner('Camera not started: press Start once in this page (a browser only opens a camera from a real click).', 'warn');
     renderState();
@@ -291,6 +366,7 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
     tracker.startSynthetic();
     return;
   }
+  camAttempted = true;
   const snap = await tracker.start(opts);
   if (snap.state === 'error') {
     state.camera = snap.error && /denied/i.test(snap.error) ? 'denied' : 'error';
@@ -303,19 +379,20 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
   }
 }
 
-function stopTracking() {
+function stopTracking({ manual = true, keepView = false } = {}) {
+  if (manual) userStopped = true;
+  camWasLive = false;
   tracker.stop();
   state.tracking = false;
   state.camera = 'off';
-  state.anchors = 'none';
-  fx.view = null;
-  fx.releaseAll();
+  // Giving way to a camera that is still opening (`keepView`): the page keeps drawing on the
+  // anchors it has instead of going blank while the device and the model load.
+  if (!keepView) {
+    state.anchors = 'none';
+    fx.view = null;
+    fx.releaseAll();
+  }
   renderState();
-}
-
-/** Are there anchors an effect could draw at? An empty frame is not a hand. */
-function anchorsPresent() {
-  return Boolean(fx.view && (fx.view.anchor || fx.view.front || (fx.view.palms && fx.view.palms.length)));
 }
 
 /**
@@ -339,8 +416,9 @@ function onTrackerState(snap) {
   state.model = snap.model;
   state.tracking = snap.state === 'running';
   // The overlay's start is the operator's action for the bus: a deck key may start a session the
-  // operator has just opened this page for, and may never open a camera on its own.
-  if (snap.state === 'running') noteStartClick();
+  // operator has just opened this page for, and may never open a camera on its own. The synthetic
+  // rig is not a start — it runs from load and must not arm the bus.
+  if (snap.state === 'running' && snap.source === 'camera') noteStartClick();
   if (snap.state === 'error') {
     state.camera = /denied/i.test(snap.error || '') ? 'denied' : 'error';
     state.error = snap.error;
@@ -352,9 +430,20 @@ function onTrackerState(snap) {
     // A camera track is running: the failure reason is history, and this is the device.
     if (snap.source === 'camera') {
       state.cameraError = null;
+      state.error = null;
       if (snap.deviceLabel) state.cameraLabel = snap.deviceLabel;
+      setBanner('');
     }
-    setBanner('');
+  }
+  if (snap.state === 'running' && snap.source === 'camera') camWasLive = true;
+  else if (snap.state === 'error' || snap.state === 'idle') {
+    if (userStopped || !fx.view) state.anchors = 'none';
+    // A camera that failed or ended hands the page back to the synthetic rig.
+    if (camWasLive || (snap.state === 'error' && camAttempted)) {
+      camWasLive = false;
+      camAttempted = false;
+      fallBackToSynthetic();
+    }
   }
   renderState();
 }
@@ -390,7 +479,8 @@ function onFrame(frame) {
   const anchors = anchorsFrom(result.hands);
   if (swipe && swipe.speed > 0.5 && anchors.anchor) anchors.swipe = { ...anchors.anchor, radius: 0.18 };
   fx.view = anchors;
-  state.anchors = frame.source === 'synthetic' ? 'synthetic' : 'camera';
+  // `camera` only while a camera track is actually live; every other frame is the synthetic rig.
+  state.anchors = frame.source === 'camera' && tracker.state === 'running' && tracker.source === 'camera' ? 'camera' : 'synthetic';
   if (hands.length && effectiveEffects().includes('embers') && !fx.live.has('embers') && result.gesture) {
     fx.trigger('embers', {});
   }
@@ -699,20 +789,16 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   }
   connectBus();
   renderState();
+  // Never a blank page, not even for one frame: the synthetic rig draws now, and the camera
+  // attempt replaces it the moment a real track runs (onTrackerState → running, source camera).
+  ensureSyntheticAnchors();
   requestAnimationFrame(loop);
-  // No camera, no waiting: if nothing has produced anchors 1.5 s after load (no track opened, or
-  // one that never delivered a hand), the overlay draws on the synthetic rig and keeps animating.
-  // The truth is on the badge and on /ack (`anchors: 'synthetic'`), never dressed as a camera.
-  setTimeout(() => {
-    if (anchorsPresent() || (state.tracking && !state.synthetic)) return;
-    // The fallback is a symptom: if an acquisition already failed, that failure is the reason and
-    // stays in `cameraError`; the timeout is only named when nothing else did.
-    if (!state.cameraError) {
-      setCameraError('timeout', 'NoCameraTrack', 'No camera track within 1.5 s — drawing on synthetic hands.');
-    }
-    ensureSyntheticAnchors();
-    ack();
-  }, 1500);
+  // The load attempt, without a gesture: an OBS browser source is never clicked, so a camera only
+  // opens here if this page asks for it itself. One retry waits for the page to be shown again.
+  autoCamera().catch(() => {});
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') autoCamera().catch(() => {});
+  });
   // Test hook: the browser test drives the page through this, not through the DOM.
   window.__handfx = {
     state,
