@@ -103,6 +103,10 @@ export class Tracker {
     this.frames = 0;
     this.fps = 0;
     this.deviceLabel = '';
+    // Where the camera acquisition failed (`enumerate` | `getUserMedia` | `track`) and the error's
+    // own name, so the overlay can report what actually happened instead of a lone sentence.
+    this.failStage = null;
+    this.errorName = null;
     this.source = 'camera'; // camera | synthetic
     this.synthetic = null;
     // Where the model bytes came from (`local` = the module's own file, `cdn` = the model URL).
@@ -118,6 +122,8 @@ export class Tracker {
       modelSource: this.modelSource,
       runtime: this.runtime,
       deviceLabel: this.deviceLabel,
+      failStage: this.failStage,
+      errorName: this.errorName,
       source: this.source,
       fps: this.fps,
       frames: this.frames,
@@ -135,6 +141,8 @@ export class Tracker {
     if (this.state === 'running' || this.state === 'starting') return this.snapshot();
     this._setState({ state: 'starting', error: null });
     try {
+      // Honest staging for the overlay's diagnostics: each failure below names the step it died at.
+      this.failStage = 'enumerate';
       if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
         const why = window.isSecureContext
           ? 'this browser exposes no camera API (navigator.mediaDevices missing)'
@@ -150,9 +158,24 @@ export class Tracker {
       const res = DEVICES[opts.resolution] || DEVICES['720p'];
       const video = { width: { ideal: res.width }, height: { ideal: res.height }, frameRate: { ideal: 30, max: 60 } };
       if (opts.deviceId) video.deviceId = { exact: opts.deviceId };
+      this.failStage = 'getUserMedia';
       this.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
-      const track = this.stream.getVideoTracks()[0];
-      this.deviceLabel = track ? track.label || 'camera' : 'camera';
+      this.failStage = 'track';
+      const stream = this.stream;
+      const track = stream.getVideoTracks()[0];
+      if (!track) throw new MediaError('no-video-track', 'The camera stream carried no video track.');
+      this.deviceLabel = track.label || 'camera';
+      // A track that ends after a successful start (device unplugged, another app took it) is a
+      // `track` failure, not a silent stop.
+      track.addEventListener('ended', () => {
+        if (this.stream !== stream) return; // a later start owns the view now
+        this.failStage = 'track';
+        this._setState({
+          state: 'error',
+          errorName: 'TrackEnded',
+          error: 'The camera track ended (device unplugged, or another app took the camera).',
+        });
+      });
       this._setState({ deviceLabel: this.deviceLabel, source: 'camera' });
 
       this.video = document.createElement('video');
@@ -163,12 +186,19 @@ export class Tracker {
       await this.video.play();
 
       if (!this.landmarker) await this._loadModel(opts);
-      this._setState({ state: 'running' });
+      this.failStage = null;
+      this.errorName = null;
+      this._setState({ state: 'running', failStage: null, errorName: null });
       this._loop();
       return this.snapshot();
     } catch (err) {
       this.stop({ keepError: true });
-      this._setState({ state: 'error', error: describeError(err) });
+      this._setState({
+        state: 'error',
+        error: describeError(err),
+        errorName: (err && err.name) || 'Error',
+        failStage: this.failStage || 'getUserMedia',
+      });
       return this.snapshot();
     }
   }

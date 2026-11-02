@@ -196,6 +196,9 @@ function build(ctx) {
   // The overlay's draw truth, reported on /ack: how many frames it rendered, where the anchors came
   // from, and when the last frame landed. Counters and a name, never a frame.
   const draw = { draws: 0, anchors: 'none', lastDrawAt: 0 };
+  // Why the overlay's camera did not open (the page's own diagnostic object) and the label of the
+  // device it did open. Reported on /ack, read back on /status; never a frame.
+  const camera = { error: null, label: null };
 
   function publish(cmd, args) {
     // The replay stamp lives on its own key: `args.id` belongs to the caller (it is the effect id
@@ -220,6 +223,9 @@ function build(ctx) {
       draws: draw.draws,
       anchors: draw.anchors,
       lastDrawAt: draw.lastDrawAt,
+      // The overlay's camera answer: why it did not open (object or null) and what it did open.
+      cameraError: camera.error,
+      cameraLabel: camera.label,
       runtime: {
         vendored: fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')),
         simdWasm: fs.existsSync(path.join(VENDOR, 'vision', 'simd-wasm', 'vision_wasm_internal.wasm')),
@@ -360,6 +366,24 @@ function build(ctx) {
           if (Number.isFinite(bodyIn.lastDrawAt) && bodyIn.lastDrawAt > draw.lastDrawAt) {
             draw.lastDrawAt = Math.min(Date.now(), bodyIn.lastDrawAt);
           }
+          // The camera's failure reason and the device that opened. The object is the page's; the
+          // shape and the stage vocabulary are this server's, so a client cannot inject anything
+          // but the fields /status promises.
+          if (bodyIn.cameraError === null) camera.error = null;
+          else if (bodyIn.cameraError && typeof bodyIn.cameraError === 'object') {
+            const ce = bodyIn.cameraError;
+            const stage = ['enumerate', 'getUserMedia', 'track', 'timeout'].includes(ce.stage) ? ce.stage : null;
+            camera.error = stage
+              ? {
+                at: Number.isFinite(ce.at) ? ce.at : Date.now(),
+                stage,
+                name: typeof ce.name === 'string' ? ce.name.slice(0, 60) : '',
+                message: typeof ce.message === 'string' ? ce.message.slice(0, 240) : '',
+              }
+              : null;
+          }
+          if (bodyIn.cameraLabel === null) camera.label = null;
+          else if (typeof bodyIn.cameraLabel === 'string' && bodyIn.cameraLabel) camera.label = bodyIn.cameraLabel.slice(0, 120);
           events.emit('handfx', 'page', {
             effect: typeof bodyIn.effect === 'string' ? bodyIn.effect : null,
             tracking: bodyIn.tracking === true,

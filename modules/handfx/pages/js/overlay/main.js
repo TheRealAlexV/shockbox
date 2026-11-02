@@ -51,6 +51,10 @@ const state = {
   tracking: false,
   camera: 'off', // off | asking | on | denied | held | error
   error: null,
+  // Why the camera did not open: { at, stage, name, message }, stage is one of
+  // enumerate | getUserMedia | track | timeout. Cleared the moment a camera track runs.
+  cameraError: null,
+  cameraLabel: null, // the label of the device the camera actually opened; null until one does
   effect: null,
   model: 'idle',
   hands: 0,
@@ -85,6 +89,16 @@ function setBadge(text, tone = 'idle') {
   badge.textContent = text || '';
   badge.dataset.tone = tone;
   badge.hidden = !text;
+}
+
+/** Record why a camera acquisition failed. `stage` is enumerate | getUserMedia | track | timeout. */
+function setCameraError(stage, name, message) {
+  state.cameraError = {
+    at: Date.now(),
+    stage,
+    name: String(name || '').slice(0, 60),
+    message: String(message || '').slice(0, 240),
+  };
 }
 
 /* ---------------------------------------------------------------- settings + bus */
@@ -283,6 +297,9 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
     state.error = snap.error;
     state.tracking = false;
     setBanner(snap.error, 'bad');
+  } else if (snap.state === 'running' && snap.source === 'camera') {
+    // The device this page actually opened, not the one the settings asked for.
+    state.cameraLabel = snap.deviceLabel || null;
   }
 }
 
@@ -327,9 +344,16 @@ function onTrackerState(snap) {
   if (snap.state === 'error') {
     state.camera = /denied/i.test(snap.error || '') ? 'denied' : 'error';
     state.error = snap.error;
+    // The page's own record of the failure, straight from the tracker's stage and the error name.
+    setCameraError(snap.failStage || 'getUserMedia', snap.errorName || 'Error', snap.error);
     setBanner(snap.error, 'bad');
   } else if (snap.state === 'running') {
     state.camera = 'on';
+    // A camera track is running: the failure reason is history, and this is the device.
+    if (snap.source === 'camera') {
+      state.cameraError = null;
+      if (snap.deviceLabel) state.cameraLabel = snap.deviceLabel;
+    }
     setBanner('');
   }
   renderState();
@@ -517,6 +541,9 @@ function ack(now = performance.now()) {
       hands: state.hands,
       gesture: state.gesture,
       error: state.error,
+      // Why the camera did not open (object or null) and the label it did open (string or null).
+      cameraError: state.cameraError,
+      cameraLabel: state.cameraLabel,
       // The mask's receipt time, so the server's status can say "mask arriving" without a frame
       // ever leaving this page. `body` also lets the pane name the body effects honestly.
       maskAt: state.bodySeen ? state.bodyAt : 0,
@@ -678,7 +705,13 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   // The truth is on the badge and on /ack (`anchors: 'synthetic'`), never dressed as a camera.
   setTimeout(() => {
     if (anchorsPresent() || (state.tracking && !state.synthetic)) return;
+    // The fallback is a symptom: if an acquisition already failed, that failure is the reason and
+    // stays in `cameraError`; the timeout is only named when nothing else did.
+    if (!state.cameraError) {
+      setCameraError('timeout', 'NoCameraTrack', 'No camera track within 1.5 s — drawing on synthetic hands.');
+    }
     ensureSyntheticAnchors();
+    ack();
   }, 1500);
   // Test hook: the browser test drives the page through this, not through the DOM.
   window.__handfx = {
