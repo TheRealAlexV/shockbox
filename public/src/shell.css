@@ -1204,6 +1204,22 @@ input[type='search'].input {
   margin: 0 0 10px;
 }
 
+/* pool manager strip: picker + rename/delete/create for the current pool */
+.pool-manager {
+  padding: 7px 10px;
+  background: var(--bg-1);
+  border: var(--hair) solid var(--line);
+}
+.pool-manager .pool-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.pool-manager .pool-inline[hidden] { display: none; }
+.pool-select { max-width: 240px; }
+.pool-hint { font-size: 10.5px; }
+
 .tabs {
   display: flex;
   gap: 0;

@@ -10,18 +10,21 @@
 //   DELETE /api/pool/:id/messages/:mid
 //   POST   /api/pool/:id/reorder      {ids:[...]}  — drag order, top to bottom
 //   POST   /api/pool/:id/messages/:mid/move {to, index}
+// Pools (managed here, where the messages live):
+//   GET    /api/pools                 {pools:[{id,name,count}]}  — `all`/`random` are views
+//   POST   /api/pools                 {label, kind}
+//   PATCH  /api/pools/:id             {label?, tags?}
+//   DELETE /api/pools/:id             → {moved}; held messages fall back to a pool of their kind
 // Live:   SSE `pool` channel, event `pools` → the whole view for tab `all` (reason included).
 //
-// Tabs are views over one list; writes always go through `all`.
+// Tabs are views over one list; writes always go through `all`. Every stored pool is a tab.
 
 import { el, clear, fmtWhen, debounce, actionButton } from '../ui.js';
 import { toast } from '../toast.js';
 
-const TABS = [
+const VIRTUAL = new Set(['all', 'random']);
+const VIRTUAL_TABS = [
   { id: 'all', label: 'All' },
-  { id: 'dialogs', label: 'Alerts' },
-  { id: 'notifications', label: 'Notifications' },
-  { id: 'wall', label: 'Wall' },
   { id: 'random', label: 'Random' },
 ];
 
@@ -51,12 +54,13 @@ export async function render(container, ctx) {
     types: [],
     tags_: [],
     counts: {},
+    pools: [],
     messages: [],
     loading: false,
   };
 
-  const initialTab = new URLSearchParams(location.hash.split('?')[1] || '').get('tab');
-  if (initialTab && TABS.some((t) => t.id === initialTab)) q.tab = initialTab;
+  // A pool id can only be validated once `GET /api/pools` lands, so remember the request.
+  let wantedTab = new URLSearchParams(location.hash.split('?')[1] || '').get('tab') || '';
 
   /* ---------------------------------------------------------- structure */
 
@@ -72,18 +76,62 @@ export async function render(container, ctx) {
 
   const tabsRow = el('div', { class: 'tabs-row' }, el('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Pool view' }));
   const tabs = tabsRow.firstElementChild;
-  const tabCount = new Map();
-  for (const t of TABS) {
-    const b = el('button', { type: 'button', class: 'tab', role: 'tab', dataset: { tab: t.id } });
-    b.append(el('span', { class: 'tab-label', text: t.label }), el('span', { class: 'tab-count mono', text: '–' }));
-    b.addEventListener('click', () => {
-      q.tab = t.id;
-      setUrlTab(t.id);
-      paintTabs();
-      rebuildList();
-    });
-    tabs.appendChild(b);
-  }
+
+  /* --------------------------------------------------------- pool manager */
+
+  const manager = el('div', { class: 'pool-toolbar pool-manager' });
+  const managerLabel = el('span', { class: 'filter-label', text: 'pool' });
+  const poolSelect = el('select', { class: 'input input-sm pool-select', 'aria-label': 'Pool' });
+  poolSelect.addEventListener('change', () => selectTab(poolSelect.value));
+  const managerActions = el('div', { class: 'pool-inline' });
+
+  // Rename happens in place: the same row swaps its controls for an input.
+  const renameForm = el('form', { class: 'pool-inline', hidden: true, autocomplete: 'off' });
+  const renameInput = el('input', { type: 'text', class: 'input input-sm', maxlength: '60', 'aria-label': 'Pool name' });
+  const renameCancel = el('button', { type: 'button', class: 'btn btn-quiet btn-sm', text: 'Cancel' });
+  renameForm.append(renameInput, el('button', { type: 'submit', class: 'btn btn-primary btn-sm', text: 'Save name' }), renameCancel);
+  renameCancel.addEventListener('click', () => { renameForm.hidden = true; });
+  renameForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const label = renameInput.value.trim();
+    if (!label) { toast('a pool needs a name', 'error'); return; }
+    try {
+      await api.patch(`/api/pools/${encodeURIComponent(q.tab)}`, { label });
+      renameForm.hidden = true;
+      toast('pool renamed', 'ok');
+      await reload();
+    } catch (err) {
+      toast(`rename failed: ${err.message}`, 'error');
+    }
+  });
+
+  const createForm = el('form', { class: 'pool-inline', hidden: true, autocomplete: 'off' });
+  const createInput = el('input', { type: 'text', class: 'input input-sm', placeholder: 'New pool name', maxlength: '60', 'aria-label': 'New pool name' });
+  const createKind = el('select', { class: 'input input-sm', 'aria-label': 'New pool kind' });
+  for (const k of KINDS) createKind.append(el('option', { value: k.id, text: k.label }));
+  const createCancel = el('button', { type: 'button', class: 'btn btn-quiet btn-sm', text: 'Cancel' });
+  createForm.append(createInput, createKind, el('button', { type: 'submit', class: 'btn btn-primary btn-sm', text: 'Create pool' }), createCancel);
+  createCancel.addEventListener('click', () => { createForm.hidden = true; });
+  createForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const label = createInput.value.trim();
+    if (!label) { toast('a pool needs a name', 'error'); return; }
+    try {
+      const out = await api.post('/api/pools', { label, kind: createKind.value });
+      createInput.value = '';
+      createForm.hidden = true;
+      toast(`pool ${out?.pool?.label || label} created`, 'ok');
+      if (out?.pool?.id) {
+        q.tab = out.pool.id;
+        setUrlTab(q.tab);
+      }
+      await reload();
+    } catch (err) {
+      toast(`create failed: ${err.message}`, 'error');
+    }
+  });
+
+  manager.append(managerLabel, poolSelect, managerActions, renameForm, createForm);
 
   const addBtn = el('button', { type: 'button', class: 'btn btn-primary', 'aria-expanded': 'false', 'aria-controls': 'add-form' });
   addBtn.append(el('span', { class: 'btn-label', text: '+ Add message' }));
@@ -143,7 +191,7 @@ export async function render(container, ctx) {
   );
 
   clear(container);
-  container.append(head, tabsRow, toolbar, addForm.root, el('section', { class: 'pool-list' }, listBox, emptyBox));
+  container.append(head, manager, tabsRow, toolbar, addForm.root, el('section', { class: 'pool-list' }, listBox, emptyBox));
 
   /* --------------------------------------------------------------- data */
 
@@ -155,11 +203,21 @@ export async function render(container, ctx) {
 
   async function loadMeta() {
     const r = await api.get('/api/pools');
+    q.pools = Array.isArray(r.pools) ? r.pools : [];
     q.types = r.types || [];
     q.tags_ = r.tags || [];
     q.counts = r.counts || {};
+    if (wantedTab) {
+      if (tabList().some((p) => p.id === wantedTab)) {
+        q.tab = wantedTab;
+        setUrlTab(wantedTab);
+      }
+      wantedTab = '';
+    }
     addForm.setTypes(q.types);
+    buildTabs();
     paintTabs();
+    paintManager();
     paintChips();
   }
 
@@ -167,7 +225,8 @@ export async function render(container, ctx) {
     if (q.loading) return;
     q.loading = true;
     const params = new URLSearchParams();
-    if (q.tab !== 'all' && q.tab !== 'random') params.set('type', q.tab);
+    // The tab already selects the pool; `type` is only the chip filter on top of it.
+    if (q.type) params.set('type', q.type);
     if (q.randomOnly) params.set('random', '1');
     // The API filters by one tag; we filter the rest client-side so chips compose.
     const tagList = [...q.tags];
@@ -198,10 +257,100 @@ export async function render(container, ctx) {
   }
 
   async function reload() {
-    await Promise.allSettled([loadMeta(), loadMessages()]);
+    // Meta first: it can retarget `q.tab` (deep link, deleted pool) before messages are read.
+    await Promise.allSettled([loadMeta()]);
+    await loadMessages();
   }
 
   /* --------------------------------------------------------------- paint */
+
+  /** Tabs = the two virtual views plus every stored pool, `random` pinned last. */
+  function tabList() {
+    const stored = (q.pools || [])
+      .filter((p) => p && p.id && !VIRTUAL.has(p.id))
+      .map((p) => ({ id: p.id, label: p.name || p.id }));
+    return [VIRTUAL_TABS[0], ...stored, VIRTUAL_TABS[1]];
+  }
+
+  function selectTab(id) {
+    if (!id) return;
+    q.tab = id;
+    setUrlTab(id);
+    renameForm.hidden = true;
+    createForm.hidden = true;
+    paintTabs();
+    paintManager();
+    rebuildList();
+    loadMessages();
+  }
+
+  function buildTabs() {
+    const list = tabList();
+    const key = list.map((p) => `${p.id}:${p.label}`).join('|');
+    if (tabs.dataset.key === key) return;
+    tabs.dataset.key = key;
+    clear(tabs);
+    for (const t of list) {
+      const b = el('button', { type: 'button', class: 'tab', role: 'tab', dataset: { tab: t.id } });
+      b.append(el('span', { class: 'tab-label', text: t.label }), el('span', { class: 'tab-count mono', text: '–' }));
+      b.addEventListener('click', () => selectTab(t.id));
+      tabs.appendChild(b);
+    }
+  }
+
+  /** The picker plus rename/delete/create controls, rebuilt from the pool list. */
+  function paintManager() {
+    const list = tabList();
+    if (!list.some((p) => p.id === q.tab)) {
+      q.tab = 'all';
+      setUrlTab('all');
+    }
+    clear(poolSelect);
+    for (const p of list) {
+      const n = q.counts?.[p.id];
+      poolSelect.append(el('option', { value: p.id, text: n === undefined ? p.label : `${p.label} (${n})` }));
+    }
+    poolSelect.value = q.tab;
+
+    clear(managerActions);
+    if (VIRTUAL.has(q.tab)) {
+      managerActions.append(el('span', { class: 'pool-hint dim', text: 'a view, not a pool' }));
+    } else {
+      const name = list.find((p) => p.id === q.tab)?.label || q.tab;
+      const held = q.counts?.[q.tab] || 0;
+      const rename = el('button', { type: 'button', class: 'btn btn-quiet btn-sm', text: 'Rename' });
+      rename.addEventListener('click', () => {
+        createForm.hidden = true;
+        renameInput.value = name;
+        renameForm.hidden = false;
+        renameInput.focus();
+        renameInput.select();
+      });
+      const del = actionButton({
+        label: 'Delete pool',
+        variant: 'btn-danger btn-sm',
+        title: `Delete ${name}`,
+        confirm: `Delete — ${held} message${held === 1 ? '' : 's'} move?`,
+        run: () => api.del(`/api/pools/${encodeURIComponent(q.tab)}`),
+        onDone: async (out) => {
+          renameForm.hidden = true;
+          q.tab = 'all';
+          setUrlTab('all');
+          toast(out?.moved ? `pool deleted, ${out.moved} message(s) moved` : 'pool deleted', 'ok');
+          await reload();
+        },
+        onError: (err) => toast(`delete failed: ${err.message}`, 'error'),
+      });
+      managerActions.append(rename, del);
+    }
+    const newBtn = el('button', { type: 'button', class: 'btn btn-quiet btn-sm', text: '+ New pool' });
+    newBtn.addEventListener('click', () => {
+      renameForm.hidden = true;
+      createForm.hidden = !createForm.hidden;
+      if (!createForm.hidden) createInput.focus();
+    });
+    managerActions.append(newBtn);
+  }
 
   function paintTabs() {
     for (const b of tabs.children) {
@@ -696,7 +845,13 @@ export async function render(container, ctx) {
       // `pools` events carry the whole `all` view: counts plus messages, on every write
       const data = frame.event === 'pools' ? frame.data : frame.cmd === 'pools' ? frame.args : null;
       if (!data) return;
-      if (Array.isArray(data.messages)) {
+      // A pool created or deleted elsewhere shows up as a changed `counts` key set.
+      const known = new Set((q.pools || []).map((p) => p.id));
+      const live = new Set(Object.keys(data.counts || {}).filter((id) => id !== 'storm'));
+      if ([...live].some((id) => !known.has(id)) || [...known].some((id) => !live.has(id))) loadMeta();
+      // Adopting the `all` view into a filtered tab would show messages that tab excludes.
+      const unfiltered = q.tab === 'all' && !q.type && !q.tags.size && !q.randomOnly;
+      if (Array.isArray(data.messages) && unfiltered) {
         // a write from any client (us, the deck, the wall) → adopt the server's truth
         q.messages = data.messages;
         if (data.types) q.types = data.types;
@@ -710,6 +865,7 @@ export async function render(container, ctx) {
       } else if (data.counts) {
         q.counts = data.counts;
         paintTabs();
+        paintManager();
       }
     }),
   );
