@@ -372,7 +372,7 @@ export default {
   /**
    * How the live picture sits on the wall, in the one number the engine needs.
    *
-   * `aspect` is (picture height / picture width) / (wall width / wall height): exactly the
+   * `aspect` is (picture height / picture width) * (wall width / wall height): exactly the
    * vertical stretch that makes a picture `imageScale` of the wall WIDTH come out at the file's
    * own proportions. Derived from the dimensions read out of the uploaded header and from the
    * ratio (a 16:9 wall is 16/9 of a wall-height tall), so it is the same geometry on a fresh
@@ -388,7 +388,7 @@ export default {
     const ratio = String((s && (typeof s.get === 'function' ? s.get('ratio') : s.ratio)) || '16:9');
     const parts = ratio.split(':').map(Number);
     const wallAspect = parts.length === 2 && parts[0] > 0 && parts[1] > 0 ? parts[0] / parts[1] : 16 / 9;
-    return { picH, wallAspect, aspect: picH / wallAspect, w, h };
+    return { picH, wallAspect, aspect: picH * wallAspect, w, h };
   },
 
   /**
@@ -447,7 +447,7 @@ export default {
         ? { rev: this.image.rev, file: this.image.file, mime: this.image.mime, w: this.image.w, h: this.image.h, bytes: this.image.bytes, limit: MAX_BYTES }
         : null,
       // How the picture sits in the placements `look` describes. `aspect` is the picture's
-      // height over its width divided by the wall's own aspect, which is exactly the vertical
+      // height over its width times the wall's own aspect, which is exactly the vertical
       // stretch the engine needs to draw the file at its own proportions while `imageScale`
       // stays "fraction of the wall WIDTH". Derived here, on the server, from the dimensions it
       // read out of the uploaded header: the page never guesses it from a decoded bitmap, so a
@@ -475,6 +475,13 @@ export default {
    * loads). The engine re-snaps against its own grid anyway; this is what the pane shows.
    */
   fenceCellsFor(px) {
+    // Idempotent: `renderSettings()` already returns this function's converted shape, and every
+    // settings/image/preset frame hands that converted fence straight back to `broadcastState`,
+    // which calls this again. Without the pass-through the `w/h > 0` bail below reads a converted
+    // fence as "no fence" and clears it on every live page. Both shapes reach here (converted
+    // from `renderSettings`, raw pixels from the pane's drag/commit), so the guard lives here.
+    if (px && typeof px === 'object' && px.cells && typeof px.cells === 'object'
+      && Number.isFinite(Number(px.cols)) && Number.isFinite(Number(px.rows))) return px;
     if (!px || !(px.w > 0) || !(px.h > 0)) return null;
     const s = this.ctx.settings;
     const cols = Math.max(4, Math.round(Number(s ? s.get('gridCols') : 0) || 112));

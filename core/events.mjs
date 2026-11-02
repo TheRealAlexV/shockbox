@@ -208,7 +208,7 @@ export function createEvents({ log }) {
 
   /**
    * Attach an SSE response. `channels` is the set this client wants.
-   * Replay: each channel's ring is sent from ?since= (or the whole ring, capped) before live frames.
+   * Replay: each channel's ring is sent from ?since= before live frames. No cursor, no replay.
    */
   function attach(req, res, { channels, view = null, since = null, client = null }) {
     res.writeHead(200, {
@@ -243,11 +243,16 @@ export function createEvents({ log }) {
         write(c, frame(ch, { reset: true, reason: 'stale-since', seq: 0 }));
         continue;
       }
-      const start = from === null ? 0 : Math.max(0, r.length - Math.min(r.length, RING_MAX));
+      // No cursor means a cold client, and a cold client must replay nothing. The ring holds
+      // commands, not state: a fresh page gets its state from the document (GET /api/wall/render)
+      // and from live, non-replayable `state.snapshot` frames. Replaying one-shots into a brand-new
+      // document re-fires them — `reload` calls location.reload() on every cold connect (an endless
+      // loop until 400 commands push it out), and `preset.set` re-applies and rewrites the document.
+      const start = from === null ? r.length : Math.max(0, r.length - Math.min(r.length, RING_MAX));
       for (let i = 0; i < r.length; i += 1) {
         const rec = r[i];
-        if (from !== null && rec.seq <= from) continue;
-        if (from === null && i < start) continue;
+        if (from === null || rec.seq <= from) continue;
+        if (i < start) continue;
         if (rec.view && view && rec.view !== view) continue;
         if (!write(c, frameFor(c, ch, rec))) break;
       }

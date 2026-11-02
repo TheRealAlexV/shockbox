@@ -157,9 +157,20 @@ async function waitFor(c, expression, ms = 10000) {
  * the wall last drew. This is the measurement every later assertion is made on, so it reads the
  * same canvas OBS sees (`preserveDrawingBuffer` is on).
  */
-const GRID_PROBE = `(function(){
+const GRID_PROBE = `(async function(){
   var i = window.LEDWALL_INSTANCE;
   if (!i) return null;
+  // The drawing buffer holds the frame drawn BEFORE the setting the caller just applied: a read
+  // taken right after applied() lands one frame late, and every position/scale/rotation diff
+  // measured against it read 0 changed cells. Wait for the loop to actually draw with the new
+  // value. 3 ticks: the breakpoint is between 1 and 2 on a frozen wall, 3 leaves headroom for a
+  // frame the compositor swallows. The timeout keeps a stalled rAF loop from hanging the gate.
+  await new Promise(function (res) {
+    var n = 0;
+    var tick = function () { n += 1; if (n >= 3) return res(); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+    setTimeout(res, 2000);
+  });
   var gl = i.gl, g = i.grid, W = i.W, H = i.H;
   var px = new Uint8Array(W * H * 4);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -206,21 +217,24 @@ function count(grid, pred) {
 }
 
 async function readGrid(c) {
-  const g = await evaluate(c, GRID_PROBE);
+  // GRID_PROBE is an async IIFE (it waits for frames), so the evaluate must await the promise.
+  const g = await evaluate(c, GRID_PROBE, true);
   if (!g) throw new Error('no grid: the wall did not mount');
   return g;
 }
 
 /**
- * Distinct colours among the LIT cells (the unlit wall is one colour, so counting it cancels the
- * metrics out). Quantised to 8 levels per channel: "distinct" must mean visibly distinct, not
- * one least-significant bit of gradient banding.
+ * Distinct HUE buckets among the LIT cells (the unlit wall is one colour, so counting it cancels
+ * the metrics out). The key is chromaticity, 4 buckets per channel, so brightness is divided out:
+ * bucketing the graded RGB instead counted the emitter profile's vignette and the ramp gradient,
+ * which read ~85 "distinct" for every `imageColour` mode and measured gain, not hue.
  */
 function litDistinct(grid) {
   const set = new Set();
   for (const c2 of grid.cells) {
     if (c2[0] + c2[1] + c2[2] < 90) continue;
-    set.add(`${c2[0] >> 5},${c2[1] >> 5},${c2[2] >> 5}`);
+    const sum = Math.max(1, c2[0] + c2[1] + c2[2]);
+    set.add(`${((c2[0] / sum) * 4) | 0},${((c2[1] / sum) * 4) | 0}`);
   }
   return set.size;
 }
@@ -337,6 +351,132 @@ function setDistance(a, b) {
   });
 })()`;
 
+/**
+ * Read the 12-bit dither where it is a 12-bit quantity: the engine's SCENE pass.
+ *
+ * The canvas is 8-bit, so a 12-bit dither is quantised away before it can be counted — measured on
+ * the same 92x92 window, the canvas reports 21 distinct green levels with `imageDither` 0 and 21
+ * with 1. The scene pass is the render the dither acts on, and the engine allocates it RGBA16F
+ * (`i.sceneFbo`), so it is read back as float. The readback format is checked rather than assumed:
+ * if the context does not advertise float colour readback the probe returns an error naming that,
+ * instead of quietly measuring something coarser and passing.
+ *
+ * The window comes from the same numbers the shader used, so it sits inside ONE flat band: the
+ * picture's green band is `uvImg.x` 0.25..0.5, i.e. wall x `centre + scale * [-0.25, 0)`, and the
+ * window is 92x92 centred in that band at the picture's y centre. Nothing new is set on the wall —
+ * it reads the placement and bit depth the caller already applied.
+ *
+ * `dither` 0 locates the window and stores its frame on the page; 1 re-reads that window and diffs
+ * the two 12-bit codes. Steps are in LSB(12) — 1/4095, the ladder the shader quantises to — and
+ * the 8-bit canvas count is taken over the same window, as context for what the eye can be shown.
+ */
+const SCENE_DITHER_PROBE = `(async function(dither){
+  var i = window.LEDWALL_INSTANCE;
+  if (!i) return { error: 'no wall instance' };
+  if (!i.sceneFbo) return { error: 'no scene target: the wall did not mount' };
+  var gl = i.gl, W = i.W, H = i.H;
+  // Same contract as GRID_PROBE: the frame holds the value from before the setting was applied.
+  await new Promise(function (res) {
+    var n = 0;
+    var tick = function () { n += 1; if (n >= 3) return res(); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+    setTimeout(res, 2000);
+  });
+
+  var side = 92;
+  var win = window.__wallDitherWin || null;
+  if (!win) {
+    var s = i.eff || i.s || {};
+    var scale = Math.min(4, Math.max(0.05, Number(s.imageScale == null ? 1 : s.imageScale)));
+    var icx = Math.min(1, Math.max(0, Number(s.imageX == null ? 0.5 : s.imageX)));
+    var icy = Math.min(1, Math.max(0, Number(s.imageY == null ? 0.5 : s.imageY)));
+    var deg = Number(s.imageRotate || 0);
+    if (Math.abs(deg) > 1e-6) return { error: 'the picture is rotated ' + deg + ' deg: its band is not axis-aligned' };
+    var bandX0 = Math.round((icx - 0.25 * scale) * W);
+    var bandX1 = Math.round(icx * W);
+    if (bandX1 - bandX0 < side + 8) {
+      return { error: 'the picture band is only ' + (bandX1 - bandX0) + ' px wide: cannot read a ' + side + 'x' + side + ' window' };
+    }
+    win = {
+      x: Math.round(bandX0 + (bandX1 - bandX0) / 2) - (side >> 1),
+      y: Math.round(icy * H) - (side >> 1),
+      w: side, h: side,
+    };
+    window.__wallDitherWin = win;
+  }
+  var x = Math.max(0, Math.min(W - win.w, win.x));
+  var y = Math.max(0, Math.min(H - win.h, win.y));
+  var w = win.w, h = win.h;
+
+  var prevFb = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, i.sceneFbo);
+  var status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+    return { error: 'the scene target is incomplete (0x' + status.toString(16) + ')' };
+  }
+  var readFmt = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT);
+  var readType = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE);
+  var floatExt = gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float');
+  // RGBA16F advertises RGBA/FLOAT (5126) or, as this host's driver does, RGBA/HALF_FLOAT (5131).
+  // Both are colour-float readback; anything else means the read would be silently coarser.
+  var halfType = gl.HALF_FLOAT || 0x140b;
+  if (readFmt !== gl.RGBA || (readType !== gl.FLOAT && readType !== halfType) || !floatExt) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+    return { error: 'the scene pass does not advertise float colour readback: format=' + readFmt +
+      ' (RGBA=' + gl.RGBA + '), type=' + readType + ' (FLOAT=' + gl.FLOAT + ', HALF_FLOAT=' + halfType +
+      '), EXT_color_buffer_float=' + Boolean(floatExt) };
+  }
+  var px = new Float32Array(w * h * 4);
+  gl.readPixels(x, y, w, h, gl.RGBA, gl.FLOAT, px);
+  var glErr = gl.getError();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  var cu = new Uint8Array(w * h * 4);
+  gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, cu);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+  if (glErr) return { error: 'readPixels(gl.FLOAT) on the scene pass raised GL error 0x' + glErr.toString(16) };
+
+  if (dither < 0.5) {
+    // One flat band, checked from the pixels: inside the picture's green band green is the one
+    // channel the picture gives a level to (raw mode is [0,1,0]), so a window that is mostly
+    // green-dominant is inside that band and not across a seam.
+    var lit = 0, redHot = 0;
+    for (var p = 0; p < w * h; p++) {
+      var o = p * 4;
+      if (px[o] > 0.002) redHot++;
+      if (px[o + 1] > 0.05 && px[o + 1] > px[o] && px[o + 1] > px[o + 2]) lit++;
+    }
+    if (lit < w * h * 0.4) {
+      return { error: 'the window is not inside a lit flat band: ' + lit + ' of ' + (w * h) +
+        ' px are green-dominant, ' + redHot + ' carry red' };
+    }
+    window.__wallDitherFlat = { px: px, cu: cu, w: w, h: h };
+    return { win: { x: x, y: y, w: w, h: h }, frame: W + 'x' + H, band: w * h, lit: lit,
+             readFmt: readFmt, readType: readType };
+  }
+
+  var base = window.__wallDitherFlat;
+  if (!base) return { error: 'no flat frame stored: read imageDither 0 first' };
+  var red = 0, green = 0, blue = 0, gb1 = 0, moved = 0, maxStep = 0, canvasMoved = 0;
+  for (var q = 0; q < w * h; q++) {
+    var o2 = q * 4;
+    var dr = Math.abs(Math.round(px[o2] * 4095) - Math.round(base.px[o2] * 4095));
+    var dg = Math.abs(Math.round(px[o2 + 1] * 4095) - Math.round(base.px[o2 + 1] * 4095));
+    var db = Math.abs(Math.round(px[o2 + 2] * 4095) - Math.round(base.px[o2 + 2] * 4095));
+    if (dr) red++;
+    if (dg) green++;
+    if (db) blue++;
+    if (dg === 1 || db === 1) gb1++;
+    var step = Math.max(dr, dg, db);
+    if (step) { moved++; if (step > maxStep) maxStep = step; }
+    if (cu[o2] !== base.cu[o2] || cu[o2 + 1] !== base.cu[o2 + 1] || cu[o2 + 2] !== base.cu[o2 + 2]) canvasMoved++;
+  }
+  window.__wallDitherWin = null;
+  window.__wallDitherFlat = null;
+  return { red: red, green: green, blue: blue, gb1: gb1, moved: moved, maxStep: maxStep,
+           canvasMoved: canvasMoved, win: { x: x, y: y, w: w, h: h } };
+})`;
+
 async function main() {
   const srv = await startServer();
   const { devtools, stop: stopChrome } = await launchChrome({
@@ -376,6 +516,23 @@ async function main() {
   const render = () => fetch(`${srv.url}/api/wall/render`).then((r) => r.json());
 
   /**
+   * Wait until the page has APPLIED `key` = `v`, not merely accepted the PATCH. The settings
+   * document lands on a later rAF frame, and a 2560x1440 `readPixels` on SwiftShader blocks rAF
+   * for 2–4.6 s, so a fixed sleep followed by `readGrid` can read the frame before the patch.
+   * `_resolveView` rebuilds `eff` only when the page takes the update, so `eff` equals the new
+   * value only once the page has applied it (and its next draw is the one to read).
+   */
+  const applied = async (k, v) => {
+    const lit = typeof v === 'number' ? v : JSON.stringify(v);
+    const test = typeof v === 'number'
+      ? `Math.abs(Number(window.LEDWALL_INSTANCE.eff.${k}) - (${v})) < 1e-9`
+      : `String(window.LEDWALL_INSTANCE.eff.${k}) === ${lit}`;
+    return waitFor(c, `Boolean(window.LEDWALL_INSTANCE && window.LEDWALL_INSTANCE.eff) && (${test})`, 30000);
+  };
+  /** Wait for every key of a multi-key patch at once. */
+  const appliedAll = (p) => Promise.all(Object.keys(p).map((k) => applied(k, p[k])));
+
+  /**
    * The frame now, and the same frame with the picture layer off, at the current placement. The
    * pair is what `changedBox` needs: only the picture's own cells move between the two, and the
    * layer is left on so the caller's next measurement sees the wall it expects.
@@ -383,12 +540,15 @@ async function main() {
   const picturePair = async () => {
     const on = await readGrid(c);
     await patch({ imageOn: 0 });
-    await sleep(600);
+    await applied('imageOn', 0);
     const off = await readGrid(c);
     await patch({ imageOn: 1 });
-    await sleep(600);
+    await applied('imageOn', 1);
     return { on, off };
   };
+
+  // Set only once every check has run, so the finally block can tell a clean run from a throw.
+  let complete = false;
 
   try {
     // Start from a known wall: whole 16:9, a SMOOTH pattern (the default `random` re-fires cells
@@ -431,7 +591,9 @@ async function main() {
       `imageOn=${liveDoc.settings.look.imageOn} imageRev=${liveDoc.settings.look.imageRev}`);
 
     // ── 2. it is ON the wall, in the picture's own colours ────────────────
-    await sleep(600);
+    // The baseline PATCH and the upload's `imageOn` land on later frames: wait for the page's
+    // effective look to carry them, or the read below is the frame before the picture.
+    await appliedAll({ pattern: 'wave', speed: 0, grain: 0, imageOn: 1 });
     const gridOn = await readGrid(c);
     if (process.env.PROBE_IMG) {
       const sample = ['red', 'green', 'blue', 'white'].map((n, i) => [n, gridOn.cells.filter((_, k) => (k % gridOn.cols) > (i * gridOn.cols / 4) && (k % gridOn.cols) < ((i + 1) * gridOn.cols / 4))]);
@@ -449,7 +611,7 @@ async function main() {
     // saturated cells" (max channel high, channel spread wide) — the pattern alone never gets there.
     const onRed = count(gridOn, isPicture);
     const off = await patch({ imageOn: 0 });
-    await sleep(600);
+    await applied('imageOn', 0);
     const gridOff = await readGrid(c);
     const offCount = count(gridOff, isPicture);
     const changed = diffCells(gridOn, gridOff);
@@ -463,7 +625,7 @@ async function main() {
       `${changed} of ${gridOn.cols * gridOn.rows} cells changed when the layer went off ` +
       `(${onRed} -> ${offCount} hot, ${litCells(gridOn)} lit vs ${litCells(gridOff)} lit)`);
     await patch({ imageOn: 1, imageScale: 0.6 });
-    await sleep(700);
+    await appliedAll({ imageOn: 1, imageScale: 0.6 });
     const grid2 = await readGrid(c);
     ok('display: it comes back when the layer is switched on again', Boolean(grid2) && count(grid2, isPicture) > 300,
       `${grid2 ? count(grid2, isPicture) : -1} hot picture cells`);
@@ -476,13 +638,13 @@ async function main() {
     // The picture box on the preview writes these same keys through settings.patch, so proving
     // the keys move the wall proves the control; `pane-drag` covers the pointer path itself.
     const moved = await patch({ imageX: 0.3, imageY: 0.4 });
-    await sleep(700);
+    await appliedAll({ imageX: 0.3, imageY: 0.4 });
     const gridMoved = await readGrid(c);
     ok('transform: a position patch moves the lit rectangle', diffCells(base, gridMoved) > 50,
       `${diffCells(base, gridMoved)} of ${base.cells.length} cells changed`);
 
     await patch({ imageX: 0.5, imageY: 0.5, imageScale: 0.3 });
-    await sleep(700);
+    await appliedAll({ imageX: 0.5, imageY: 0.5, imageScale: 0.3 });
     const { on: gridZoomed, off: zoomedOff } = await picturePair();
     const smallBox = changedBox(gridZoomed, zoomedOff);
     ok('transform: a scale patch resizes the lit rectangle',
@@ -490,18 +652,20 @@ async function main() {
       `scale 0.6 → ${boxText(bigBox)}, scale 0.3 → ${boxText(smallBox)}`);
 
     await patch({ imageScale: 0.6 });
-    await sleep(700);
-    const gridRot = await patch({ imageRotate: 45 }).then(() => sleep(800)).then(() => readGrid(c));
+    await applied('imageScale', 0.6);
+    await patch({ imageRotate: 45 });
+    await applied('imageRotate', 45);
+    const gridRot = await readGrid(c);
     ok('transform: a rotation patch turns the rectangle', diffCells(grid2, gridRot) > 50,
       `${diffCells(grid2, gridRot)} cells changed at 45°`);
     await patch({ imageRotate: 0 });
-    await sleep(700);
+    await applied('imageRotate', 0);
 
     // ── 4. colour modes: three visibly different pictures ────────────────
     const byMode = {};
     for (const mode of ['raw', 'match', 'palette']) {
       await patch({ imageColour: mode });
-      await sleep(700);
+      await applied('imageColour', mode);
       const g = await readGrid(c);
       byMode[mode] = { grid: g, colours: colourSet(g), distinct: litDistinct(g) };
     }
@@ -519,7 +683,7 @@ async function main() {
       byMode.palette.distinct < byMode.raw.distinct * 0.75,
       `${byMode.raw.distinct} raw → ${byMode.palette.distinct} palette`);
     await patch({ imageColour: 'raw' });
-    await sleep(700);
+    await applied('imageColour', 'raw');
 
     // ── 5. bit depth: the ladder is 8/10/12, and the dither belongs to the top of it ─
     // 8-bit is 256 levels per channel, which is the most the uploaded PNG has; the quantiser is
@@ -529,29 +693,56 @@ async function main() {
     const byBits = {};
     for (const bits of ['8', '10', '12']) {
       await patch({ imageBits: bits });
-      await sleep(700);
+      await applied('imageBits', bits);
       byBits[bits] = litDistinct(await readGrid(c));
     }
     ok('depth: the ladder is 8, 10 and 12 bit at 4 bits per step', byBits['8'] > 0 && byBits['10'] > 0 && byBits['12'] > 0,
       `8-bit=${byBits['8']} 10-bit=${byBits['10']} 12-bit=${byBits['12']} distinct cell colours`);
 
-    const flat12 = await patch({ imageBits: '12', imageDither: 0 }).then(() => sleep(800)).then(() => readGrid(c));
-    const dith12 = await patch({ imageBits: '12', imageDither: 1 }).then(() => sleep(800)).then(() => readGrid(c));
-    ok('depth: the ordered dither band-fills the 12-bit picture (more distinct colours)',
-      litDistinct(dith12) > litDistinct(flat12),
-      `12-bit flat=${litDistinct(flat12)} dithered=${litDistinct(dith12)} distinct`);
+    // The canvas cannot show this one: it is 8-bit, and the dither is a 12-bit offset, so both
+    // dither states read the same distinct-level count on the canvas (21 either way, measured on
+    // this window). The scene pass is the frame the dither actually moves and it is RGBA16F, so
+    // the assertion reads it as float. The offsets are spread across the emitters on purpose
+    // (engine.js LED_FRAG: red none, green three quarters, blue three times), so red must not move
+    // at all while green and blue step by one level, and no pixel may jump more than two.
+    const ditherBefore = await evaluate(c, 'Number(window.LEDWALL_INSTANCE.eff.imageDither)');
+    const ditherRestore = Number.isFinite(ditherBefore) ? ditherBefore : 1;
+    await patch({ imageBits: '12', imageDither: 0 });
+    await appliedAll({ imageBits: '12', imageDither: 0 });
+    const flatScene = await evaluate(c, `(${SCENE_DITHER_PROBE})(0)`, true);
+    let dithScene = flatScene;
+    if (!flatScene.error) {
+      await patch({ imageDither: 1 });
+      await applied('imageDither', 1);
+      dithScene = await evaluate(c, `(${SCENE_DITHER_PROBE})(1)`, true);
+    }
+    await patch({ imageDither: ditherRestore });
+    await applied('imageDither', ditherRestore);
+    const sceneWin = (flatScene.win || dithScene.win || { x: -1, y: -1, w: 0, h: 0 });
+    ok('depth: the 12-bit dither steps green and blue by one level and leaves red alone',
+      !flatScene.error && !dithScene.error &&
+        dithScene.red === 0 && dithScene.gb1 >= 300 && dithScene.maxStep <= 2,
+      flatScene.error
+        ? `scene readback: ${flatScene.error}`
+        : dithScene.error
+          ? `dither readback: ${dithScene.error}`
+          : `red diffs=${dithScene.red}, green diffs=${dithScene.green}, blue diffs=${dithScene.blue}, max step=${dithScene.maxStep} LSB(12) over ${sceneWin.w}x${sceneWin.h} px at ${sceneWin.x},${sceneWin.y} of ${flatScene.frame} (green+blue at exactly 1 LSB: ${dithScene.gb1}, any channel moved: ${dithScene.moved}); scene readback RGBA format=${flatScene.readFmt} type=${flatScene.readType} (float), ${flatScene.lit}/${flatScene.band} px lit flat band; 8-bit canvas in the same window: ${dithScene.canvasMoved} px moved`);
 
-    const flat8 = await patch({ imageBits: '8', imageDither: 0 }).then(() => sleep(800)).then(() => readGrid(c));
-    const dith8 = await patch({ imageBits: '8', imageDither: 1 }).then(() => sleep(800)).then(() => readGrid(c));
+    await patch({ imageBits: '8', imageDither: 0 });
+    await appliedAll({ imageBits: '8', imageDither: 0 });
+    const flat8 = await readGrid(c);
+    await patch({ imageBits: '8', imageDither: 1 });
+    await appliedAll({ imageBits: '8', imageDither: 1 });
+    const dith8 = await readGrid(c);
     ok('depth: at 8-bit the dither has no steps worth filling (change stays inside noise)',
       Math.abs(litDistinct(dith8) - litDistinct(flat8)) <= Math.max(4, litDistinct(flat8) * 0.1),
       `8-bit flat=${litDistinct(flat8)} dithered=${litDistinct(dith8)} distinct`);
     await patch({ imageBits: '8', imageDither: 1 });
-    await sleep(600);
+    await appliedAll({ imageBits: '8', imageDither: 1 });
 
     // ── 6. preset round-trip: save the placement, reload, get it back ─────
     await patch({ imageX: 0.34, imageY: 0.42, imageScale: 0.44, imageRotate: 12, imageColour: 'match', imageBits: '8' });
-    await sleep(500);
+    await appliedAll({ imageX: 0.34, imageY: 0.42, imageScale: 0.44, imageRotate: 12, imageColour: 'match', imageBits: '8' });
     const saved = await fetch(`${srv.url}/api/wall/cmd`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -569,7 +760,7 @@ async function main() {
 
     // move it somewhere else, so "restored" cannot be mistaken for "never moved"
     await patch({ imageX: 0.8, imageY: 0.8, imageScale: 1.2, imageRotate: -60, imageColour: 'raw', imageBits: '10' });
-    await sleep(400);
+    await appliedAll({ imageX: 0.8, imageY: 0.8, imageScale: 1.2, imageRotate: -60, imageColour: 'raw', imageBits: '10' });
     await fetch(`${srv.url}/api/wall/cmd`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -597,6 +788,25 @@ async function main() {
     ok('preset: loading it restores the picture placement', Math.abs(Number(restored.imageX) - 0.34) < 1e-6 && Math.abs(Number(restored.imageScale) - 0.44) < 1e-6 && Number(restored.imageRotate) === 12,
       `x=${restored.imageX} scale=${restored.imageScale} rot=${restored.imageRotate} colour=${restored.imageColour} bits=${restored.imageBits}`);
 
+    // The frame the reload must be compared against is the one drawn immediately BEFORE it, not
+    // the 45° frame from three sections ago: diffing against a stale frame passes for any picture
+    // at all, a blank wall included.
+    await appliedAll({ imageX: 0.34, imageY: 0.42, imageScale: 0.44, imageRotate: 12, imageColour: 'match', imageBits: '8' });
+    const gridRestored = await readGrid(c);
+
+    // Noise floor of this measurement: two accurate reads of a wall that has not been touched.
+    // If this is the same size as `reloadDiff`, the assertion is reading frame noise, not the
+    // restore, and no threshold below it can pass.
+    const restDrift = diffCells(gridRestored, await readGrid(c));
+
+    // Diagnostics for the one failure this gate has never passed: the frame the reload draws
+    // differs from the pre-reload frame even though the document, the texture and both toggles
+    // agree. `restDrift` is the measurement's own noise floor (two accurate reads of the untouched
+    // wall - 0), so a diff in the thousands is the render, not the probe. `wave time` is printed
+    // because engine.js:1614 accumulates `time += dt*speed` and a reload starts at 0; measured
+    // 0.0333 -> 0, too small to move a frozen wave, so it is ruled out, not blamed.
+    const tBefore = await evaluate(c, 'window.LEDWALL_INSTANCE && Number(window.LEDWALL_INSTANCE.time)');
+
     // the page reloads and draws the same picture in the same place: a real restore, not a
     // server-side document nobody renders
     await c.send('Page.reload', { ignoreCache: true });
@@ -604,8 +814,20 @@ async function main() {
     const remounted = await waitFor(c, 'Boolean(window.LEDWALL_INSTANCE && window.LEDWALL_INSTANCE.imgTex)', 12000);
     await sleep(900);
     const gridReload = await readGrid(c);
-    ok('preset: a reload draws the restored placement on the wall', Boolean(remounted) && diffCells(gridRot, gridReload) > 20,
-      `${diffCells(gridRot, gridReload)} cells differ from the 45° frame`);
+    const reloadDiff = diffCells(gridRestored, gridReload);
+    const tAfter = await evaluate(c, 'window.LEDWALL_INSTANCE && Number(window.LEDWALL_INSTANCE.time)');
+    // (restDrift is measured above, before the reload.)
+    const reloadState = await evaluate(c, `(function () {
+      var i = window.LEDWALL_INSTANCE || {};
+      return JSON.stringify({ imgRev: i.s && i.s.imageRev, imgError: i.imgError || null, imgTex: Boolean(i.imgTex),
+        imgOn: i.s && i.s.imageOn, effOn: i.eff && i.eff.imageOn,
+        fenceOn: Boolean(i.fenceOn), fence: i.fence || null, fenceCells: i.fenceCells || null,
+        docFence: (i.s && i.s.fence) || null });
+    })()`);
+    ok('preset: a reload draws the restored placement on the wall', Boolean(remounted) && reloadDiff < 20,
+      `diff=${reloadDiff} of ${gridRestored.cells.length} cells vs the pre-reload frame (rest drift ${restDrift}), wave time ${tBefore} -> ${tAfter}, remounted=${Boolean(remounted)}, ` +
+      `frame ${gridRestored.W}x${gridRestored.H}/${gridRestored.cols}x${gridRestored.rows} -> ${gridReload.W}x${gridReload.H}/${gridReload.cols}x${gridReload.rows}, ${reloadState}`);
+    complete = true;
   } finally {
     c.close();
     stopChrome();
@@ -613,6 +835,11 @@ async function main() {
     await sleep(150);
     if (srv.log) fs.writeFileSync(path.join(SCRATCH, 'wall-image-server.log'), srv.log.join(''));
     fs.writeFileSync(path.join(SCRATCH, 'wall-image-console.log'), consoleLines.join('\n'));
+    // A failing run keeps its state dir: it is the only copy of the document and settings to
+    // diagnose from, while a passing run's is dead weight in /tmp.
+    if (complete && results.every((r) => r.pass) && srv.stateDir) {
+      fs.rmSync(srv.stateDir, { recursive: true, force: true });
+    }
   }
 
   const failed = results.filter((r) => !r.pass);

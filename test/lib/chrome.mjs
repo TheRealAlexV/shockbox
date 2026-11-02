@@ -51,6 +51,12 @@
 //     (and, without --dry-run, reaps) every headless Chrome and stray test server on the box.
 //     `npm test` runs it as `pretest`; `npm run sweep` runs it by hand.
 //
+// CONTAINMENT (enforced here, not asked for in a doc): `launchChrome` takes an exclusive lock file
+// (one gate at a time), refuses to start when the host is already above 0.7 × cpus of 1-minute load,
+// spawns Chrome inside a hard CPU quota (systemd-run user scope, else cpulimit, else nice 19 with a
+// warning), and releases the lock plus runs `gui/sweep-orphans.sh` from `stop()`. Overrides:
+// SHOCKBOX_GATE_FORCE=1 (load), CPU_CAP_PCT (default 150), SHOCKBOX_GATE_MEM_MB (default 4096).
+//
 // Anything a caller needs that this does not pass goes in `extraArgs`.
 
 import { spawn } from 'node:child_process';
@@ -58,6 +64,17 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+
+// Structural limits for the browser itself: one gate at a time, a hard CPU quota, a refusal to
+// start on a hot host, and an orphan sweep on the way out. See test/lib/containment.mjs.
+import {
+  acquireGateLock,
+  assertHostIdle,
+  cpuController,
+  gateName,
+  releaseGateLock,
+  sweepOrphans,
+} from './containment.mjs';
 
 export const IN_CI = Boolean(process.env.CI && process.env.CI !== 'false' && process.env.CI !== '0');
 
@@ -346,6 +363,25 @@ function reapAll() {
   for (const entry of [...LIVE]) reap(entry);
 }
 
+// --- orphan sweep ------------------------------------------------------------------------------
+// One last pass on the way out: if a browser escaped its group, or an earlier run left one behind,
+// gui/sweep-orphans.sh reaps it. At most once per process; `sweepOrphans` caches the result, so the
+// stop() call and the exit hook share one run.
+let sweepArmed = false;
+
+function sweepOrphansOnce() {
+  const swept = sweepOrphans();
+  if (!swept) return;
+  if (swept.last) console.log(`[containment] orphan sweep: ${swept.last}`);
+  else if (swept.error) console.error(`[containment] orphan sweep failed: ${swept.error}`);
+}
+
+function armSweep() {
+  if (sweepArmed) return;
+  sweepArmed = true;
+  process.on('exit', () => sweepOrphansOnce()); // registered after the browser reaper, so it runs last
+}
+
 function armReaper() {
   if (reaperArmed) return;
   reaperArmed = true;
@@ -378,6 +414,12 @@ export async function launchChrome({ size = [1280, 720], extraArgs = [], profile
   if (!CHROME) {
     throw new Error(`no chrome/chromium found (set CHROME= or CHROME_PATH=); probed ${PROBED.join(', ')}`);
   }
+  // Fail before anything is allocated: a hot host, or a gate that is already running, means no
+  // browser at all. Both throw with the reason; the gate exits non-zero.
+  assertHostIdle();
+  acquireGateLock({ name: gateName() });
+  const cpuCap = cpuController();
+
   const port = await freePort();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), profilePrefix));
   const args = [
@@ -399,12 +441,18 @@ export async function launchChrome({ size = [1280, 720], extraArgs = [], profile
   // detached puts Chrome in a new process group led by itself, which is what makes `kill(-pid)`
   // reach the children it spawns. Nothing here waits on the browser, so it never needs the
   // terminal to stay in the loop; the gate's own output is unaffected.
-  const child = spawn(CHROME, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  //
+  // The command is the CPU-cap wrapper, not the binary: systemd-run's scope becomes the group
+  // leader and Chrome (with its zygote/gpu-process) lives inside it, so `kill(-pid)` still reaches
+  // every child while the cgroup quota covers the whole tree.
+  const wrapped = cpuCap.command(CHROME, args);
+  const child = spawn(wrapped.cmd, wrapped.args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
   const entry = { child, pid: child.pid, reaped: false };
   if (child.pid) {
     LIVE.add(entry);
     MANAGED.add(child.pid);
     armReaper();
+    armSweep();
   }
 
   // Ring buffer of Chrome's own words. stdout is read and dropped so a full pipe can never block
@@ -451,14 +499,27 @@ export async function launchChrome({ size = [1280, 720], extraArgs = [], profile
     return bits.join('\n  ');
   };
 
-  const stop = () => reap(entry);
+  // Teardown for every exit path: the browser's whole process group, the gate lock, then the orphan
+  // sweep. `reap` is idempotent; the other two are guarded here so a gate calling stop() twice and
+  // the 'exit' handler after it do not release somebody else's lock or sweep twice.
+  let tornDown = false;
+  const stop = () => {
+    if (tornDown) return;
+    tornDown = true;
+    reap(entry); // kill(-pid): the wrapper and every chrome child in its group
+    releaseGateLock();
+    sweepOrphansOnce();
+  };
 
   const base = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + (timeoutMs ?? (IN_CI ? 30_000 : 15_000));
   let version = null;
 
   while (Date.now() < deadline) {
-    if (exit) throw new Error(`chrome did not start:\n  ${describe()}`);
+    if (exit) {
+      stop(); // a browser that never came up still owns the group slot and the lock
+      throw new Error(`chrome did not start:\n  ${describe()}`);
+    }
     if (!version) {
       try {
         const r = await fetch(`${base}/json/version`, { signal: AbortSignal.timeout(2000) });

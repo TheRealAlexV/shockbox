@@ -45,10 +45,11 @@
     'bloom', 'bloomThreshold', 'bloomRadius',
     'exposure', 'saturation', 'contrast', 'lift', 'vignette', 'grain',
     'dither', 'acsTonemap', 'bits',
-    // The picture is part of the look: where it sits, how it is coloured, how deep. `imageRev`
-    // names the stored upload so loading the preset puts the same picture back.
+    // The picture is part of the look: where it sits, how it is coloured, how deep. `imageOn`
+    // says the picture is on the wall at all; `imageRev` names the stored upload so loading the
+    // preset puts the same picture back.
     'imageX', 'imageY', 'imageScale', 'imageRotate', 'imageColour', 'imageBits', 'imageDither',
-    'imageRev',
+    'imageOn', 'imageRev',
     'textScroll', 'safeArea'
   ];
 
@@ -89,6 +90,28 @@
 
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
   function num(v, d) { var n = Number(v); return isFinite(n) ? n : d; }
+
+  // Same URL helper boot.js uses (`qNum` there): absent parameter → the default, present →
+  // Number() of it, so a typo reads as NaN instead of a silent 0.
+  function qNum(name, dflt) {
+    var v = (typeof location === 'undefined' || !location.search) ? null
+      : new URLSearchParams(location.search).get(name);
+    return v === null ? dflt : Number(v);
+  }
+
+  // ── Idle throttle ─────────────────────────────────────────────────────────
+  // A wall page lives in an OBS browser source for days. When the look is static — speed 0,
+  // no grain, no trail, nothing revealing, and no image on the way in — a full GPU frame per
+  // vsync draws the same picture again. The loop then sleeps at IDLE_FPS. `?idleFps=` overrides
+  // the rate for verification (0 = never skip); absent leaves the default path untouched.
+  var IDLE_FPS = (function () {
+    var v = qNum('idleFps', 5);
+    if (!isFinite(v)) v = 5;
+    return v <= 0 ? 0 : clamp(v, 0.5, 30);
+  })();
+  // After a change, keep drawing for this long: the sim eases `cur` toward `br` with
+  // `1 - exp(-dt * rate * transition)`, so one frame after a patch is not the final picture.
+  var IDLE_SETTLE_MS = 1000;
 
   function merge(base, part) {
     var out = {};
@@ -238,7 +261,7 @@
     'uniform vec4  u_imgXf;       // x, y (picture centre, wall uv), scale, unused',
     'uniform vec2  u_imgRot;      // cos(theta), sin(theta)',
     'uniform float u_imgMode;     // 0 raw, 1 match the ramp, 2 luminance through the ramp',
-    'uniform vec2  u_imgSize;     // aspect compensation: (1, picture aspect / wall aspect)',
+    'uniform vec2  u_imgSize;     // aspect compensation: (1, (h / w) * wall aspect)',
     'uniform float u_bits;        // picture bit depth per channel: 4, 8 or 12',
     'uniform float u_imgDither;   // 0 = flat quantise, 1 = 4x4 Bayer offset before quantising',
     'out vec4 o;',
@@ -254,7 +277,7 @@
     // The picture plane is expressed in WALL fractions on both axes: `u_imgXf.xy` is the
     // picture centre (0..1 of the wall, down-positive) and `u_imgXf.z` its width as a fraction
     // of the wall width. The box that comes out is `scale` of the wall WIDE; `u_imgSize.y`
-    // stretches that plane vertically to the picture's own aspect (`scale * h / w / (W / H)`,
+    // stretches that plane vertically to the picture's own aspect (`scale * (h / w) * (W / H)`,
     // computed by the server from the uploaded file's real dimensions). Without the stretch a
     // square picture was drawn 0.6 wide and 0.34 tall, i.e. an aspect the picture never had, and
     // `scale` meant a different thing on each axis.
@@ -337,7 +360,7 @@
     '        else if (by == 1) { if (bx == 0) bayer = 12.0; else if (bx == 1) bayer = 4.0; else if (bx == 2) bayer = 14.0; else bayer = 6.0; }',
     '        else if (by == 2) { if (bx == 0) bayer = 3.0; else if (bx == 1) bayer = 11.0; else if (bx == 2) bayer = 1.0; else bayer = 9.0; }',
     '        else { if (bx == 0) bayer = 15.0; else if (bx == 1) bayer = 7.0; else if (bx == 2) bayer = 13.0; else bayer = 5.0; }',
-    '        float boff = (bayer / 16.0 - 0.5) / lv;',
+    '        float boff = (bayer / 16.0 - 0.5) / 255.0;',
     // Spread across the three emitters (blue carries three times the offset, green three
     // quarters, red none): the SAME offset on every channel just makes every level per channel
     // and lands the cell on its nearest quantum again, which is why the earlier one-per-channel
@@ -504,6 +527,17 @@
     this.destroyed = false;
     this.frameIndex = 0;
     this.lastNow = 0;
+
+    // ── idle throttle state ──────────────────────────────────────────────────
+    // `_dirty` is raised by every entry point that changes what the wall draws (settings,
+    // deck commands, fence, an image landing) and cleared by the frame that draws it. A dirty
+    // frame always draws at once, so interaction is unchanged; only a clean, static look sleeps.
+    this._dirty = true;
+    this._idleLast = 0;        // timestamp of the last drawn frame
+    this._idleSettle = 0;      // keep drawing until then (see IDLE_SETTLE_MS)
+    // Readable as `window.LEDWALL_INSTANCE.renderStats` — boot.js puts this instance on that
+    // global, so the counters are the loop's own numbers, not a copy.
+    this.renderStats = { drawn: 0, skipped: 0, idle: false };
 
     this.benchState = null;
     this.samples = new Float32Array(8192);
@@ -690,6 +724,7 @@
    * Called on mount and whenever settings that move the grid change.
    */
   Instance.prototype._layout = function () {
+    this._dirty = true;      // re-sizing, re-allocating or re-gridding always repaints
     var gl = this.gl;
     var W = Math.max(2, Math.round(this.baseW));
     var H = Math.max(2, Math.round(this.baseH));
@@ -880,6 +915,7 @@
       })
       .then(function () {
         self.imgLoading = Math.max(0, self.imgLoading - 1);
+        self._dirty = true;   // the picture that just landed (or failed) needs the wall drawn
       });
   };
 
@@ -894,11 +930,11 @@
     //   u_imgRot = (cos, sin)
     //   u_imgSize = (1, aspect compensation for the HEIGHT)
     //     `scale` is a fraction of the WALL WIDTH (the pane draws its rectangle the same way).
-    //     The wall is not square, so a picture `scale` wide is `scale / wallAspect` tall in
-    //     wall-height fractions; the shader works in width fractions on both axes, so that
-    //     height has to be stretched by `wallAspect` to come back out square in cells.
-    // The vertical stretch is the server's `imageGeometry.aspect` (picture aspect / wall
-    // aspect), derived from the uploaded file's real size. Falling back to the wall's own aspect
+    //     The wall is not square, so a picture `scale` of the wall wide is
+    //     `scale * (h / w) * (W / H)` wall-heights tall; the shader works in wall fractions on
+    //     both axes and divides by `u_imgSize.y` to get there.
+    // The vertical stretch is the server's `imageGeometry.aspect` (picture height/width times
+    // the wall aspect), derived from the uploaded file's real size. Falling back to the wall's own aspect
     // keeps a page that was handed only a look (a bare harness, a URL preset) drawing a square
     // box instead of dividing by zero.
     var geom = this.imageGeometry || null;
@@ -1060,6 +1096,9 @@
   };
 
   Instance.prototype._syncDerived = function () {
+    // Every look mutation lands here (setSettings, _patchField, _setViewField, _restoreHold,
+    // preset apply, text edits), so one flag here covers the command bus as well as the URL.
+    this._dirty = true;
     var eff = this._resolveView();
     this.patternIndex = SIM.PATTERN_INDEX[eff.pattern] !== undefined
       ? SIM.PATTERN_INDEX[eff.pattern] : 0;
@@ -1149,6 +1188,7 @@
 
   /** Snap `fence` to the grid's whole cells (cols/rows), clamped inside the wall. */
   Instance.prototype._computeFence = function () {
+    this._dirty = true;      // every fence change reaches `setFence` through here
     var g = this.grid;
     if (!this.fenceOn || !this.fence || !g || !this.W) { this.fenceCells = null; return; }
     // The server sends cells already (the pane drags pixels, the server converts once, so both
@@ -1247,6 +1287,12 @@
     var liveViewMode = hadViewMode ? prevVB.mode : undefined;
 
     this.s = merge(DEFAULTS, preset || {});
+    // Presets saved before `imageOn` was a dim cannot say the picture was on; a recorded
+    // revision is the only evidence they carry.
+    if (!(preset && Object.prototype.hasOwnProperty.call(preset, 'imageOn')) &&
+        Number(preset && preset.imageRev) > 0) {
+      this.s.imageOn = 1;
+    }
     for (var pk in prevGrid) {
       if (Object.prototype.hasOwnProperty.call(prevGrid, pk)) this.s[pk] = prevGrid[pk];
     }
@@ -1567,8 +1613,36 @@
 
   // ── Frame ────────────────────────────────────────────────────────────────
 
+  /**
+   * True when redrawing now would paint exactly what is already on the canvas.
+   *
+   * This is the whole idle predicate: every clause below is a thing that changes the picture
+   * with time rather than with settings.  Anything that is not listed here is font/render
+   * state, and a change to it raises `_dirty` instead.
+   */
+  Instance.prototype._canIdle = function (now) {
+    if (this._dirty) return false;                       // a change is waiting to be drawn
+    if (this.benchState) return false;                   // the bench counts drawn frames
+    if (now < this._idleSettle) return false;            // the sim is still easing to the new look
+    if (this.imgLoading > 0) return false;               // a picture is on the way in
+    var look = this.eff || this.s;
+    if (num(look.speed, 1) !== 0) return false;          // pattern clock advancing (`time`)
+    if (num(look.grain, 0.03) > 0) return false;         // wall-clock noise — grade.js:168
+    if (clamp(num(look.persistence, 0), 0, 0.99) > 0.001) return false; // trail decay needs frames
+    if (this.revealDur > 0 &&                           // type-on running (or not started yet)
+        (this.revealStart < 0 || (this.elapsed - this.revealStart) < this.revealDur)) return false;
+    if (this.modeIndex && num(this.textStyle().scroll, 0) !== 0) return false; // marquee
+    // `random` is the one pattern driven by real time instead of `u_time`: its cooldown
+    // (sim.js:180, `cd -= u_dt * u_cdScale`) re-rolls cells every few seconds even at speed 0,
+    // so it is a wall-clock renderer and must keep drawing.
+    if (this.patternIndex === SIM.PATTERN_INDEX.random) return false;
+    return true;
+  };
+
   Instance.prototype._frame = function (now) {
     if (this.destroyed) return;
+    // Always re-arm: the page must wake on the very next vsync after a change, and a skipped
+    // frame still has to keep the loop alive (the agent heartbeat below rides it).
     this.raf = requestAnimationFrame(this._frameBound);
 
     var t0 = performance.now();
@@ -1576,19 +1650,20 @@
     var dtReal = (now - this.lastNow) / 1000;
     this.lastNow = now;
     if (!isFinite(dtReal) || dtReal < 0) dtReal = 0;
+    // A frame that follows idle skips can arrive with a whole idle interval behind it. The cap
+    // is the step the sim was tuned at, so nothing downstream ever sees more than 0.1 s in one
+    // step. `lastNow` moves on skipped frames too, so a resumed frame normally measures one
+    // vsync; the cap is what stops a stalled page (backgrounded tab, long GC) from injecting a
+    // big step, and `time` cannot jump from idling at all because idling requires speed 0
+    // (dt × 0 = 0).
     dtReal = Math.min(dtReal, 0.1);
-
-    // fps EMA (frame-to-frame, includes rAF pacing)
-    if (dtReal > 0.0001) {
-      var inst = 1 / dtReal;
-      this.fps = this.fps ? this.fps * 0.9 + inst * 0.1 : inst;
-    }
 
     // Second heartbeat clock.  The frame loop is the one clock a browser source
     // provably keeps (it is what paints the wall), so the /state post rides it
     // as well as the 2 s timer; `beat()` de-duplicates within 1.5 s.  Runs
     // before the `paused` return: a paused page is still a live page whose
-    // state the deck must see.
+    // state the deck must see.  Runs before the idle return too: dragging a look
+    // must not cost the deck its heartbeat.
     if (this.agent) this.agent.beat('frame');
 
     if (this.paused) {
@@ -1600,7 +1675,31 @@
     // browser is starving timers (a backgrounded tab, or a long frame) the
     // revert still lands on the first frame past due.  Both paths are guarded
     // by `holds[view] === h`, so whichever runs first wins and neither repeats.
+    // It runs before the idle return so an expiry still fires on a sleeping wall
+    // (the revert raises `_dirty`, and the next frame draws it).
     this._holdTick();
+
+    // ── idle throttle ────────────────────────────────────────────────────────
+    // Skip only when the idle interval has already elapsed since the last drawn frame *and*
+    // nothing on the wall is moving. A dirty frame fails `_canIdle`, so a change is drawn on
+    // the very next vsync at full rate; the settle window keeps it at full rate until the sim's
+    // ease has landed, so an animated wall and a change look exactly as they did before.
+    var rs = this.renderStats;
+    var idleDue = IDLE_FPS > 0 && (now - this._idleLast) >= (1000 / IDLE_FPS);
+    if (idleDue && this._canIdle(now)) {
+      rs.skipped++;
+      rs.idle = true;
+      return;
+    }
+
+    // fps EMA (frame-to-frame, includes rAF pacing).  Below the idle return on purpose: a
+    // sleeping wall keeps reporting what it draws at, instead of reporting the idle rate.
+    if (dtReal > 0.0001) {
+      var inst = 1 / dtReal;
+      this.fps = this.fps ? this.fps * 0.9 + inst * 0.1 : inst;
+    }
+
+    var consumedChange = this._dirty;
 
     this.elapsed += dtReal;
     var look = this.eff || this.s;
@@ -1628,6 +1727,14 @@
 
     this.frameIndex++;
     this.cpuMs = performance.now() - t0;
+
+    // A drawn frame satisfies every pending change, and holds the loop awake long enough for
+    // the sim's ease to reach its target (IDLE_SETTLE_MS) before it may sleep again.
+    rs.drawn++;
+    rs.idle = false;
+    this._dirty = false;
+    this._idleLast = now;
+    if (consumedChange) this._idleSettle = now + IDLE_SETTLE_MS;
 
     // ~2 Hz stats callback
     this.statsAccum += dtReal;
@@ -1741,7 +1848,7 @@
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
   Instance.prototype.pause = function () { this.paused = true; };
-  Instance.prototype.resume = function () { this.paused = false; this.lastNow = 0; };
+  Instance.prototype.resume = function () { this.paused = false; this.lastNow = 0; this._dirty = true; };
 
   Instance.prototype.captureDataURL = function (maxWidth) {
     // Render one frame and grab it in the same task; the GL buffer is still intact.
@@ -1911,6 +2018,7 @@
    * view that had no override before the send must have no override after it.
    */
   Instance.prototype._restoreLookParts = function (snap) {
+    this._dirty = true;
     var view = snap.view;
     if (!this.s.views) this.s.views = {};
     if (!this.s.views[view]) this.s.views[view] = {};
@@ -1923,6 +2031,7 @@
   };
 
   Instance.prototype._restorePatternPart = function (snap) {
+    this._dirty = true;
     var view = snap.view;
     if (!this.s.views) this.s.views = {};
     if (!this.s.views[view]) this.s.views[view] = {};
