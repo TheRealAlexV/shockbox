@@ -142,7 +142,11 @@ async function waitFor(c, expression, ms = 10000) {
   let last;
   while (Date.now() - t0 < ms) {
     try {
-      last = await evaluate(c, expression);
+      // `awaitPromise` because some callers pass a `fetch(...).then(...)` expression: without it
+      // Runtime.evaluate hands back the Promise object, which is truthy on the first poll, so the
+      // wait returned before the page had done anything (that is how `preset.set` was read straight
+      // back out of the document it had not written yet).
+      last = await evaluate(c, expression, true);
       if (last) return last;
     } catch (err) {
       last = String(err.message);
@@ -157,49 +161,93 @@ async function waitFor(c, expression, ms = 10000) {
  * the wall last drew. This is the measurement every later assertion is made on, so it reads the
  * same canvas OBS sees (`preserveDrawingBuffer` is on).
  */
+/**
+ * Page-side wait for a frame the loop STARTED after this call.
+ *
+ * The drawing buffer holds the frame drawn BEFORE the setting the caller just applied, and on
+ * SwiftShader a 2560x1440 draw takes ~0.6 s, so "3 rAF ticks" (50 ms) is shorter than one frame:
+ * every read came back one frame late, which is how the 0.3-scale box inflated to the union of
+ * two placements, the dither read 0 diffs in both targets, and match/palette read the same
+ * picture. `renderStats.drawn` ticks at the end of every draw, so waiting for two ticks
+ * guarantees one draw that both started and finished after this probe began (a draw already in
+ * flight when we arrive only ever contributes the first tick). The timeout keeps a stalled rAF
+ * loop from hanging the gate.
+ */
+const FRAME_WAIT = `
+  await new Promise(function (res) {
+    var rs = window.LEDWALL_INSTANCE && window.LEDWALL_INSTANCE.renderStats;
+    if (!rs || typeof rs.drawn !== 'number') {
+      var n0 = 0;
+      var tick0 = function () { n0 += 1; if (n0 >= 3) return res(); requestAnimationFrame(tick0); };
+      requestAnimationFrame(tick0);
+      setTimeout(res, 2000);
+      return;
+    }
+    var d0 = rs.drawn, t0 = performance.now();
+    var tick = function () {
+      if (rs.drawn >= d0 + 3 || performance.now() - t0 > 6000) return res();
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    setTimeout(res, 5000);
+  });
+`;
+
 const GRID_PROBE = `(async function(){
   var i = window.LEDWALL_INSTANCE;
   if (!i) return null;
-  // The drawing buffer holds the frame drawn BEFORE the setting the caller just applied: a read
-  // taken right after applied() lands one frame late, and every position/scale/rotation diff
-  // measured against it read 0 changed cells. Wait for the loop to actually draw with the new
-  // value. 3 ticks: the breakpoint is between 1 and 2 on a frozen wall, 3 leaves headroom for a
-  // frame the compositor swallows. The timeout keeps a stalled rAF loop from hanging the gate.
-  await new Promise(function (res) {
-    var n = 0;
-    var tick = function () { n += 1; if (n >= 3) return res(); requestAnimationFrame(tick); };
-    requestAnimationFrame(tick);
-    setTimeout(res, 2000);
-  });
+  ${FRAME_WAIT}
   var gl = i.gl, g = i.grid, W = i.W, H = i.H;
-  var px = new Uint8Array(W * H * 4);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
-  var cells = [];
   var pitchX = W / g.cols, pitchY = H / g.rows;
-  var seen = Object.create(null);
-  for (var r = 0; r < g.rows; r++) {
-    for (var c = 0; c < g.cols; c++) {
-      // sample the centre 3x3 of each cell, in GL's bottom-up rows
-      var cxp = Math.round((c + 0.5) * pitchX);
-      var cyp = Math.round(H - (r + 0.5) * pitchY);
-      var acc = [0,0,0];
-      var n = 0;
-      for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
-          var x = Math.min(W - 1, Math.max(0, cxp + dx));
-          var y = Math.min(H - 1, Math.max(0, cyp + dy));
-          var o = (y * W + x) * 4;
-          acc[0] += px[o]; acc[1] += px[o+1]; acc[2] += px[o+2];
-          n++;
+  function grab() {
+    var px = new Uint8Array(W * H * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    var cells = [];
+    var seen = Object.create(null);
+    for (var r = 0; r < g.rows; r++) {
+      for (var c = 0; c < g.cols; c++) {
+        // sample the centre 3x3 of each cell, in GL's bottom-up rows
+        var cxp = Math.round((c + 0.5) * pitchX);
+        var cyp = Math.round(H - (r + 0.5) * pitchY);
+        var acc = [0,0,0];
+        var n = 0;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            var x = Math.min(W - 1, Math.max(0, cxp + dx));
+            var y = Math.min(H - 1, Math.max(0, cyp + dy));
+            var o = (y * W + x) * 4;
+            acc[0] += px[o]; acc[1] += px[o+1]; acc[2] += px[o+2];
+            n++;
+          }
         }
+        var col = [Math.round(acc[0]/n), Math.round(acc[1]/n), Math.round(acc[2]/n)];
+        cells.push(col);
+        seen[col.join(',')] = (seen[col.join(',')] || 0) + 1;
       }
-      var col = [Math.round(acc[0]/n), Math.round(acc[1]/n), Math.round(acc[2]/n)];
-      cells.push(col);
-      seen[col.join(',')] = (seen[col.join(',')] || 0) + 1;
     }
+    return { cells: cells, cols: g.cols, rows: g.rows, distinct: Object.keys(seen).length, W: W, H: H };
   }
-  return { cells: cells, cols: g.cols, rows: g.rows, distinct: Object.keys(seen).length, W: W, H: H };
+  // The FIRST read after a settings change comes back one rendered state behind, even after
+  // FRAME_WAIT: measured on the colour modes, read 1 of "palette" held the "match" picture and
+  // read 2 held the palette one. The drawing buffer here is committed lazily (headless
+  // SwiftShader), so a read that starts right after the change still sees the frame before it.
+  // Two reads, second one returned: the first read costs 2-4 s on its own, which is what lets the
+  // commit land. Both reads are the same code, so this cannot hide a stale frame - a wall that is
+  // still moving reads differently on a second pass and the assertions catch it.
+  grab();
+  await new Promise(function (res) {
+    var d0 = (window.LEDWALL_INSTANCE.renderStats || {}).drawn || 0;
+    var t0 = performance.now();
+    var tick = function () {
+      var d = (window.LEDWALL_INSTANCE.renderStats || {}).drawn || 0;
+      if (d > d0 || performance.now() - t0 > 3000) return res();
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    setTimeout(res, 3000);
+  });
+  return grab();
 })()`;
 
 /** Count cells in a grid whose colour is "bright" (any channel over `t`). */
@@ -335,6 +383,44 @@ function setDistance(a, b) {
   return n;
 }
 
+/** Every cell colour inside a cell box (`{minC,minR,maxC,maxR}` from `changedBox`). */
+function boxCells(grid, box) {
+  const out = [];
+  if (!grid || !box) return out;
+  for (let r = box.minR; r <= box.maxR; r++) {
+    for (let c = box.minC; c <= box.maxC; c++) out.push(grid.cells[r * grid.cols + c]);
+  }
+  return out;
+}
+
+/** The `k` most common colours inside a box, as `[{colour, n}]`, commonest first. */
+function boxTop(grid, box, k = 3) {
+  const hist = new Map();
+  for (const col of boxCells(grid, box)) {
+    const key = col.join(',');
+    const e = hist.get(key) || { colour: col, n: 0 };
+    e.n += 1;
+    hist.set(key, e);
+  }
+  return [...hist.values()].sort((a, b) => b.n - a.n).slice(0, k);
+}
+
+/** Share of a box's cells within `tol` (per channel) of any colour in `list`. */
+function nearShare(grid, box, list, tol = 8) {
+  const cells = boxCells(grid, box);
+  if (!cells.length || !list.length) return 0;
+  let n = 0;
+  for (const c of cells) {
+    for (const q of list) {
+      if (Math.abs(c[0] - q[0]) <= tol && Math.abs(c[1] - q[1]) <= tol && Math.abs(c[2] - q[2]) <= tol) {
+        n += 1;
+        break;
+      }
+    }
+  }
+  return n / cells.length;
+}
+
 /** Which texture is bound to the LED program's `u_image` TEXTURE2 unit (proves the shader path). */const IMAGE_BOUND_PROBE = `(function(){
   var i = window.LEDWALL_INSTANCE, gl = i.gl;
   var u = i.progLed.u.image;
@@ -375,13 +461,8 @@ const SCENE_DITHER_PROBE = `(async function(dither){
   if (!i) return { error: 'no wall instance' };
   if (!i.sceneFbo) return { error: 'no scene target: the wall did not mount' };
   var gl = i.gl, W = i.W, H = i.H;
-  // Same contract as GRID_PROBE: the frame holds the value from before the setting was applied.
-  await new Promise(function (res) {
-    var n = 0;
-    var tick = function () { n += 1; if (n >= 3) return res(); requestAnimationFrame(tick); };
-    requestAnimationFrame(tick);
-    setTimeout(res, 2000);
-  });
+  // Same contract as GRID_PROBE: see FRAME_WAIT.
+  ${FRAME_WAIT}
 
   var side = 92;
   var win = window.__wallDitherWin || null;
@@ -436,6 +517,33 @@ const SCENE_DITHER_PROBE = `(async function(dither){
   gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
   if (glErr) return { error: 'readPixels(gl.FLOAT) on the scene pass raised GL error 0x' + glErr.toString(16) };
 
+  // Read again after one more draw. The first read taken after a settings change is one rendered
+  // state behind (the same commit lag GRID_PROBE documents), and here that is fatal in a way it is
+  // not for a diff-based probe: both reads would hold the imageDither 0 frame, the comparison
+  // would find 0 diffs in every channel, and the gate would look broken when the dither is fine.
+  await new Promise(function (res) {
+    var d0 = (i.renderStats || {}).drawn || 0, t0 = performance.now();
+    var tick = function () {
+      var d = (i.renderStats || {}).drawn || 0;
+      if (d > d0 || performance.now() - t0 > 3000) return res();
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    setTimeout(res, 3000);
+  });
+  gl.bindFramebuffer(gl.FRAMEBUFFER, i.sceneFbo);
+  gl.readPixels(x, y, w, h, gl.RGBA, gl.FLOAT, px);
+  glErr = gl.getError();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, cu);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+  if (glErr) return { error: 'the second readPixels(gl.FLOAT) on the scene pass raised GL error 0x' + glErr.toString(16) };
+
+  var pageDither = Number((i.eff || {}).imageDither);
+  var ditherLoc = gl.getUniformLocation(i.progLed.p, 'u_imgDither');
+  var uniformDither = ditherLoc ? gl.getUniform(i.progLed.p, ditherLoc) : null;
+  var drawnNow = (i.renderStats || {}).drawn || 0;
+
   if (dither < 0.5) {
     // One flat band, checked from the pixels: inside the picture's green band green is the one
     // channel the picture gives a level to (raw mode is [0,1,0]), so a window that is mostly
@@ -450,9 +558,10 @@ const SCENE_DITHER_PROBE = `(async function(dither){
       return { error: 'the window is not inside a lit flat band: ' + lit + ' of ' + (w * h) +
         ' px are green-dominant, ' + redHot + ' carry red' };
     }
-    window.__wallDitherFlat = { px: px, cu: cu, w: w, h: h };
+    window.__wallDitherFlat = { px: px, cu: cu, w: w, h: h, pageDither: pageDither };
     return { win: { x: x, y: y, w: w, h: h }, frame: W + 'x' + H, band: w * h, lit: lit,
-             readFmt: readFmt, readType: readType };
+             readFmt: readFmt, readType: readType, pageDither: pageDither,
+             uniformDither: uniformDither, drawn: drawnNow };
   }
 
   var base = window.__wallDitherFlat;
@@ -474,7 +583,8 @@ const SCENE_DITHER_PROBE = `(async function(dither){
   window.__wallDitherWin = null;
   window.__wallDitherFlat = null;
   return { red: red, green: green, blue: blue, gb1: gb1, moved: moved, maxStep: maxStep,
-           canvasMoved: canvasMoved, win: { x: x, y: y, w: w, h: h } };
+           canvasMoved: canvasMoved, win: { x: x, y: y, w: w, h: h }, pageDither: pageDither,
+           flatDither: base.pageDither, uniformDither: uniformDither, drawn: drawnNow };
 })`;
 
 async function main() {
@@ -662,28 +772,52 @@ async function main() {
     await applied('imageRotate', 0);
 
     // ── 4. colour modes: three visibly different pictures ────────────────
+    // The dither is a per-cell ±0.5 LSB(8) offset, so it multiplies the number of distinct shades
+    // inside the box (match read 960 shades with it on against raw's 435) and drowns the property
+    // this section measures: which colours the mode maps the picture onto. It has its own section
+    // below, so switch it off here and put it back.
+    const ditherBeforeColour = (await render()).settings.look.imageDither;
+    await patch({ imageDither: 0 });
+    await applied('imageDither', 0);
     const byMode = {};
     for (const mode of ['raw', 'match', 'palette']) {
       await patch({ imageColour: mode });
       await applied('imageColour', mode);
       const g = await readGrid(c);
-      byMode[mode] = { grid: g, colours: colourSet(g), distinct: litDistinct(g) };
+      byMode[mode] = { grid: g, colours: colourSet(g), distinct: litDistinct(g), top: boxTop(g, bigBox, 3) };
     }
     const dRawMatch = setDistance(byMode.raw.colours, byMode.match.colours);
     const dRawPal = setDistance(byMode.raw.colours, byMode.palette.colours);
     const dMatchPal = setDistance(byMode.match.colours, byMode.palette.colours);
     ok('colour: raw | match | palette are three different pictures',
       dRawMatch > 8 && dRawPal > 8 && dMatchPal > 4,
-      `distinct colours raw=${byMode.raw.distinct} match=${byMode.match.distinct} palette=${byMode.palette.distinct}; ` +
+      `distinct hue buckets raw=${byMode.raw.distinct} match=${byMode.match.distinct} palette=${byMode.palette.distinct}; ` +
       `set distance raw↔match=${dRawMatch} raw↔palette=${dRawPal} match↔palette=${dMatchPal}`);
-    ok('colour: "match" collapses the picture onto ramp colours (fewer distinct than raw)',
-      byMode.match.distinct < byMode.raw.distinct * 0.75,
-      `${byMode.raw.distinct} raw → ${byMode.match.distinct} matched`);
-    ok('colour: "palette" discards the picture\'s hue (fewer distinct than raw)',
-      byMode.palette.distinct < byMode.raw.distinct * 0.75,
-      `${byMode.raw.distinct} raw → ${byMode.palette.distinct} palette`);
+    // The whole-wall colour set is mostly the wave, which is identical in all three modes, so it
+    // dilutes every difference (raw↔match read 12 buckets that way). Inside the picture box the
+    // modes are the only variable. "Collapses onto ramp colours" is measured as the picture's OWN
+    // three dominant colours leaving the box: `match` replaces each cell's colour with the nearest
+    // entry of the live ramp, and a match mode that fell through to `raw` would score the raw share
+    // (46%) and fail.
+    const rawOwn = byMode.raw.top.map((t) => t.colour);
+    const rawShare = nearShare(byMode.raw.grid, bigBox, rawOwn);
+    const matchShare = nearShare(byMode.match.grid, bigBox, rawOwn);
+    const palShare = nearShare(byMode.palette.grid, bigBox, rawOwn);
+    ok('colour: "match" maps the picture onto ramp colours (its own colours leave the box)',
+      Boolean(bigBox) && rawShare > 0.25 && matchShare < 0.05,
+      `the picture's three dominant colours cover ${(rawShare * 100).toFixed(0)}% of the box in raw ` +
+      `and ${(matchShare * 100).toFixed(1)}% in match; match's box top is ` +
+      `${byMode.match.top.map((t) => t.colour.join(',')).join(' / ')}`);
+    // Same instrument, different claim: `palette` drives the ramp from luminance, so the picture's
+    // own colours are gone there too - and a palette that fell through to `raw` would score 46%.
+    ok('colour: "palette" discards the picture\'s own colours (they are gone from the box)',
+      Boolean(bigBox) && rawShare > 0.25 && palShare < 0.05,
+      `the picture's three dominant colours cover ${(rawShare * 100).toFixed(0)}% of the box in raw ` +
+      `and ${(palShare * 100).toFixed(1)}% in palette (${rawOwn.map((q) => q.join(',')).join(' / ')})`);
     await patch({ imageColour: 'raw' });
     await applied('imageColour', 'raw');
+    await patch({ imageDither: ditherBeforeColour });
+    await applied('imageDither', ditherBeforeColour);
 
     // ── 5. bit depth: the ladder is 8/10/12, and the dither belongs to the top of it ─
     // 8-bit is 256 levels per channel, which is the most the uploaded PNG has; the quantiser is
@@ -704,7 +838,9 @@ async function main() {
     // this window). The scene pass is the frame the dither actually moves and it is RGBA16F, so
     // the assertion reads it as float. The offsets are spread across the emitters on purpose
     // (engine.js LED_FRAG: red none, green three quarters, blue three times), so red must not move
-    // at all while green and blue step by one level, and no pixel may jump more than two.
+    // at all while green and blue step in small quantisation steps: the offsets are a fraction of
+    // one 8-bit level spread over a 4x4 cell block, and at 12 bit one 8-bit level is 16 LSB(12), so
+    // blue (three times the offset) tops out at 0.5/255*3*4095 = 24 and green (three quarters) at 6.
     const ditherBefore = await evaluate(c, 'Number(window.LEDWALL_INSTANCE.eff.imageDither)');
     const ditherRestore = Number.isFinite(ditherBefore) ? ditherBefore : 1;
     await patch({ imageBits: '12', imageDither: 0 });
@@ -719,14 +855,24 @@ async function main() {
     await patch({ imageDither: ditherRestore });
     await applied('imageDither', ditherRestore);
     const sceneWin = (flatScene.win || dithScene.win || { x: -1, y: -1, w: 0, h: 0 });
-    ok('depth: the 12-bit dither steps green and blue by one level and leaves red alone',
+    // Measured on a 4x4 Bayer offset of 0.5/255 spread (0, 0.75, 3) across (red, green, blue) at
+    // 12 bit: red 0, green 2255, blue 2549 of 8464 px moved, 992 of them by exactly 1 LSB(12), and
+    // the largest step 23 (blue carries three times the offset: 0.5/255*3*4095 = 24 LSB(12)). A
+    // dither that stopped reaching the shader moves 0 px, so the bound is what separates "small
+    // quantisation steps" from "the toggle did nothing" and from a colour shift.
+    ok('depth: the 12-bit dither steps green and blue in small steps and leaves red alone',
       !flatScene.error && !dithScene.error &&
-        dithScene.red === 0 && dithScene.gb1 >= 300 && dithScene.maxStep <= 2,
+        // The two reads must have been taken with different dither values, or the probe is
+        // comparing two frames of the same state and every diff would be 0 for a reason that has
+        // nothing to do with the shader.
+        Number(flatScene.pageDither) === 0 && Number(dithScene.pageDither) === 1 &&
+        dithScene.red === 0 && dithScene.green > 1000 && dithScene.blue > 1000 &&
+        dithScene.gb1 >= 300 && dithScene.maxStep >= 1 && dithScene.maxStep <= 24,
       flatScene.error
         ? `scene readback: ${flatScene.error}`
         : dithScene.error
           ? `dither readback: ${dithScene.error}`
-          : `red diffs=${dithScene.red}, green diffs=${dithScene.green}, blue diffs=${dithScene.blue}, max step=${dithScene.maxStep} LSB(12) over ${sceneWin.w}x${sceneWin.h} px at ${sceneWin.x},${sceneWin.y} of ${flatScene.frame} (green+blue at exactly 1 LSB: ${dithScene.gb1}, any channel moved: ${dithScene.moved}); scene readback RGBA format=${flatScene.readFmt} type=${flatScene.readType} (float), ${flatScene.lit}/${flatScene.band} px lit flat band; 8-bit canvas in the same window: ${dithScene.canvasMoved} px moved`);
+          : `red diffs=${dithScene.red}, green diffs=${dithScene.green}, blue diffs=${dithScene.blue}, max step=${dithScene.maxStep} LSB(12) over ${sceneWin.w}x${sceneWin.h} px at ${sceneWin.x},${sceneWin.y} of ${flatScene.frame} (green+blue at exactly 1 LSB: ${dithScene.gb1}, any channel moved: ${dithScene.moved}); scene readback RGBA format=${flatScene.readFmt} type=${flatScene.readType} (float), ${flatScene.lit}/${flatScene.band} px lit flat band; 8-bit canvas in the same window: ${dithScene.canvasMoved} px moved; imageDither at the two reads ${flatScene.pageDither} -> ${dithScene.pageDither} (u_imgDither ${flatScene.uniformDither} -> ${dithScene.uniformDither}, frame ${flatScene.drawn} -> ${dithScene.drawn})`);
 
     await patch({ imageBits: '8', imageDither: 0 });
     await appliedAll({ imageBits: '8', imageDither: 0 });
@@ -811,8 +957,16 @@ async function main() {
     // server-side document nobody renders
     await c.send('Page.reload', { ignoreCache: true });
     await sleep(1200);
-    const remounted = await waitFor(c, 'Boolean(window.LEDWALL_INSTANCE && window.LEDWALL_INSTANCE.imgTex)', 12000);
-    await sleep(900);
+    // A reload has to compile the shaders on SwiftShader and then fetch + upload the picture again;
+    // 12 s outlasted it on an idle host but not with the CPU cap contended, and a `remounted` false
+    // then failed the assertion for a frame that was merely late. Wait for the texture AND a drawn
+    // frame (the grid read below needs a frame, not just a mounted engine).
+    const remounted = await waitFor(
+      c,
+      'Boolean(window.LEDWALL_INSTANCE && window.LEDWALL_INSTANCE.imgTex && ' +
+        'window.LEDWALL_INSTANCE.renderStats && window.LEDWALL_INSTANCE.renderStats.drawn > 0)',
+      30000
+    );
     const gridReload = await readGrid(c);
     const reloadDiff = diffCells(gridRestored, gridReload);
     const tAfter = await evaluate(c, 'window.LEDWALL_INSTANCE && Number(window.LEDWALL_INSTANCE.time)');

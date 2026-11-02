@@ -1995,6 +1995,10 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     if (Number.isFinite(Number(snap.seq))) seq = Number(snap.seq);
     if (Array.isArray(snap.history)) history = snap.history;
     if (snap.snapshot) onStateFrame({ data: snap.snapshot });
+    // ...and a settings push (broadcastState) is that same record flat: `{rev, look, ratio,
+    // fence}`. Only the nested view snapshot was read, so every push was dropped and the switch
+    // and the still showed the wall from before the change until the 4 s poll caught up.
+    else if (snap.rev !== undefined) onStateFrame({ data: snap });
     paintOnline();
     paintStrip();
   }

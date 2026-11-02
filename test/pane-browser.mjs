@@ -214,7 +214,15 @@ try {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ratio: '9:16', fence: { x: 880, y: 0, w: 1440, h: 2560 } }),
   });
-  await sleep(600);
+  // The pane learns this from the server on its own (a `wall-state` push, else the poll). Wait for
+  // it to draw the window: a `.pv-window` still hidden by whole-wall mode carries a 0×0 rect, and
+  // every press derived from that rect lands at client y=0 — outside the picture, so the drag
+  // moves nothing and this test failed for a reason that had nothing to do with dragging.
+  const paneWindow = async () => JSON.parse(await c.eval(`JSON.stringify((function(){
+    var w=document.querySelector('#pane .pv-window');
+    var r=w?w.getBoundingClientRect():null;
+    return {on:!!r&&r.width>8&&r.height>8}; })())`));
+  for (let t0 = Date.now(); Date.now() - t0 < 8000 && !(await paneWindow()).on;) await sleep(120);
   const before = (await live()).render.fence?.px;
   ok('window is on the wall before the drag', Boolean(before), JSON.stringify(before));
 
@@ -275,18 +283,25 @@ try {
   }
 
   // Whole wall ⇄ window through the pane's own control (`#wall-fence-on`, the window switch),
-  // then read the server back.
+  // then read the server back. The switch's direction is whatever it showed when pressed, so the
+  // expectation comes from that: pressing it flips the wall, whichever way it was.
   const toggled = await c.eval(`(function(){
     var t=document.querySelector('#wall-fence-on');
     if(!t) return 'no control';
     var was=t.checked;
     t.checked=!was;
     t.dispatchEvent(new Event('change',{bubbles:true}));
-    return 'clicked: '+(was?'on → off':'off → on'); })()`);
+    return JSON.stringify({was:was, now:t.checked}); })()`);
   await sleep(900);
   const afterToggle = (await live()).render.fence;
   const ratioAfter = (await live()).render.ratio;
-  ok('the whole-wall control changes the server document', toggled !== 'no control' && ratioAfter !== '9:16', `${toggled} → fence ${afterToggle ? 'set' : 'null'}, ratio ${ratioAfter}`);
+  const ask = toggled === 'no control' ? null : JSON.parse(toggled);
+  const fenceNow = afterToggle?.px ?? null;
+  // Turning the window off posts `ratio: 16:9` only: the stored rect is the window the switch
+  // restores, so the fence px staying put is correct. The ratio is what says whole wall.
+  ok('the whole-wall control changes the server document',
+    Boolean(ask) && ratioAfter === (ask.now ? '9:16' : '16:9') && (!ask.now || Boolean(fenceNow)),
+    `${ask ? (ask.was ? 'on → off' : 'off → on') : toggled} → fence ${fenceNow ? 'set' : 'null'}, ratio ${ratioAfter}`);
   // put the window back for later checks
   await fetch(`${srv.url}/api/wall/settings`, {
     method: 'PATCH',
@@ -628,10 +643,23 @@ try {
     `${bitsPosted}: imageBits ${afterUpload.imageBits} → ${bitsGot}`);
 
   // The dither is offered from 10-bit up and says so: at 8 bit it has no steps worth filling.
-  const at10 = await readImage();
+  // The pane repaints these controls from the document it re-reads after the PATCH, and `settle`
+  // only watches the server — so wait for the paint (bounded) instead of judging the switch in
+  // the milliseconds between the server committing and the pane drawing. Measured: at the first
+  // sample the switch still read the previous depth, 100 ms later it read the new one.
+  const painted = async (want, ms = 2000) => {
+    const t0 = Date.now();
+    let img = await readImage();
+    while (Date.now() - t0 < ms && String(img.value.bits) !== String(want)) {
+      await sleep(50);
+      img = await readImage();
+    }
+    return img;
+  };
+  const at10 = await painted(bitsGot);
   await pickImg(imgIds.bits, '8');
   const at8 = await settle('imageBits', '8');
-  const at8Controls = await readImage();
+  const at8Controls = await painted(at8);
   await pickImg(imgIds.bits, '10');
   const backBits = await settle('imageBits', '10');
   ok('the Dither toggle is offered from 10-bit up and refused at 8-bit',
