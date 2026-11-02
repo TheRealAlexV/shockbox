@@ -16,7 +16,13 @@
     "scale": { "type": "number", "default": 0.7, "min": 0.5, "max": 1.2, "label": "Scale" },
     "sound": { "type": "boolean", "default": true, "label": "Sound", "group": "sound", "help": "Play a tone for each newly shown alert" },
     "volume": { "type": "number", "default": 0.6, "min": 0, "max": 1, "step": 0.05, "label": "Volume", "group": "sound" },
-    "tone": { "type": "string", "default": "error_CDOxCYm.mp3", "maxLength": 200, "label": "Alert tone", "group": "sound", "help": "A clip from this module's /audio/list" }
+    "tone": { "type": "string", "default": "error_CDOxCYm.mp3", "maxLength": 200, "label": "Alert tone", "group": "sound", "help": "A clip from this module's /audio/list" },
+    "randomConfig": {
+      "type": "object",
+      "default": { "poolIds": [], "tags": [], "messageIds": [] },
+      "label": "Random alert sources",
+      "help": "Messages a random alert may spawn from: any matching poolId, tag or message id. Empty lists mean every alert message is eligible. Replaces the per-message `random` flag, which is still read from the pool but ignored."
+    }
   },
   "pages": [
     { "route": "/dialogs", "title": "Alert overlay", "file": "overlay/index.html" }
