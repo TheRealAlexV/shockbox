@@ -77,19 +77,7 @@ function render(entity) {
   body.appendChild(el('div', 'text', entity.text));
   box.appendChild(body);
 
-  if (entity.buttons && entity.buttons.length) {
-    const acts = el('div', 'acts');
-    for (const b of entity.buttons) {
-      const btn = el('button', 'btn', b.label);
-      btn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        dismiss(entity.id, b.action);
-      });
-      acts.appendChild(btn);
-    }
-    box.appendChild(acts);
-  }
-
+  // No action buttons: real OS toasts have none. Whatever `entity.buttons` carries is ignored.
   box.addEventListener('click', () => dismiss(entity.id, 'close'));
   return box;
 }

@@ -97,26 +97,6 @@ body {
   word-break: break-word;
 }
 
-.acts {
-  flex: 0 0 auto;
-  align-self: center;
-  display: flex;
-  gap: 6px;
-}
-
-.btn {
-  font: inherit;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 4px 9px;
-  border-radius: 7px;
-  border: 1px solid currentColor;
-  background: transparent;
-  color: inherit;
-  cursor: default;
-  opacity: 0.85;
-}
-
 /* ---------------------------------------------------------------- looks */
 
 .t-ios {
@@ -169,10 +149,6 @@ body {
 .t-macos .lead {
   background: #dcdcdf;
   color: #3b3b3f;
-}
-
-.btn:hover {
-  opacity: 1;
 }
 
 /* The stage pointer from the show preview: an annotation on the stream, not part of the strip,
