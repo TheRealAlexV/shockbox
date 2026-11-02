@@ -379,10 +379,18 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
       }
       const hit = registry.match(req.method, p);
       if (hit) {
-        const body = req.method === 'GET' || req.method === 'HEAD' ? null : await readJson(req).catch((e) => {
-          if (e instanceof HttpError) throw e;
-          throw new HttpError(400, e.message);
-        });
+        // A module route may take its body as bytes (`rawBody: true`): a picture upload is not
+        // JSON, and the size ceiling stays the module's own (the same rule as core's extra routes).
+        const body = req.method === 'GET' || req.method === 'HEAD' ? null
+          : hit.route.rawBody === true
+            ? await readBody(req, hit.route.rawLimit || BODY_LIMIT).catch((e) => {
+              if (e instanceof HttpError) throw e;
+              throw new HttpError(400, e.message);
+            })
+            : await readJson(req).catch((e) => {
+              if (e instanceof HttpError) throw e;
+              throw new HttpError(400, e.message);
+            });
         const out = await hit.route.handler(req, res, url, body, hit.params);
         if (out !== undefined && !res.headersSent) sendJson(res, 200, out);
         return undefined;

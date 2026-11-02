@@ -22,6 +22,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createPublisher } from './publish-pipe.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -199,6 +200,9 @@ function build(ctx) {
   // Why the overlay's camera did not open (the page's own diagnostic object) and the label of the
   // device it did open. Reported on /ack, read back on /status; never a frame.
   const camera = { error: null, label: null };
+  // The ShockBox Virtual Camera pipe (publish-pipe.mjs). `off` opens nothing at all: no listener,
+  // no buffer, no conversion. The pane's select is the only writer; the page sends the pictures.
+  const pipe = createPublisher({ log });
 
   function publish(cmd, args) {
     // The replay stamp lives on its own key: `args.id` belongs to the caller (it is the effect id
@@ -210,6 +214,10 @@ function build(ctx) {
   }
 
   function status() {
+    // The module is built twice (once for init, once for routes), so a pipe opened in init would
+    // belong to an instance nobody serves from. Sync here instead: the pane and the overlay both
+    // read this document, so the setting takes effect at the first read, and `off` costs a compare.
+    pipe.setMode(settings.get('publish'));
     const s = settings.all();
     const model = findModel();
     return {
@@ -226,6 +234,9 @@ function build(ctx) {
       // The overlay's camera answer: why it did not open (object or null) and what it did open.
       cameraError: camera.error,
       cameraLabel: camera.label,
+      // The virtual camera's truth: off | waiting (no consumer, or connected and silent) | live
+      // (a consumer is reading frames), plus the counters and the geometry both sides agreed on.
+      publish: pipe.status(),
       runtime: {
         vendored: fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')),
         simdWasm: fs.existsSync(path.join(VENDOR, 'vision', 'simd-wasm', 'vision_wasm_internal.wasm')),
@@ -274,8 +285,17 @@ function build(ctx) {
             if (bad.length) return send(res, 400, { ok: false, error: `unknown effect id(s): ${bad.join(', ')}` });
           }
           try {
+            const before = settings.get('publish');
             const changed = settings.patch(patch);
-            return send(res, 200, { ok: true, changed, settings: settings.describe() });
+            const now = settings.get('publish');
+            // Opening or closing the pipe follows the setting, and the page has to learn the new
+            // mode before it starts (or stops) sending pictures: the bus is the only channel the
+            // page listens on, and it re-reads the status document on `settings.patch`.
+            if (now !== before) {
+              pipe.setMode(now);
+              publish('settings.patch', { key: 'publish', value: now });
+            }
+            return send(res, 200, { ok: true, changed, settings: settings.describe(), publish: pipe.status() });
           } catch (err) {
             return send(res, err.status || 400, { ok: false, error: err.message });
           }
@@ -402,6 +422,37 @@ function build(ctx) {
       },
 
       {
+        // The page's picture, as raw RGBA bytes (a frame is not JSON — the route declares
+        // `rawBody`, so core hands over the bytes and this module owns the size ceiling).
+        // Nothing is kept, logged or written to disk: it is converted to NV12 and written to the
+        // camera's pipe, which is why an absent consumer costs nothing but a status word.
+        path: '/frame',
+        method: 'POST',
+        rawBody: true,
+        rawLimit: 32 * 1024 * 1024,
+        handler: (req, res, url, body) => {
+          const kind = url.searchParams.get('kind');
+          pipe.setMode(settings.get('publish'));
+          const out = pipe.publish(body, kind === 'raw' || kind === 'effects' ? kind : null);
+          if (out.ok) {
+            return send(res, 200, { ok: true, stage: out.stage, sent: out.sent || 0, converted: out.converted === true });
+          }
+          // A frame for a mode that is off, or of the wrong size, is the page and the pipe
+          // disagreeing — say which, and what the pipe wants, instead of a bare 400.
+          if (out.reason === 'size') {
+            return send(res, 409, {
+              ok: false,
+              error: 'frame size does not match the camera',
+              expected: out.expected,
+              got: out.got,
+              geometry: pipe.status().geometry,
+            });
+          }
+          return send(res, 409, { ok: false, error: out.reason || 'not published', mode: pipe.status().mode });
+        },
+      },
+
+      {
         path: '/model',
         method: 'GET',
         handler: (req, res, url) => {
@@ -450,9 +501,13 @@ function build(ctx) {
         `handfx: runtime ${fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')) ? 'vendored' : 'NOT vendored'}, ` +
           `model ${findModel() ? 'local' : 'fetched from ' + MODEL_URL}`,
       );
+      // The pipe is not opened here: init runs on a build that routes() then replaces, so a
+      // listener owned by it would accept the Frame Server and never send a frame. `status()`
+      // syncs the mode on the instance that actually serves.
     },
 
     dispose() {
+      pipe.dispose();
       settings.flush();
     },
   };

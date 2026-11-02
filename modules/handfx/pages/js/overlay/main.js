@@ -18,6 +18,7 @@
 // that track fails or ends.
 
 import { Tracker, syntheticHands } from '../engine/tracker.js';
+import { createPublisher } from './publish.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
 import { FxRenderer, EFFECTS, anchorsFrom } from '../engine/fx.js';
 
@@ -75,6 +76,13 @@ const state = {
 
 const fx = new FxRenderer(canvas, { onError: (msg) => setBanner(`Effects unavailable: ${msg}`, 'bad') });
 const tracker = new Tracker({ onFrame: onFrame, onState: onTrackerState });
+// The virtual camera's feed: only runs when the server says `publish` is not `off`.
+const publisher = createPublisher({
+  video: () => tracker.video,
+  fx: () => canvas,
+  settings: () => state.settings || {},
+  log: (msg) => console.warn(msg),
+});
 const motion = new Motion();
 const gate = new GestureGate();
 
@@ -140,6 +148,9 @@ function applySettings(status) {
   }
   const list = effectiveEffects();
   if (state.cursor >= list.length) state.cursor = Math.max(0, list.length - 1);
+  // The virtual camera's mode and geometry travel with the status document; nothing else tells
+  // this page whether to feed it.
+  publisher.fromStatus(status);
   renderState();
 }
 
@@ -743,6 +754,9 @@ function loop(now) {
       state.lastDrawAt = Date.now();
     }
   }
+  // Runs straight after the effects pass, while the canvas still holds this frame's pixels.
+  // Publishes nothing unless the server says `publish` is raw or effects.
+  publisher.tick(now);
   requestAnimationFrame(loop);
 }
 

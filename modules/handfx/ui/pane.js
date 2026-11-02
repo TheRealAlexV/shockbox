@@ -511,11 +511,23 @@ export async function render(container, ctx) {
         actionButton({ label: 'Clear device', variant: 'btn btn-quiet btn-sm', run: () => patch('deviceId', ''), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
       ),
       el('div', { class: 'hfx-row' }, el('span', { class: 'hfx-label', text: 'publish' }), selectControl('publish', s.settings.publish || 'off', (s.status?.settings?.publish?.values) || ['off', 'raw', 'effects'], (v) => patch('publish', v))),
-      // Honest about reach: the value is stored, but the second camera output it names does not
-      // exist yet, so nothing is published and the OBS source is unchanged. Say so where it is set.
-      (s.settings.publish && s.settings.publish !== 'off')
-        ? el('p', { class: 'hfx-help hfx-note warn', text: `publish ${s.settings.publish}: saved, but a second camera is not built — nothing is published, and the OBS source still shows the overlay page's own picture. This value changes nothing yet.` })
-        : el('p', { class: 'hfx-help', text: 'publish off: no second camera is published; the OBS source uses the overlay page, as before.' }),
+      // The truth about the pipe, read from /status rather than assumed: the camera slot may not be
+      // running at all, which is `waiting`, not a failure.
+      (() => {
+        const mode = s.settings.publish || 'off';
+        if (mode === 'off') {
+          return el('p', { class: 'hfx-help', text: 'publish off: no pipe is opened — the ShockBox Virtual Camera keeps its black placeholder, and nothing is converted.' });
+        }
+        const p = s.status?.publish || {};
+        const g = p.geometry;
+        const size = g ? `${g.width}×${g.height} NV12 @ ${g.fps} fps` : 'format.ini not read yet';
+        const ago = p.lastFrameAt ? `${Math.max(0, Math.round((Date.now() - p.lastFrameAt) / 1000))}s ago` : 'never';
+        const why = p.stage === 'live' ? 'live' : 'waiting — no consumer on the pipe, or the overlay page is not sending';
+        return el('p', {
+          class: `hfx-help hfx-note ${p.stage === 'live' ? 'ok' : 'warn'}`,
+          text: `publish ${mode}: ${size} · ${why} · ${p.frames || 0} frames, last ${ago}${p.error ? ` · ${p.error}` : ''}`,
+        });
+      })(),
       el('p', { class: 'hfx-help', text: 'The camera opens only on Start preview (or the overlay’s own Start). One document holds the camera at a time; the overlay holds it while it is tracking.' }),
     );
     card.append(body);
