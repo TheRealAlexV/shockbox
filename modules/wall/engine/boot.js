@@ -1,9 +1,9 @@
 /**
  * LED Wall v2.1 — shared page boot
  * =================================
- * One classic script, two pages: `display.html` (16:9) and
- * `display-portrait.html` (9:16) differ only in the `LEDWALL_PAGE` constant they
- * set before loading this file.
+ * One page, one classic script: `engine/display.html` sets `LEDWALL_PAGE` and loads this file.
+ * The 9:16 picture is not a second page — it is the fence block inside that page's 16:9
+ * canvas, selected by `?view=portrait` or by the render settings.
  *
  * WHY classic script: the production page is loaded from
  * `file:///C:/OBS/LEDWall/display.html` inside OBS CEF.  `file://` blocks ES
@@ -25,7 +25,7 @@
   // The 16:9 page draws BOTH view blocks: landscape is the whole picture, portrait is the 9:16
   // fence inside it (2026-10-29). So the serving page reports as landscape; a ?view=portrait
   // on this page means 'start with the fence layout', which the render settings carry because
-  // the window is a mod-8 fence rectangle. The dedicated 9:16 page keeps its own VIEW.
+  // the window is a mod-8 fence rectangle. A `?view=` on the URL overrides it further down.
 
   var qs = new URLSearchParams(location.search);
   var DEFAULTS = window.LEDWALL_DEFAULTS || {};

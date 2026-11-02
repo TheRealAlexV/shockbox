@@ -49,8 +49,11 @@ export default {
     // A document written on another machine can name a clip that is not here. Keep the operator's
     // choice on disk and say so; a write through PATCH /settings is what validates for real.
     const keep = [DEFAULT_NOTIFY_TONE];
-    if (!this.sounds.has(this.settings.get('tone'), keep)) {
-      ctx.log.warn(`sounds: tone "${this.settings.get('tone')}" is not in ${this.sounds.dir.root || '(no directory)'} — it will not play`);
+    // Only a directory that exists can be missing a clip. With none configured the warning above
+    // already says tones are silent, and naming "(no directory)" as the place the clip is not
+    // reads like a broken install rather than an unset one.
+    if (this.sounds.dir.root && !this.sounds.has(this.settings.get('tone'), keep)) {
+      ctx.log.warn(`sounds: tone "${this.settings.get('tone')}" is not in ${this.sounds.dir.root} — it will not play`);
     }
     // Auto-close is a visual timer, so it is swept here and never persisted.
     this.timer = setInterval(() => {

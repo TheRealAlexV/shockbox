@@ -24,6 +24,27 @@ import { createServer } from './core/server-http.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = '1.0.0';
 
+// The tone store is one file with a server half and a page half, so it imports `node:fs` and
+// `node:path` at the top. Browsers cannot resolve those specifiers, so the raw module source
+// blanked both overlays; core's `/mod/<id>/<path>` fallback deliberately serves a module's source
+// unchanged. This route is the page copy: the server-only imports are dropped and the functions
+// behind them stay in the text without ever running in a browser.
+const SOUND_SRC = path.join(HERE, 'modules/notifications/sound.mjs');
+const NODE_IMPORT_LINE = /^import\s+(?:[^;]*?\s+from\s+)?['"]node:[^'"]*['"];?\s*$/gm;
+const browserSoundRoutes = ['GET', 'HEAD'].map((method) => ({
+  method,
+  path: /^\/mod\/notifications\/sound\.mjs$/,
+  handler(req, res) {
+    const body = fs.readFileSync(SOUND_SRC, 'utf8').replace(NODE_IMPORT_LINE, '');
+    res.writeHead(200, {
+      'content-type': 'text/javascript; charset=utf-8',
+      'cache-control': 'no-store',
+      'content-length': Buffer.byteLength(body),
+    });
+    res.end(method === 'HEAD' ? undefined : body);
+  },
+}));
+
 function arg(name, fallback = undefined) {
   const i = process.argv.indexOf(`--${name}`);
   if (i >= 0 && process.argv[i + 1] && !process.argv[i + 1].startsWith('--')) return process.argv[i + 1];
@@ -53,9 +74,15 @@ const STATE_DIR = path.resolve(arg('state', process.env.SHOCKBOX_STATE || cfg.st
 // next to it; this is the same stream, written straight to a file with the log ring behind
 // /api/log. Defaults to the state directory, so a plain `node server.mjs` is unchanged.
 const LOG_DIR = path.resolve(arg('log-dir', process.env.SHOCKBOX_LOG_DIR || cfg.logDir || STATE_DIR));
-// Where the notification / alert tone clips live. Rig default; overridable for tests and for a
-// checkout on another machine. Handed to the modules through the context; core does not read it.
-const SOUNDS_DIR = path.resolve(arg('sounds', process.env.SHOCKBOX_SOUNDS || cfg.soundsDir || 'C:\\OBS\\Sounds\\SoundBoard'));
+// Where the notification / alert tone clips live. Rig default on Windows; overridable for tests
+// and for a checkout on another machine. Handed to the modules through the context; core does not
+// read it. A Windows drive path is only meaningful on Windows: joined to a POSIX cwd it becomes a
+// directory that cannot exist, so elsewhere the library is simply unconfigured (empty tone list).
+const SOUNDS_RAW = String(arg('sounds', process.env.SHOCKBOX_SOUNDS || cfg.soundsDir || (process.platform === 'win32' ? 'C:\\OBS\\Sounds\\SoundBoard' : '')) || '').trim();
+// A drive-letter path is a Windows path: on win32 resolve it as before (byte-identical), elsewhere
+// treat the library as unconfigured rather than joining the path onto a cwd it never belonged to.
+const SOUNDS_WIN_ONLY = /^[A-Za-z]:[\\/]/.test(SOUNDS_RAW) && process.platform !== 'win32';
+const SOUNDS_DIR = SOUNDS_RAW && !SOUNDS_WIN_ONLY ? path.resolve(SOUNDS_RAW) : null;
 const PUBLIC_DIR = path.join(HERE, 'public');
 const COMPAT_PORT = has('no-compat') ? 0 : Number(process.env.EP_COMPAT === '1' ? process.env.EP_COMPAT_PORT || 8787 : cfg.compatPort || 0);
 const OBS_URL = cfg.obs?.url || 'ws://127.0.0.1:4455';
@@ -239,6 +266,9 @@ const httpServer = createServer({
     // Core never names the module; it asks every loaded module for its extra routes.
     extraRoutes: [
       ...poolRoutes({ pool, events, log: log.scope('pool') }),
+      // The page copy of the shared tone player (`/mod/notifications/sound.mjs`), which the raw
+      // module source cannot be: see browserSoundRoutes above.
+      ...browserSoundRoutes,
       // Scheduled sends: /api/schedules (list, book, run now, cancel). Registered here rather than
       // in a module so the wall, the dialogs and the notifications share one queue.
       ...scheduler.routes,

@@ -177,6 +177,51 @@ for (const p of ['/dialogs', '/notify']) {
 const overlayJs = await fetch(base + '/mod/dialogs/overlay/app.js');
 ok(overlayJs.status === 200 && /EventSource/.test(await overlayJs.text()), 'overlay module assets are served from the module dir');
 
+// A page that names an asset relative to itself while it is served at a module prefix
+// (`href="style.css"` at /handfx → /style.css → 404) fails silently: the document is 200, only the
+// stylesheet and the script are missing, and the OBS source is blank with no API call to blame. So
+// every declared page is walked here, every href/src resolved the way a browser resolves it (the
+// document URL, plus the page's <base> when it declares one), and each reference must be served.
+// The page list comes from the manifests: a new module or page is covered without editing this test.
+const declaredPages = [];
+for (const id of fs.readdirSync(path.join(ROOT, 'modules'))) {
+  const manifestPath = path.join(ROOT, 'modules', id, 'module.json');
+  if (!fs.existsSync(manifestPath)) continue;
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  for (const page of manifest.pages || []) if (page.route) declaredPages.push({ id, route: page.route, file: page.file || '' });
+}
+ok(declaredPages.length > 0, `module manifests declare pages to walk (${declaredPages.map((p) => p.route).join(', ')})`);
+
+for (const page of declaredPages) {
+  const docUrl = new URL(page.route, base);
+  const pageRes = await fetch(docUrl);
+  const html = await pageRes.text();
+  ok(pageRes.status === 200, `page ${page.route} (${page.file}) is served`, pageRes.status);
+  const baseTag = /<base\s[^>]*href\s*=\s*["']([^"']*)["']/i.exec(html);
+  const docBase = baseTag ? new URL(baseTag[1], docUrl) : docUrl;
+  // The <base> tag is read above and then dropped: its href is the resolution origin, not a file
+  // the browser fetches, and a page's base URL is not required to be a served path.
+  const refHtml = html.replace(/<base\b[^>]*>/gi, '');
+  // href/src are the attributes a browser fetches without a click. A URL with a scheme is not this
+  // server's asset, and a fragment is not a request at all.
+  const refs = [...refHtml.matchAll(/\b(?:href|src)\s*=\s*["']([^"']*)["']/gi)]
+    .map((m) => m[1].trim())
+    .filter((ref) => ref && !ref.startsWith('#') && !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(ref));
+  for (const ref of refs) {
+    const assetUrl = new URL(ref, docBase);
+    const asset = await fetch(assetUrl);
+    const type = asset.headers.get('content-type') || '';
+    // A module page loads ES modules: serving the right bytes as text/plain still leaves the
+    // overlay blank, so the type is part of "resolves".
+    const isJs = /\.m?js$/.test(assetUrl.pathname);
+    ok(
+      asset.status === 200 && (!isJs || /javascript/.test(type)),
+      `page ${page.route} (${page.file}) reference "${ref}" resolves → ${assetUrl.pathname}`,
+      { status: asset.status, type },
+    );
+  }
+}
+
 // --- cleanup ------------------------------------------------------------
 await req('DELETE', `/api/pool/all/messages/${dialogId}`);
 await req('DELETE', `/api/pool/all/messages/${notifId}`);

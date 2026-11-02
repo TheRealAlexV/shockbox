@@ -22,9 +22,12 @@ Source: `modules/wall/server.js`, `commands.mjs`, `ratio.mjs`, `module.json`, `u
 - No `order` (defaults to 100). No `settings` block in the manifest — the settings schema below is
   built in `server.js`, not by the registry.
 - **`/wall/render` is the only page.** There is no `/wall/portrait` route: `module.json` does not
-  declare it, nothing in the server or the shell references it, and `modules/wall/pages/display-portrait.html`
-  is unreachable dead weight. The 9:16 picture is a fence inside `/wall/render`, and the view
-  list below survives only at the wire level.
+  declare it and nothing in the server or the shell references it. The 9:16 picture is a fence
+  inside `/wall/render`, and the view list below survives only at the wire level. A standalone
+  9:16 page (`display-portrait.html`) sat in `modules/wall/pages/` from the initial import until
+  2026-11-02; nothing routed it, its six script paths resolved above the module and 404'd, and
+  the fence already produces 9:16, so it was deleted. Do not reinstate it: a real 9:16 mount
+  would need a `pages[]` entry and a `<base href="/mod/wall/engine/">` of its own.
 
 ## HTTP routes (all under `/api/wall`)
 

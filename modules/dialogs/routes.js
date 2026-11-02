@@ -1,7 +1,7 @@
 import { HttpError } from '../../core/id.mjs';
 import { createDialogState } from './state.mjs';
 import { checkTone } from '../notifications/audio-routes.mjs';
-import { DEFAULT_DIALOG_TONE } from '../notifications/sound.mjs';
+import { DEFAULT_DIALOG_TONE, DEFAULT_TONES } from '../notifications/sound.mjs';
 
 // Alerts module — the dialog side of the popup feature.
 //
@@ -61,10 +61,20 @@ export default {
         path: '/audio/list',
         handler() {
           const audio = mod.soundStore();
-          if (!audio) throw new HttpError(500, 'notifications module is not up');
-          const out = audio.listRoute();
-          if (!out.available) throw new HttpError(500, out.error || 'sound directory unavailable');
-          return { ...out, key: 'tone' };
+          // An absent store is a normal rig state, not a failure: answer the notifications
+          // route's shape (200 + available:false) instead of a 500, so the pane can show why.
+          if (!audio) {
+            return {
+              ok: true,
+              available: false,
+              dir: null,
+              files: [],
+              error: 'notifications module is not up — no sound directory configured',
+              defaults: DEFAULT_TONES,
+              key: 'tone',
+            };
+          }
+          return { ...audio.listRoute(), key: 'tone' };
         },
       },
       {

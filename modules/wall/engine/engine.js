@@ -1680,13 +1680,18 @@
     this._holdTick();
 
     // ── idle throttle ────────────────────────────────────────────────────────
-    // Skip only when the idle interval has already elapsed since the last drawn frame *and*
-    // nothing on the wall is moving. A dirty frame fails `_canIdle`, so a change is drawn on
-    // the very next vsync at full rate; the settle window keeps it at full rate until the sim's
-    // ease has landed, so an animated wall and a change look exactly as they did before.
+    // Skip while the last *draw* is younger than one idle interval, so a sleeping wall redraws at
+    // IDLE_FPS instead of at vsync. The test has to be "too soon", not "due": a skip never
+    // advances `_idleLast`, so testing "the interval has elapsed since the last draw" stays true
+    // after the first skip and the wall then skips every frame forever (measured: 0 draws/s while
+    // skipping at vsync). Nothing on the wall may be moving either — a dirty frame fails
+    // `_canIdle`, so a change is drawn on the very next vsync at full rate; the settle window
+    // keeps it at full rate until the sim's ease has landed, so an animated wall and a change look
+    // exactly as they did before. A wall whose frames already cost more than the interval is
+    // draw-bound and simply never skips.
     var rs = this.renderStats;
-    var idleDue = IDLE_FPS > 0 && (now - this._idleLast) >= (1000 / IDLE_FPS);
-    if (idleDue && this._canIdle(now)) {
+    var idleTooSoon = IDLE_FPS > 0 && (now - this._idleLast) < (1000 / IDLE_FPS);
+    if (idleTooSoon && this._canIdle(now)) {
       rs.skipped++;
       rs.idle = true;
       return;

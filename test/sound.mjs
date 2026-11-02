@@ -8,8 +8,9 @@
 //   · a missing directory → empty list, and /audio/<name> 404s with a message
 //   · PATCH settings refuses a tone that is not on disk
 // Browser half (headless Chrome, --autoplay-policy=no-user-gesture-required): each module page
-// is loaded as itself — its own module script, its own SSE — through a small origin that only
-// adds `<base href>` so `./app.js` resolves under the page route. The player is created with
+// is loaded as itself — its own module script, its own SSE — byte-for-byte as the server serves
+// it. The page's asset URLs are the real ones, so a page that cannot load its own CSS/JS fails
+// here instead of being propped up. The player is created with
 // `{instrument:true}`, which records every element it builds and every play() it issues, so the
 // test asserts on the player's own record, never on audio output:
 //   · a page load over an existing banner plays nothing (the first payload seeds the page)
@@ -189,14 +190,12 @@ const STATUS = `JSON.stringify(window.__pageAudio ? {
 async function open(c, url, origin, proxy) {
   const t = origin;
   await c.send('Page.addScriptToEvaluateOnNewDocument', { source: INSTRUMENT });
-  // The document is fetched and a `<base href>` is put in front of the parser with
-  // `document.write`, so `./app.js` resolves against `/notify/` before the first subresource is
-  // requested. The markup is the module's own page otherwise, unmodified.
   const pagePath = new URL(url).pathname;
   const hash = url.includes('#') ? url.slice(url.indexOf('#')) : '';
-  // Serve the page from the test's own origin under the page's path: `<base href="/notify/">`
-  // then resolves `./app.js` to `/notify/app.js`, which the real server serves. Everything else
-  // (the SSE stream, `/api/*`, `/audio/*`) goes to the real server through the proxy.
+  // Serve the page from the test's own origin under the page's path, byte-for-byte as the
+  // server serves it: the page names its assets root-relative (`/notify/app.js`), so the browser
+  // asks the proxy for exactly the URL a real OBS browser source asks for. Everything else (the
+  // SSE stream, `/api/*`, `/audio/*`) goes to the real server through the proxy.
   await c.send('Page.navigate', { url: `${proxy.origin}${pagePath}${hash}` });
   await sleep(1800);
 
@@ -223,19 +222,14 @@ const srv = await startServer(dir);
 const missing = await startServer(path.join(dir, 'no-such-dir'));
 
 /**
- * The page origin the browser half loads from. It serves exactly the two module pages and their
- * sibling assets from the real server, with `<base href="/<page>/">` put in the document — the
- * one thing a browser source gets for free and a plain same-origin navigation does not. Every
- * other path falls through to the real server unmodified, so `/api/*`, `/audio/*` and the SSE
- * stream behave exactly as they do in production (and so do the traversal probes).
+ * The page origin the browser half loads from. It forwards every request to the real server
+ * untouched — no `<base>`, no rewriting of a page or a module source — so the browser asks for the
+ * exact URLs a real OBS browser source asks for and a page that names its CSS/JS/module wrongly
+ * fails here instead of being propped up. The SSE stream is forwarded unbuffered.
  */
 async function startPageProxy(upstream) {
-  const pages = new Set(['/notify', '/dialogs']);
-  const assets = /^\/(notify|dialogs)\/[A-Za-z0-9._-]+\/?$/;
-  const modAssets = /^\/mod\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
   const server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
-    const isPage = pages.has(u.pathname);
     if (u.pathname === '/events') {
       const up = http.request({ host: '127.0.0.1', port: new URL(upstream).port, path: req.url, method: req.method, headers: req.headers }, (r) => {
         res.writeHead(r.statusCode, {
@@ -250,36 +244,12 @@ async function startPageProxy(upstream) {
       req.pipe(up);
       return;
     }
-    const isAsset = assets.test(u.pathname) || modAssets.test(u.pathname);
-    if (!isPage && !isAsset) {
-      const up = http.request({ host: '127.0.0.1', port: new URL(upstream).port, path: req.url, method: req.method, headers: req.headers }, (r) => {
-        res.writeHead(r.statusCode, r.headers);
-        r.pipe(res);
-      });
-      up.on('error', () => res.destroy());
-      req.pipe(up);
-      return;
-    }
-    // `/mod/<id>/<file>.mjs` is the module's source for a browser; the server hands it over
-    // unchanged. `node:` imports inside it are dead server code for a page — the browser would
-    // stop at the first `import fs from 'node:fs'` — so the page copy omits those imports and
-    // the server-side functions below them are left unreferenced (they never run in a page).
-    const isModuleSource = u.pathname.startsWith('/mod/') && u.pathname.endsWith('.mjs');
-    http
-      .get({ host: '127.0.0.1', port: new URL(upstream).port, path: u.pathname }, (r) => {
-        const chunks = [];
-        r.on('data', (d) => chunks.push(d));
-        r.on('end', () => {
-          let body = Buffer.concat(chunks).toString('utf8');
-          if (isPage) body = body.replace(/<head([^>]*)>/i, `<head$1><base href="${u.pathname}/">`);
-          if (isModuleSource) body = body.replace(/^import\s+(?:[^;]*?\s+from\s+)?['"]node:[^'"]*['"];?\s*$/gm, '');
-          const headers = { ...r.headers, 'content-length': Buffer.byteLength(body) };
-          delete headers['content-encoding'];
-          res.writeHead(r.statusCode, headers);
-          res.end(body);
-        });
-      })
-      .on('error', () => res.destroy(500));
+    const up = http.request({ host: '127.0.0.1', port: new URL(upstream).port, path: req.url, method: req.method, headers: req.headers }, (r) => {
+      res.writeHead(r.statusCode, r.headers);
+      r.pipe(res);
+    });
+    up.on('error', () => res.destroy());
+    req.pipe(up);
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();

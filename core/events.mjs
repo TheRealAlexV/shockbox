@@ -86,7 +86,7 @@ export function createEvents({ log }) {
     } catch {
       /* ignore */
     }
-    log.info(`sse client #${c.id} ${c.channels} dropped (${why}), ${clients.size} left`);
+    log.info(`sse client #${c.id} ${[...c.channels]} dropped (${why}), ${clients.size} left`);
   }
 
   /** Publish a command frame to one channel. view scopes delivery (wall has landscape|portrait). */
