@@ -791,11 +791,13 @@
     // 63 is only the fallback when gridCols is absent.
     var pitchCols = num(s.gridCols, 0);
     var wantCols = this.ratio === '9:16'
-      ? (pitchCols > 0 ? Math.round(720 / (1920 / pitchCols)) : 63)
+      ? (pitchCols > 0 ? 720 / (1920 / pitchCols) : 63)
       : num(s.gridCols, 112);
     var cols = clamp(Math.round(wantCols), 4, 400);
     var cellShape = clamp(num(s.cellShape, 1), 0.25, 4);
-    var pitchX = this.W / cols;
+    // Portrait keeps the ideal fractional pitch so auto rows stay on pitch
+    // (11 × 16/9 = 19 rows, not the 20 that rounding cols to 11 would give).
+    var pitchX = this.ratio === '9:16' && pitchCols > 0 ? this.W / wantCols : this.W / cols;
     var pitchY = pitchX * cellShape;
     var rows = Math.round(num(s.gridRows, 0));
     if (!rows || rows < 8) rows = Math.max(4, Math.round(this.H / pitchY));
