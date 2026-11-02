@@ -6,8 +6,8 @@
 // focal point, and they are four places to read instead of one picture.
 //
 // A layer is the module's own thing, not a reimplementation:
-//   wall          the shared `.pv-look` paint from preview.css, plus the wall's picture at
-//                 imageX/imageY/imageScale (the transform the engine applies), clipped to the crop
+//   wall          the real `/wall/portrait` page in an iframe, scaled into the strip: the engine's
+//                 own paint, picture and blackout, not a CSS copy of them
 //   hand fx       the pane's own camera canvas, mirrored — the module keeps drawing its pixels
 //   notifications the module's own markup and stylesheet inside a shadow root (405×720 native)
 //   dialogs       the same, on its 810×1440 desk shown at half scale
@@ -398,15 +398,17 @@ export function mountMergedColumn(host, opts = {}) {
   const scene = el('div', { class: 'mx-scene' });
   surface.append(scene);
 
-  /* The wall, in its own 1280×720 picture space; the strip is the middle 405px of it. */
+  /* The wall layer is the real page, not a CSS imitation of it: `/wall/portrait` is the same
+   * document OBS loads, drawn at 720×1280 and scaled 0.5625 to the strip's 405×720. The outer
+   * element and its classes stay — layout still targets it. */
   const wallEl = el('div', { class: 'mx-wall pv-stage', 'data-shape': 'wave' },
-    el('div', { class: 'pv-look' }),
-    el('div', { class: 'pv-dots' }),
+    el('iframe', {
+      src: '/wall/portrait',
+      scrolling: 'no',
+      title: 'Show wall',
+      style: 'width:720px;height:1280px;border:0;position:absolute;inset:0;transform:scale(0.5625);transform-origin:0 0',
+    }),
   );
-  const wallImg = el('img', { class: 'mx-img', alt: '', draggable: 'false' });
-  wallImg.hidden = true;
-  wallImg.addEventListener('load', () => placeWallImg());
-  wallEl.append(wallImg);
 
   /* Hand FX draws on its own camera canvas in its own pane; the strip mirrors those pixels. */
   const fxEl = el('div', { class: 'mx-handfx' });
@@ -625,57 +627,6 @@ export function mountMergedColumn(host, opts = {}) {
     wallEl.style.setProperty('--pv-dot', look.blackout ? '0.04' : String(clamp(0.25 + bright * 0.5, 0.12, 1)));
   }
 
-  let img = { on: false, rev: -1, x: 0.5, y: 0.5, scale: 0.6, rotate: 0 };
-
-  /** Where the wall's picture sits: `imageX/Y` is its centre as a fraction of the wall, and
-   *  `imageScale` its width as a fraction of the wall's width. The show's own transform. */
-  function placeWallImg() {
-    wallImg.hidden = !(img.on && img.rev >= 0);
-    if (wallImg.hidden) return;
-    const w = Math.max(1, img.scale * STRIP.frameW);
-    const ratio = wallImg.naturalWidth && wallImg.naturalHeight
-      ? wallImg.naturalWidth / wallImg.naturalHeight
-      : STRIP.frameW / STRIP.frameH;
-    const h = w / ratio;
-    wallImg.style.width = `${w}px`;
-    wallImg.style.height = `${h}px`;
-    wallImg.style.left = `${img.x * STRIP.frameW - w / 2}px`;
-    wallImg.style.top = `${img.y * STRIP.frameH - h / 2}px`;
-    wallImg.style.transform = `rotate(${img.rotate}deg)`;
-  }
-
-  /**
-   * The picture drags in the strip, in wall pixels, and the drag commits `imageX/imageY` to the
-   * wall's own settings route — the same keys the wall pane's own drag writes. Nothing new is
-   * stored: the position the show uses is the position the strip wrote.
-   */
-  const dragWall = { cx: null, cy: null };
-  dragSurface(wallImg, {
-    onMove(ev, pt, dx, dy) {
-      if (dragWall.cx === null) {
-        dragWall.cx = img.x * STRIP.frameW;
-        dragWall.cy = img.y * STRIP.frameH;
-      }
-      const cx = clamp(dragWall.cx + dx / scale, 0, STRIP.frameW);
-      const cy = clamp(dragWall.cy + dy / scale, 0, STRIP.frameH);
-      wallImg.style.left = `${cx - wallImg.offsetWidth / 2}px`;
-      wallImg.style.top = `${cy - wallImg.offsetHeight / 2}px`;
-      wallEl.dataset.dragging = 'true';
-      select('wall');
-    },
-    onEnd() {
-      wallEl.dataset.dragging = 'false';
-      if (dragWall.cx === null) return;
-      const x = clamp((parseFloat(wallImg.style.left) + wallImg.offsetWidth / 2) / STRIP.frameW, 0, 1);
-      const y = clamp((parseFloat(wallImg.style.top) + wallImg.offsetHeight / 2) / STRIP.frameH, 0, 1);
-      dragWall.cx = null;
-      dragWall.cy = null;
-      void send('wall', '/api/wall/settings', {
-        imageX: Math.round(x * 1000) / 1000,
-        imageY: Math.round(y * 1000) / 1000,
-      }).then(() => load('wall'));
-    },
-  });
 
   /* ------------------------------------------------------------ the alerts */
 
@@ -889,26 +840,7 @@ export function mountMergedColumn(host, opts = {}) {
       fence: (s.render && s.render.fence) || (s.fence && s.fence.px) || prev.fence,
     });
     const w = lookStore.get('wall');
-    if (hasDom()) {
-      paintWall();
-      img = {
-        on: num(setting(s.settings, 'imageOn', 0), 0) > 0,
-        rev: num(setting(s.settings, 'imageRev', 0), 0),
-        x: clamp(num(setting(s.settings, 'imageX', 0.5), 0.5), 0, 1),
-        y: clamp(num(setting(s.settings, 'imageY', 0.5), 0.5), 0, 1),
-        scale: clamp(num(setting(s.settings, 'imageScale', 0.6), 0.6), 0.05, 4),
-        rotate: num(setting(s.settings, 'imageRotate', 0), 0),
-      };
-      if (img.on && img.rev !== Number(wallImg.dataset.rev)) {
-        wallImg.dataset.rev = String(img.rev);
-        wallImg.src = `/api/wall/image?rev=${img.rev}`;
-      }
-      if (!img.on) {
-        delete wallImg.dataset.rev;
-        wallImg.removeAttribute('src');
-      }
-      placeWallImg();
-    }
+    if (hasDom()) paintWall();
     setState('wall', `${w.pattern}${w.blackout ? ' · black' : ''}`, w.blackout ? 'warn' : '');
   }
 
