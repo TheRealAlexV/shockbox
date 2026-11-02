@@ -12,8 +12,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { HttpError, clamp } from './id.mjs';
 
-export const POOL_IDS = ['all', 'random', 'dialogs', 'notifications', 'wall'];
+// `all` and `random` are views, not places a message lives — they filter every record / the
+// records with `random === true` — so they stay virtual. A real pool is a record in the state
+// file: `{ id, label, kind, tags }`, and a message's `poolId` points at one.
+export const VIRTUAL_POOLS = [
+  { id: 'all', label: 'All messages' },
+  { id: 'random', label: 'Random' },
+];
 export const POOL_NAMES = { all: 'All messages', random: 'Random', dialogs: 'Alerts', notifications: 'Notifications', wall: 'Wall' };
+
+// A fresh store starts with one pool per kind; `kind` is what a message's `poolId` resolves to.
+export const SEED_POOLS = [
+  { id: 'dialogs', label: POOL_NAMES.dialogs, kind: 'dialog', tags: [] },
+  { id: 'notifications', label: POOL_NAMES.notifications, kind: 'notification', tags: [] },
+  { id: 'wall', label: POOL_NAMES.wall, kind: 'wall', tags: [] },
+];
+
+// Deprecated: kept for callers that still import it. Nothing in this file reads it — the pool
+// list in the state file is the source of truth now.
+export const POOL_IDS = [...VIRTUAL_POOLS.map((p) => p.id), ...SEED_POOLS.map((p) => p.id)];
 
 // `wall` is a message pool record too: one typography source for alerts, notifications and
 // the LED wall, so a message written once can pop as a dialog or climb the wall.
@@ -137,6 +154,7 @@ export function parseMessageBody(body, { partial }) {
 
 export function createPool({ file, log, onChange = null }) {
   let messages = [];
+  let pools = [];
   let seq = 0;
   let loaded = false;
 
@@ -149,6 +167,27 @@ export function createPool({ file, log, onChange = null }) {
     seq = Math.max(seq, max);
   }
 
+  function seedPools() {
+    return SEED_POOLS.map((p) => ({ ...p, tags: [] }));
+  }
+
+  function normalisePool(raw) {
+    const r = raw && typeof raw === 'object' ? raw : {};
+    const id = typeof r.id === 'string' ? r.id.trim().slice(0, 40) : '';
+    if (!id) return null;
+    return {
+      id,
+      label: typeof r.label === 'string' && r.label.trim() ? r.label.trim().slice(0, 60) : id,
+      kind: KINDS.includes(r.kind) ? r.kind : null,
+      tags: Array.isArray(r.tags) ? r.tags.filter((t) => typeof t === 'string').slice(0, MAX_TAGS) : [],
+    };
+  }
+
+  function poolIdForKind(kind) {
+    const rec = pools.find((p) => p.kind === kind);
+    return rec ? rec.id : undefined;
+  }
+
   function normalise(raw) {
     const r = raw && typeof raw === 'object' ? raw : {};
     const parsed = parseMessageBody({ ...r, text: r.text ?? r.body }, { partial: false });
@@ -157,6 +196,7 @@ export function createPool({ file, log, onChange = null }) {
     return {
       id: typeof r.id === 'string' && r.id.trim() ? r.id.trim().slice(0, 40) : null,
       kind: r.kind === 'wall' ? 'wall' : r.kind === 'dialog' ? 'dialog' : r.kind === 'notification' ? 'notification' : v.kind,
+      poolId: typeof r.poolId === 'string' && r.poolId.trim() ? r.poolId.trim().slice(0, 40) : undefined,
       type: v.type,
       title: v.title || undefined,
       text: v.text,
@@ -187,6 +227,7 @@ export function createPool({ file, log, onChange = null }) {
     for (let i = 0; i < list.length; i++) {
       const rec = normalise(list[i]);
       if (!rec) return { error: `messages[${i}]: invalid record` };
+      if (!rec.poolId) rec.poolId = poolIdForKind(rec.kind);
       if (seenText.has(rec.text)) {
         skipped += 1;
         continue;
@@ -211,26 +252,35 @@ export function createPool({ file, log, onChange = null }) {
       doc = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (err) {
       if (err.code !== 'ENOENT') log.warn(`pool: cannot read ${file} (${err.message})`);
+      pools = seedPools();
       return messages;
     }
     const list = Array.isArray(doc) ? doc : Array.isArray(doc && doc.messages) ? doc.messages : null;
+    const stored = Array.isArray(doc && doc.pools) ? doc.pools : null;
+    // Idempotent migration: `pools` on disk means it already ran, so neither the pool list nor
+    // any message's poolId is touched a second time.
+    const migrate = stored === null;
+    pools = migrate ? seedPools() : stored.map(normalisePool).filter(Boolean);
+    if (!pools.length) pools = seedPools();
     if (!list) return messages;
     const seen = new Set();
     messages = [];
     for (const raw of list) {
       const rec = normalise(raw);
       if (!rec) continue;
+      if (migrate) rec.poolId = poolIdForKind(rec.kind);
       if (!rec.id || seen.has(rec.id)) rec.id = `m${++seq}`;
       seen.add(rec.id);
       messages.push(rec);
     }
     syncSeq();
+    if (migrate) save();
     log.info(`pool: ${messages.length} messages from ${path.basename(file)}`);
     return messages;
   }
 
   function save() {
-    const doc = { version: 4, updated: new Date().toISOString(), messages };
+    const doc = { version: 5, updated: new Date().toISOString(), pools, messages };
     const tmp = `${file}.tmp`;
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -270,6 +320,31 @@ export function createPool({ file, log, onChange = null }) {
     return all().slice();
   }
 
+  /** The stored pool records (copies): `{ id, label, kind, tags }`. */
+  function poolList() {
+    load();
+    return pools.map((p) => ({ ...p, tags: p.tags.slice() }));
+  }
+
+  function poolIds() {
+    load();
+    return pools.map((p) => p.id);
+  }
+
+  function poolRecord(id) {
+    load();
+    return pools.find((p) => p.id === id) || null;
+  }
+
+  /** Valid tab ids: the two virtual views plus every stored pool. */
+  function tabIds() {
+    return [...VIRTUAL_POOLS.map((p) => p.id), ...poolIds()];
+  }
+
+  function knowsPool(id) {
+    return tabIds().includes(id);
+  }
+
   function eligible(kind, flag) {
     return all().filter((m) => (!kind || m.kind === kind) && (flag ? m[flag] === true : true));
   }
@@ -277,6 +352,7 @@ export function createPool({ file, log, onChange = null }) {
   function add(values) {
     load();
     const rec = { id: `m${++seq}`, ...values };
+    if (!rec.poolId) rec.poolId = poolIdForKind(rec.kind);
     messages.push(rec);
     return rec;
   }
@@ -308,6 +384,7 @@ export function createPool({ file, log, onChange = null }) {
       insert = clamp(Number.isInteger(index) ? index : messages.length, 0, messages.length);
     }
     messages.splice(insert, 0, rec);
+    rec.poolId = poolIdForKind(rec.kind);
     return { to, index: insert, kind: rec.kind, random: rec.random === true, storm: rec.storm === true };
   }
 
@@ -341,12 +418,12 @@ export function createPool({ file, log, onChange = null }) {
     if (keepOrder) {
       // Import path: preserve the caller's array order verbatim (legacy stores carry their own
       // ordering), only new records get a fresh id. The `twin` text match above still hits.
-      const next = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values }));
+      const next = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values, poolId: poolIdForKind(values.kind) }));
       for (const rec of messages) if (!next.some((n) => n.id === rec.id)) next.push(rec);
       messages = next;
       return { count: messages.length };
     }
-    messages = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values }));
+    messages = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values, poolId: poolIdForKind(values.kind) }));
     return { count: messages.length };
   }
 
@@ -375,6 +452,7 @@ export function createPool({ file, log, onChange = null }) {
   /** Filtered view for one pool tab. */
   function view(poolId, query = {}) {
     load();
+    const poolRec = pools.find((p) => p.id === poolId) || null;
     const typeFilter = (query.type || '').trim().toLowerCase();
     const tagFilter = (query.tag || '').trim().toLowerCase();
     const q = (query.q || '').trim().toLowerCase();
@@ -395,7 +473,7 @@ export function createPool({ file, log, onChange = null }) {
     const { types, tags } = typesAndTags();
     return {
       id: poolId,
-      name: POOL_NAMES[poolId],
+      name: poolRec ? poolRec.label : POOL_NAMES[poolId] || poolId,
       types,
       tags,
       counts: {
@@ -442,6 +520,11 @@ export function createPool({ file, log, onChange = null }) {
     all,
     byId,
     list,
+    poolList,
+    poolIds,
+    poolRecord,
+    tabIds,
+    knowsPool,
     eligible,
     add,
     remove,
@@ -470,7 +553,12 @@ export function poolRoutes({ pool, events, log = pool.log }) {
       handler() {
         const { types, tags } = pool.typesAndTags();
         const v = pool.view('all');
-        return { pools: POOL_IDS.map((id) => ({ id, name: POOL_NAMES[id], count: v.counts[id] })), types, tags, counts: v.counts };
+        return {
+          pools: [...VIRTUAL_POOLS, ...pool.poolList()].map((p) => ({ id: p.id, name: p.label, count: v.counts[p.id] || 0 })),
+          types,
+          tags,
+          counts: v.counts,
+        };
       },
     },
     {
@@ -505,7 +593,7 @@ export function poolRoutes({ pool, events, log = pool.log }) {
       path: /^\/api\/pool\/([^/]+)$/,
       handler(req, res, url, body, params) {
         const id = decodeURIComponent(params[0]);
-        if (!POOL_IDS.includes(id)) throw new HttpError(404, `unknown pool ${id}`);
+        if (!pool.knowsPool(id)) throw new HttpError(404, `unknown pool ${id}`);
         const q = Object.fromEntries(url.searchParams.entries());
         return pool.view(id, q);
       },
@@ -526,7 +614,7 @@ export function poolRoutes({ pool, events, log = pool.log }) {
       path: /^\/api\/pool\/([^/]+)\/messages$/,
       handler(req, res, url, body, params) {
         const id = decodeURIComponent(params[0]);
-        if (!POOL_IDS.includes(id)) throw new HttpError(404, `unknown pool ${id}`);
+        if (!pool.knowsPool(id)) throw new HttpError(404, `unknown pool ${id}`);
         const parsed = parseMessageBody(body || {}, { partial: false });
         if (parsed.error) throw new HttpError(400, parsed.error);
         const rec = pool.add(parsed.values);
@@ -541,7 +629,7 @@ export function poolRoutes({ pool, events, log = pool.log }) {
       path: /^\/api\/pool\/([^/]+)\/reorder$/,
       handler(req, res, url, body, params) {
         const id = decodeURIComponent(params[0]);
-        if (!POOL_IDS.includes(id)) throw new HttpError(404, `unknown pool ${id}`);
+        if (!pool.knowsPool(id)) throw new HttpError(404, `unknown pool ${id}`);
         const ids = body && body.ids;
         if (!Array.isArray(ids) || !ids.every((x) => typeof x === 'string')) throw new HttpError(400, 'ids must be an array of message ids');
         const r = pool.reorder(id, ids);
@@ -556,9 +644,9 @@ export function poolRoutes({ pool, events, log = pool.log }) {
       path: /^\/api\/pool\/([^/]+)\/messages\/([^/]+)\/move$/,
       handler(req, res, url, body, params) {
         const fromId = decodeURIComponent(params[0]);
-        if (!POOL_IDS.includes(fromId)) throw new HttpError(404, `unknown pool ${fromId}`);
+        if (!pool.knowsPool(fromId)) throw new HttpError(404, `unknown pool ${fromId}`);
         const to = body && body.to;
-        if (!POOL_IDS.includes(to)) throw new HttpError(400, `to must be one of ${POOL_IDS.join(', ')}`);
+        if (!pool.knowsPool(to)) throw new HttpError(400, `to must be one of ${pool.tabIds().join(', ')}`);
         const r = pool.move(decodeURIComponent(params[1]), to, body && body.index);
         if (r.error) throw new HttpError(404, r.error);
         pool.commit('move');
@@ -571,12 +659,12 @@ export function poolRoutes({ pool, events, log = pool.log }) {
       path: /^\/api\/pool\/([^/]+)\/messages\/([^/]+)$/,
       handler(req, res, url, body, params) {
         const id = decodeURIComponent(params[0]);
-        if (!POOL_IDS.includes(id)) throw new HttpError(404, `unknown pool ${id}`);
+        if (!pool.knowsPool(id)) throw new HttpError(404, `unknown pool ${id}`);
         const mid = decodeURIComponent(params[1]);
         const rec = pool.byId(mid);
         if (!rec) throw new HttpError(404, `unknown message ${mid}`);
         const m = req.method;
-        if (m === 'GET' || m === 'HEAD') return { id, name: POOL_NAMES[id], message: rec };
+        if (m === 'GET' || m === 'HEAD') return { id, name: (pool.poolRecord(id) || {}).label || POOL_NAMES[id] || id, message: rec };
         if (m === 'DELETE') {
           pool.remove(mid);
           pool.commit('delete');
