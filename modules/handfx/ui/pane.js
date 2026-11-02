@@ -44,6 +44,8 @@ export async function render(container, ctx) {
     streaming: false,
     streamError: null,
     camera: 'off', // off | asking | on | denied | held | error | insecure
+    cameraLabel: '', // the label of the camera this pane actually opened
+    cameraFrom: null, // why the opened camera is not the WebcamSwitcher one; null when it is
     devices: 'idle', // idle | listing | denied | error
     page: null, // last honest status line from the overlay
     live: new Map(), // effect id -> {startedAt, hands, gesture} (from the overlay's reports)
@@ -131,6 +133,21 @@ export async function render(container, ctx) {
     if (root.isConnected) render();
   }
 
+  // The WebcamSwitcher virtual camera is found by name. Its driver hands out a new device id on
+  // every start, so a stored id goes stale and the pane would open whatever the browser picked
+  // without saying so. A labelled match wins; failing that the saved device, then the first video
+  // device — and the note names the substitute, so the swap is never silent.
+  const SWITCHER = 'webcamswitcher';
+
+  function pickCamera() {
+    const list = s.deviceList || [];
+    const named = list.find((d) => (d.label || '').toLowerCase().includes(SWITCHER));
+    if (named) return { id: named.deviceId, label: named.label || '' };
+    const want = s.settings.deviceId || '';
+    const chosen = (want && list.find((d) => d.deviceId === want)) || list[0] || null;
+    return { id: chosen ? chosen.deviceId : want, label: chosen ? chosen.label || '' : '' };
+  }
+
   async function startPreview(deviceId) {
     stopPreview();
     const insecure = secureText();
@@ -146,11 +163,22 @@ export async function render(container, ctx) {
     try {
       const res = s.settings.resolution || '720p';
       const size = { '480p': [640, 480], '720p': [1280, 720], '1080p': [1920, 1080] }[res] || [1280, 720];
+      // An explicit id (a click on the device list) is honoured as-is; otherwise the camera is
+      // resolved by label so the virtual camera survives its changing id.
+      const pick = deviceId ? { id: deviceId, label: '' } : pickCamera();
       const constraints = { video: { width: { ideal: size[0] }, height: { ideal: size[1] } }, audio: false };
-      const want = deviceId || s.settings.deviceId;
-      if (want) constraints.video.deviceId = { exact: want };
+      if (pick.id) constraints.video.deviceId = { exact: pick.id };
       stream = await navigator.mediaDevices.getUserMedia(constraints);
       s.camera = 'on';
+      // The track's own label is the truth about what opened, not the constraint we asked for.
+      const opened = ((stream.getVideoTracks()[0] || {}).label) || '';
+      s.cameraLabel = opened;
+      const hadSwitcher = (s.deviceList || []).some((d) => (d.label || '').toLowerCase().includes(SWITCHER));
+      s.cameraFrom = opened.toLowerCase().includes(SWITCHER) ? null
+        : hadSwitcher
+          ? `opened ${opened || 'an unlabelled camera'} by your click, not the WebcamSwitcher one`
+          : `WebcamSwitcher camera not found — using ${opened || pick.label || 'an unlabelled video device'}`;
+      if (s.cameraFrom) push(s.cameraFrom, 'warn');
       await listDevices();
     } catch (err) {
       s.camera = /NotAllowed|Security/i.test(err.name || '') ? 'denied' : /NotReadable|Abort/i.test(err.name || '') ? 'held' : 'error';
@@ -164,6 +192,8 @@ export async function render(container, ctx) {
     if (stream) for (const t of stream.getTracks()) t.stop();
     stream = null;
     if (s.camera !== 'held') s.camera = 'off';
+    s.cameraLabel = '';
+    s.cameraFrom = null;
     if (videoEl) {
       videoEl.srcObject = null;
       videoEl = null;
@@ -364,7 +394,12 @@ export async function render(container, ctx) {
     videoEl = cam;
 
     const note = el('div', { class: 'hfx-preview-note' });
-    if (s.camera === 'on') note.append(el('span', { class: 'hfx-note ok', text: 'camera live in this pane' }));
+    if (s.camera === 'on') {
+      note.append(el('span', { class: 'hfx-note ok', text: `camera live in this pane${s.cameraLabel ? ` — ${s.cameraLabel}` : ''}` }));
+      // Never a silent swap: when the WebcamSwitcher camera is not the one that opened, say which
+      // one did and why.
+      if (s.cameraFrom) note.append(el('span', { class: 'hfx-note warn', text: s.cameraFrom }));
+    }
     else if (s.camera === 'asking') note.append(el('span', { class: 'hfx-note', text: 'waiting for the permission prompt…' }));
     else if (s.camera === 'denied') note.append(el('span', { class: 'hfx-note bad', text: 'camera permission denied — allow it for this origin and try again' }));
     else if (s.camera === 'held') note.append(el('span', { class: 'hfx-note bad', text: 'camera held by another app or tab (the overlay, OBS, a call) — stop it there first' }));
@@ -381,6 +416,7 @@ export async function render(container, ctx) {
       actionButton({ label: s.synthetic ? 'Stop synthetic' : 'Synthetic', variant: 'btn btn-sm', run: async () => { s.synthetic = !s.synthetic; s.syntheticAt = performance.now(); synthMotion.push(null, performance.now()); }, onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
     );
     if (s.synthetic) note.append(el('span', { class: 'hfx-note ok', text: 'synthetic hands — drawn over the camera feed when it is live, on the dark backdrop when it is not' }));
+    if (s.settings.obsHandFx === false) note.append(el('span', { class: 'hfx-note', text: 'effects off for OBS — this preview draws none either, so it matches the source' }));
     card.append(head, stage, el('div', { class: 'panel-body hfx-preview-body' }, note));
 
     // After the DOM is in place: attach the live stream and start the landmark loop.
@@ -405,6 +441,9 @@ export async function render(container, ctx) {
     const body = el('div', { class: 'panel-body hfx-fields' });
     body.append(
       row('effects enabled', switchControl('enabled', s.settings.enabled !== false, async (v) => { await patch('enabled', v); if (v) await bus('tracking.toggle').catch(() => {}); })),
+      // The source (the overlay page) and this preview read the same flag, so the operator can
+      // never tune effects that the OBS source is not drawing.
+      row('effects in OBS', switchControl('obsHandFx', s.settings.obsHandFx !== false, async (v) => patch('obsHandFx', v))),
       row('mirror', switchControl('mirror', s.settings.mirror !== false, async (v) => patch('mirror', v))),
       row('debug overlay', switchControl('debugOverlay', s.settings.debugOverlay === true, async (v) => patch('debugOverlay', v))),
       row('sensitivity', sliderControl('sensitivity', s.settings.sensitivity ?? 1, 0.4, 2, 0.05, (v) => patch('sensitivity', v))),
@@ -413,6 +452,9 @@ export async function render(container, ctx) {
       row('resolution', selectControl('resolution', s.settings.resolution || '720p', (s.status?.settings?.resolution?.values) || ['480p', '720p', '1080p'], (v) => patch('resolution', v))),
     );
     card.append(body);
+    if (s.settings.obsHandFx === false) {
+      card.append(el('p', { class: 'hfx-help hfx-note warn', text: 'Effects are off for OBS: the overlay page still tracks hands and reports gestures, but it draws no effects — and neither does this preview.' }));
+    }
     return card;
   }
 
@@ -468,6 +510,12 @@ export async function render(container, ctx) {
         actionButton({ label: 'Refresh list', variant: 'btn btn-sm', run: listDevices, onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
         actionButton({ label: 'Clear device', variant: 'btn btn-quiet btn-sm', run: () => patch('deviceId', ''), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
       ),
+      el('div', { class: 'hfx-row' }, el('span', { class: 'hfx-label', text: 'publish' }), selectControl('publish', s.settings.publish || 'off', (s.status?.settings?.publish?.values) || ['off', 'raw', 'effects'], (v) => patch('publish', v))),
+      // Honest about reach: the value is stored, but the second camera output it names does not
+      // exist yet, so nothing is published and the OBS source is unchanged. Say so where it is set.
+      (s.settings.publish && s.settings.publish !== 'off')
+        ? el('p', { class: 'hfx-help hfx-note warn', text: `publish ${s.settings.publish}: saved, but a second camera is not built — nothing is published, and the OBS source still shows the overlay page's own picture. This value changes nothing yet.` })
+        : el('p', { class: 'hfx-help', text: 'publish off: no second camera is published; the OBS source uses the overlay page, as before.' }),
       el('p', { class: 'hfx-help', text: 'The camera opens only on Start preview (or the overlay’s own Start). One document holds the camera at a time; the overlay holds it while it is tracking.' }),
     );
     card.append(body);
@@ -690,6 +738,13 @@ export async function render(container, ctx) {
   function startFx() {
     cancelAnimationFrame(fxRaf);
     if (!fxCanvas || !fxCanvas.isConnected) return;
+    // One flag decides both: when the OBS source draws no effects, the preview draws none either,
+    // so the operator tunes what the stream actually shows.
+    if (s.settings.obsHandFx === false) {
+      fxCanvas.style.display = 'none';
+      return;
+    }
+    fxCanvas.style.display = '';
     if (!fxr) {
       fxr = new FxRenderer(fxCanvas, { onError: (msg) => push(`preview effects: ${msg}`, 'bad') });
       if (!fxr.init()) {

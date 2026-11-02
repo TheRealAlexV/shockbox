@@ -106,7 +106,7 @@ function applySettings(status) {
     bufferScroll: s.bufferScroll ?? 0.35,
     mirror: s.mirror !== false,
     debugOverlay: s.debugOverlay === true,
-    enabled: s.enabled !== false,
+    enabled: s.enabled !== false && s.obsHandFx !== false,
   });
   if (s.debugOverlay && !debugCanvas) {
     debugCanvas = document.createElement('canvas');
@@ -566,7 +566,7 @@ function loop(now) {
     bodyTickAt = now;
     tickBody();
   }
-  if (state.settings && state.settings.enabled !== false) {
+  if (state.settings && state.settings.enabled !== false && state.settings.obsHandFx !== false) {
     // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
     // sees something and the channel is up), each enabled body effect stays alive, so a mask that
     // goes quiet releases them through the expiry above.

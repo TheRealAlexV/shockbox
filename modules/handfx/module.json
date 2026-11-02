@@ -31,6 +31,21 @@
       "label": "Mirror the picture (selfie view — the default for a camera pointed at the operator)",
       "group": "general"
     },
+    "obsHandFx": {
+      "type": "boolean",
+      "default": true,
+      "label": "Draw effects in the OBS source (the pane preview follows the same flag)",
+      "help": "Off: the overlay page still tracks hands and reports gestures, but draws no effects, and the pane preview draws none either. Read by the overlay's frame loop and by the pane.",
+      "group": "general"
+    },
+    "publish": {
+      "type": "enum",
+      "default": "off",
+      "values": ["off", "raw", "effects"],
+      "label": "Publish a second camera: off | raw | effects",
+      "help": "Stored, but not built yet: no second camera is published and the OBS source still receives the overlay page's own picture, so raw and effects change nothing today. 'off' is what actually happens.",
+      "group": "general"
+    },
     "sensitivity": {
       "type": "number",
       "default": 1,

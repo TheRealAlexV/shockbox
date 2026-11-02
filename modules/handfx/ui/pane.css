@@ -132,6 +132,7 @@
 .hfx-note { font-size: 10.5px; line-height: 1.45; color: var(--fg-3); }
 .hfx-note.ok { color: var(--ok); }
 .hfx-note.bad { color: var(--bad); }
+.hfx-note.warn { color: var(--warn); }
 
 /* ------------------------------------------------------------------ side cards */
 
