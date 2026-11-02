@@ -345,6 +345,89 @@ export function createPool({ file, log, onChange = null }) {
     return tabIds().includes(id);
   }
 
+  function slugFor(label) {
+    const base = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'pool';
+    const taken = new Set([...VIRTUAL_POOLS.map((p) => p.id), ...pools.map((p) => p.id)]);
+    if (!taken.has(base)) return base;
+    for (let n = 2; n < 1000; n += 1) {
+      if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+    }
+    return `${base}-${Date.now()}`;
+  }
+
+  function copyPool(p) {
+    return { ...p, tags: p.tags.slice() };
+  }
+
+  function holdsMessages(id) {
+    return messages.some((m) => m.poolId === id);
+  }
+
+  /** Create: the id is a slug of the label and never changes after this. */
+  function createPoolRecord(body) {
+    load();
+    const r = body && typeof body === 'object' ? body : {};
+    const label = typeof r.label === 'string' ? r.label.trim() : '';
+    if (!label) return { status: 400, error: 'label is required' };
+    if (label.length > 60) return { status: 400, error: 'label must be at most 60 characters' };
+    if (!KINDS.includes(r.kind)) return { status: 400, error: `kind must be one of ${KINDS.join(', ')}` };
+    const parsed = parseTags(r.tags);
+    if (parsed.error) return { status: 400, error: parsed.error };
+    const rec = { id: slugFor(label), label, kind: r.kind, tags: parsed.tags };
+    pools.push(rec);
+    return { pool: copyPool(rec) };
+  }
+
+  /** Rename/retag: `id` stays put; `kind` only moves while the pool is empty. */
+  function updatePoolRecord(id, body) {
+    load();
+    const rec = pools.find((p) => p.id === id);
+    if (!rec) return { status: 404, error: `unknown pool ${id}` };
+    const r = body && typeof body === 'object' ? body : {};
+    if (r.label !== undefined) {
+      const label = typeof r.label === 'string' ? r.label.trim() : '';
+      if (!label) return { status: 400, error: 'label must be a non-empty string' };
+      if (label.length > 60) return { status: 400, error: 'label must be at most 60 characters' };
+      rec.label = label;
+    }
+    if (r.kind !== undefined) {
+      if (!KINDS.includes(r.kind)) return { status: 400, error: `kind must be one of ${KINDS.join(', ')}` };
+      if (r.kind !== rec.kind) {
+        if (holdsMessages(rec.id)) return { status: 409, error: `pool ${id} holds messages; kind cannot change` };
+        rec.kind = r.kind;
+      }
+    }
+    if (r.tags !== undefined) {
+      const parsed = parseTags(r.tags);
+      if (parsed.error) return { status: 400, error: parsed.error };
+      rec.tags = parsed.tags;
+    }
+    return { pool: copyPool(rec) };
+  }
+
+  /** Delete: messages fall back to another pool of their kind, or the delete is refused. */
+  function deletePoolRecord(id) {
+    load();
+    if (VIRTUAL_POOLS.some((p) => p.id === id)) return { status: 400, error: `${id} is a view, not a pool` };
+    const index = pools.findIndex((p) => p.id === id);
+    if (index < 0) return { status: 404, error: `unknown pool ${id}` };
+    const rec = pools[index];
+    const held = messages.filter((m) => m.poolId === rec.id);
+    // Fall back to the seeded pool for that kind (e.g. a custom dialog pool drains into
+    // `dialogs`), else any other pool of the same kind.
+    const seedId = (SEED_POOLS.find((s) => s.kind === rec.kind) || {}).id;
+    const fallback =
+      (seedId && seedId !== rec.id ? pools.find((p) => p.id === seedId) : null) ||
+      pools.find((p) => p.id !== rec.id && rec.kind && p.kind === rec.kind) ||
+      null;
+    if (held.length && !fallback) {
+      return { status: 409, error: `pool ${id} is the only ${rec.kind || 'kindless'} pool and holds ${held.length} message(s)` };
+    }
+    if (held.length) for (const m of held) m.poolId = fallback.id;
+    pools.splice(index, 1);
+    return { moved: held.length, to: fallback ? fallback.id : null };
+  }
+
   function eligible(kind, flag) {
     return all().filter((m) => (!kind || m.kind === kind) && (flag ? m[flag] === true : true));
   }
@@ -370,6 +453,7 @@ export function createPool({ file, log, onChange = null }) {
     const at = messages.findIndex((m) => m.id === id);
     if (at === -1) return { error: `unknown message ${id}` };
     const [rec] = messages.splice(at, 1);
+    const dest = pools.find((p) => p.id === to) || null;
     let insert;
     if (to === 'random') {
       rec.random = true;
@@ -378,13 +462,18 @@ export function createPool({ file, log, onChange = null }) {
     } else if (to === 'dialogs') {
       rec.kind = 'dialog';
       insert = clamp(Number.isInteger(index) ? index : messages.length, 0, messages.length);
+    } else if (dest) {
+      // A stored pool owns its kind, so landing in it is what sets the record's kind.
+      rec.kind = dest.kind || rec.kind;
+      rec.random = false;
+      insert = clamp(Number.isInteger(index) ? index : messages.length, 0, messages.length);
     } else {
       rec.kind = 'notification';
       rec.random = false;
       insert = clamp(Number.isInteger(index) ? index : messages.length, 0, messages.length);
     }
     messages.splice(insert, 0, rec);
-    rec.poolId = poolIdForKind(rec.kind);
+    rec.poolId = dest ? dest.id : poolIdForKind(rec.kind);
     return { to, index: insert, kind: rec.kind, random: rec.random === true, storm: rec.storm === true };
   }
 
@@ -459,10 +548,14 @@ export function createPool({ file, log, onChange = null }) {
     const randomOnly = /^(1|true|yes)$/i.test(query.random || '');
     const stormOnly = /^(1|true|yes)$/i.test(query.storm || '');
     const list = all().filter((m) => {
-      if (poolId === 'dialogs' && m.kind !== 'dialog') return false;
-      if (poolId === 'notifications' && m.kind !== 'notification') return false;
-      if (poolId === 'wall' && m.kind !== 'wall') return false;
-      if (poolId === 'random' && m.random !== true) return false;
+      if (poolId === 'random') {
+        if (m.random !== true) return false;
+      } else if (poolId !== 'all') {
+        // A stored pool owns the records pointing at it; the kind match keeps pre-migration
+        // records (no `poolId`) visible.
+        if (!poolRec) return false;
+        if (m.poolId !== poolRec.id && !(poolRec.kind && m.kind === poolRec.kind && !m.poolId)) return false;
+      }
       if (randomOnly && m.random !== true) return false;
       if (stormOnly && m.storm !== true) return false;
       if (typeFilter && m.type.toLowerCase() !== typeFilter) return false;
@@ -471,19 +564,19 @@ export function createPool({ file, log, onChange = null }) {
       return true;
     });
     const { types, tags } = typesAndTags();
+    const every = all();
+    const counts = { all: every.length };
+    for (const p of pools) {
+      counts[p.id] = every.filter((m) => m.poolId === p.id || (!m.poolId && p.kind && p.kind === m.kind)).length;
+    }
+    counts.random = every.filter((m) => m.random === true).length;
+    counts.storm = every.filter((m) => m.storm === true).length;
     return {
       id: poolId,
       name: poolRec ? poolRec.label : POOL_NAMES[poolId] || poolId,
       types,
       tags,
-      counts: {
-        all: all().length,
-        dialogs: all().filter((m) => m.kind === 'dialog').length,
-        notifications: all().filter((m) => m.kind === 'notification').length,
-        wall: all().filter((m) => m.kind === 'wall').length,
-        random: all().filter((m) => m.random === true).length,
-        storm: all().filter((m) => m.storm === true).length,
-      },
+      counts,
       messages: list.map((m) => ({ ...m, tags: m.tags.slice(), buttons: m.buttons.map((b) => ({ ...b })) })),
     };
   }
@@ -525,6 +618,9 @@ export function createPool({ file, log, onChange = null }) {
     poolRecord,
     tabIds,
     knowsPool,
+    createPoolRecord,
+    updatePoolRecord,
+    deletePoolRecord,
     eligible,
     add,
     remove,
@@ -570,6 +666,41 @@ export function poolRoutes({ pool, events, log = pool.log }) {
         pool.commit('replace');
         broadcast();
         return { ok: true, count: r.count };
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/pools',
+      handler(req, res, url, body) {
+        const r = pool.createPoolRecord(body);
+        if (r.status) throw new HttpError(r.status, r.error);
+        pool.commit('pools');
+        broadcast();
+        return { ok: true, pool: r.pool };
+      },
+    },
+    {
+      method: 'PATCH',
+      path: /^\/api\/pools\/([^/]+)$/,
+      handler(req, res, url, body, params) {
+        const id = decodeURIComponent(params[0]);
+        const r = pool.updatePoolRecord(id, body);
+        if (r.status) throw new HttpError(r.status, r.error);
+        pool.commit('pools');
+        broadcast();
+        return { ok: true, pool: r.pool };
+      },
+    },
+    {
+      method: 'DELETE',
+      path: /^\/api\/pools\/([^/]+)$/,
+      handler(req, res, url, body, params) {
+        const id = decodeURIComponent(params[0]);
+        const r = pool.deletePoolRecord(id);
+        if (r.status) throw new HttpError(r.status, r.error);
+        pool.commit('pools');
+        broadcast();
+        return { ok: true, moved: r.moved };
       },
     },
     {
