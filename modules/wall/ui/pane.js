@@ -191,11 +191,42 @@ export async function render(container, ctx) {
 
   /* ------------------------------------------------------------ structure */
 
+  /* ------------------------------------------------------------- apply gate */
+  // Every write path funnels through patchSettings() and cmd(). Auto Apply off makes those two
+  // collect instead of send (settings in pendingPatch, page commands in pendingCmds); one Apply
+  // flushes both and re-reads the wall. The pane has no prefs store, so localStorage remembers it.
+  const AUTO_KEY = 'wall.autoApply';
+  let autoApply = true;
+  try {
+    const saved = localStorage.getItem(AUTO_KEY);
+    if (saved !== null) autoApply = saved === '1';
+  } catch { /* storage can be denied: keep the live default */ }
+
+  const pendingPatch = Object.create(null);
+  const pendingCmds = [];
+  let applying = false;
+
+  const autoApplyBox = el('input', { type: 'checkbox', id: 'wall-auto-apply' });
+  autoApplyBox.checked = autoApply;
+  const applyBtn = el('button', {
+    type: 'button', class: 'btn btn-sm', text: 'Apply',
+    title: 'Send the collected settings and commands, then re-read the wall',
+  });
+  applyBtn.disabled = autoApply;
+  const applyGate = el('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
+    el('label', { class: 'switch-inline', for: 'wall-auto-apply', title: 'On: every change applies at once. Off: collect edits and send them with Apply.' },
+      autoApplyBox, el('span', { text: 'Auto Apply' })),
+    applyBtn,
+  );
+
   const header = el('div', { class: 'pane-head' });
   const headStatus = el('div', { class: 'pane-head-status' });
   header.append(
     el('div', { class: 'pane-title-wrap' },
-      el('h1', { class: 'pane-title', text: 'LED wall control' }),
+      el('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' } },
+        el('h1', { class: 'pane-title', text: 'LED wall control' }),
+        applyGate,
+      ),
       el('p', { class: 'pane-desc', text: 'Drag the 9:16 window on the preview, or pick a look. Everything here is the live document the OBS page follows.' }),
     ),
     headStatus,
@@ -625,8 +656,8 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   textToggle.addEventListener('click', async () => {
     textToggle.disabled = true;
     try {
-      await api.post('/api/wall/cmd', { cmd: 'text.enabled', args: { on: !textOn } });
-      textOn = !textOn;
+      const out = await cmd('text.enabled', { on: !textOn });
+      if (out) textOn = !textOn;
       paintTextToggle();
     } catch (err) {
       toast(`text layer: ${err.message}`, 'error');
@@ -634,8 +665,8 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       textToggle.disabled = false;
     }
   });
-  const textClearBtn = actionButton({ label: 'Clear', variant: '', run: () => api.post('/api/wall/cmd', { cmd: 'text.clear' }), onError: (e) => toast(`clear: ${e.message}`, 'error') });
-  const textRevealBtn = actionButton({ label: 'Reveal', variant: '', run: () => api.post('/api/wall/cmd', { cmd: 'text.reveal' }), onError: (e) => toast(`reveal: ${e.message}`, 'error') });
+  const textClearBtn = actionButton({ label: 'Clear', variant: '', run: () => cmd('text.clear'), onError: (e) => toast(`clear: ${e.message}`, 'error') });
+  const textRevealBtn = actionButton({ label: 'Reveal', variant: '', run: () => cmd('text.reveal'), onError: (e) => toast(`reveal: ${e.message}`, 'error') });
 
   const textPanel = el('section', { class: 'panel wall-text-panel' },
     el('div', { class: 'panel-head' },
@@ -1118,10 +1149,8 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     poolId: 'wall',
     kinds: ['wall'],
     placeholder: 'Message to the wall — text, or pick from the pool…',
-    onSend: (p) => api.post('/api/wall/cmd', {
-      cmd: 'text.send',
-      args: p.text ? { text: p.text, ...(p.title ? { title: p.title } : {}) } : { poolId: p.poolId },
-    }),
+    onSend: (p) => cmd('text.send',
+      p.text ? { text: p.text, ...(p.title ? { title: p.title } : {}) } : { poolId: p.poolId }),
     onSchedule: (p) => api.post('/api/schedules', {
       module: 'wall',
       at: p.at,
@@ -1223,6 +1252,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       // only an explicit '16:9' should put the pane into whole-wall mode
       if (s.ratio === '9:16' || s.ratio === '16:9') ratioSelection = s.ratio;
     }
+    paintQueued();
     paintAll();
   }
 
@@ -1690,6 +1720,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   let pushQueued = false;
 
   function pushFenceLive() {
+    if (!autoApply) return; // off: the drag is local until Apply
     if (!fencePx) return;
     pushQueued = true;
     if (pushTimer) return;
@@ -1759,6 +1790,14 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
 
   async function commitFence(rect) {
     if (signal.aborted) return;
+    if (!autoApply) {
+      fencePx = { ...rect };
+      Object.assign(pendingPatch, { fence: rect });
+      paintFenceFields();
+      paintPreview();
+      paintPending();
+      return { ok: true, queued: true };
+    }
     previewPanel.dataset.busy = 'true';
     try {
       // Commit through the fence route: a drag preview never persisted, so this is what makes
@@ -1795,9 +1834,123 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     }
   }
 
+  /* ------------------------------------------------------- apply gate writes */
+
+  function pendingCount() {
+    return Object.keys(pendingPatch).length + pendingCmds.length + (form?.pendingCount?.() || 0);
+  }
+
+  function paintPending() {
+    const n = pendingCount();
+    applyBtn.textContent = n ? `Apply (${n})` : 'Apply';
+    applyBtn.disabled = autoApply || applying;
+  }
+
+  /** Show collected edits on the pane the way a server answer would, so nothing snaps back. */
+  function mirrorQueuedPatch(patch) {
+    if (!patch) return;
+    const nextLook = { ...look };
+    for (const [k, v] of Object.entries(patch)) {
+      if (k === 'fence' || k === 'ratio') continue;
+      nextLook[k] = v;
+    }
+    look = nextLook;
+    if ('fence' in patch) fencePx = patch.fence ? { ...patch.fence } : null;
+    if ('ratio' in patch) ratioSelection = patch.ratio === '9:16' ? '9:16' : '16:9';
+    if (settingsMeta) {
+      const next = { ...settingsMeta };
+      for (const [k, v] of Object.entries(patch)) {
+        if (next[k]) next[k] = { ...next[k], value: v };
+      }
+      settingsMeta = next;
+    }
+  }
+
+  /** Re-assert the queued view after a poll replaced `look` with the server's document. */
+  function paintQueued() {
+    if (autoApply) return;
+    if (Object.keys(pendingPatch).length) mirrorQueuedPatch(pendingPatch);
+    for (const c of pendingCmds) {
+      if (c.name === 'blackout.on') look = { ...look, blackout: 1 };
+      else if (c.name === 'blackout.off') look = { ...look, blackout: 0 };
+      else if (c.name === 'look.palette' && c.args?.name) synth = { ...synth, palette: c.args.name };
+      else if (c.name === 'look.pattern' && c.args?.name) synth = { ...synth, pattern: c.args.name };
+      else if (c.name === 'preset.set' && c.args?.name) synth = { ...synth, preset: c.args.name };
+      else if (c.name === 'ratio.force16x9') ratioSelection = '16:9';
+      else if (c.name === 'ratio.toggle' && ratioSelection) ratioSelection = ratioSelection === '9:16' ? '16:9' : '9:16';
+    }
+  }
+
+  function queuePatch(patch, optimistic) {
+    Object.assign(pendingPatch, patch);
+    mirrorQueuedPatch(patch);
+    if (optimistic) optimistic({ ok: true, queued: true });
+    paintAll();
+    paintPending();
+    return { ok: true, queued: true, settings: null };
+  }
+
+  function queueCmd(name, args) {
+    pendingCmds.push({ name, args });
+    paintQueued();
+    paintAll();
+    paintPending();
+    const out = { ok: true, queued: true };
+    if (name.startsWith('ratio.')) out.ratio = ratioSelection;
+    if (name === 'preset.save' && args) out.preset = args.name;
+    return out;
+  }
+
+  function setAutoApply(on) {
+    autoApply = !!on;
+    autoApplyBox.checked = autoApply;
+    try { localStorage.setItem(AUTO_KEY, autoApply ? '1' : '0'); } catch { /* not fatal */ }
+    form?.setManual?.(!autoApply);
+    paintPending();
+  }
+
+  async function applyPending() {
+    if (applying || signal.aborted) return;
+    applying = true;
+    paintPending();
+    try {
+      const formPatch = form?.takePending?.() || {};
+      const patch = { ...pendingPatch, ...formPatch };
+      if (Object.keys(patch).length) {
+        const out = await patchSettings(patch, { force: true });
+        if (!out) {
+          // the request failed or was refused; keep it for the next Apply (the toast said why)
+          Object.assign(pendingPatch, patch);
+          return;
+        }
+        for (const k of Object.keys(pendingPatch)) delete pendingPatch[k];
+        form?.markSaved?.(out.settings || null);
+      }
+      while (pendingCmds.length) {
+        const c = pendingCmds[0];
+        const out = await cmd(c.name, c.args, { force: true });
+        if (out === null) break; // failed: leave it queued
+        pendingCmds.shift();
+      }
+      await pull();
+    } finally {
+      applying = false;
+      paintPending();
+    }
+  }
+
+  autoApplyBox.addEventListener('change', () => {
+    const on = autoApplyBox.checked;
+    setAutoApply(on);
+    // turning the gate back on must not strand what was collected while it was off
+    if (on) void applyPending();
+  });
+  applyBtn.addEventListener('click', () => { void applyPending(); });
+
   /** One settings key through PATCH (which also broadcasts). Honest on failure. */
-  async function patchSettings(patch, { optimistic = null } = {}) {
+  async function patchSettings(patch, { optimistic = null, force = false } = {}) {
     if (signal.aborted) return null;
+    if (!autoApply && !force) return queuePatch(patch, optimistic);
     try {
       const out = await api.patch('/api/wall/settings', patch);
       if (out && out.settings) settingsMeta = out.settings;
@@ -1820,8 +1973,9 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     }
   }
 
-  async function cmd(name, args = undefined) {
+  async function cmd(name, args = undefined, { force = false } = {}) {
     if (signal.aborted) return null;
+    if (!autoApply && !force) return queueCmd(name, args);
     try {
       const out = await api.post('/api/wall/cmd', args ? { cmd: name, args } : { cmd: name });
       // A dispatcher answer of ok:false is a refusal, not a delivery: show its own words.
@@ -1934,6 +2088,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       settings: shown,
       title: 'Look',
       signal,
+      externalGate: true,
       onSave: async (patch) => {
         const out = await api.patch('/api/wall/settings', patch);
         if (out && out.settings) {
@@ -1959,6 +2114,8 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     // one heading: the group is renamed, its settings row is not repeated
     form?.renameGroup?.('general', 'Look');
     form?.omitGroupRow?.('general');
+    form?.setManual?.(!autoApply);
+    paintPending();
   }
 
   /* ---------------------------------------------------------------- live */

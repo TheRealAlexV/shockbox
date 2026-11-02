@@ -52,23 +52,50 @@ export function renderSettingsForm(container, opts) {
   const head = el('div', { class: 'settings-head' });
   const autoToggle = el('label', { class: 'switch-inline', title: 'Apply changes immediately, or collect them and press Save' });
   const autoBox = el('input', { type: 'checkbox', checked: true });
-  autoBox.addEventListener('change', () => {
-    manual = !autoBox.checked;
+  // A host pane can own the gate instead: its header decides manual mode and sends the collected
+  // patch, so this form shows neither a second toggle nor a second Save button.
+  const externalGate = !!opts.externalGate;
+  function setManual(on) {
+    manual = !!on;
+    autoBox.checked = !manual;
     form.dataset.manual = manual ? 'true' : 'false';
-    if (manual) head.appendChild(saveBtn);
+    if (manual && !externalGate) head.appendChild(saveBtn);
     else saveBtn.remove();
-  });
+  }
+  autoBox.addEventListener('change', () => setManual(!autoBox.checked));
   autoToggle.append(autoBox, el('span', { text: 'apply immediately' }));
 
   let pendingPatch = {};
+
+  /** The collected patch, handed to a host that owns Apply. */
+  function takePending() {
+    const patch = pendingPatch;
+    pendingPatch = {};
+    return patch;
+  }
+  function pendingCount() {
+    return Object.keys(pendingPatch).length;
+  }
+  /** A host that sent the patch itself tells the form what the server took. */
+  function markSaved(settings) {
+    if (settings) applyValues(settings);
+    for (const r of rowsByKey.values()) delete r.dataset.dirty;
+  }
+  async function flush() {
+    const patch = takePending();
+    if (!Object.keys(patch).length) return null;
+    try {
+      return await opts.onSave(patch);
+    } catch (err) {
+      pendingPatch = { ...patch, ...pendingPatch };
+      throw err;
+    }
+  }
+
   const saveBtn = actionButton({
     label: 'Save',
     variant: 'btn-primary',
-    run: async () => {
-      const patch = pendingPatch;
-      pendingPatch = {};
-      return opts.onSave(patch);
-    },
+    run: flush,
     onDone: (out) => {
       if (out && out.settings) applyValues(out.settings);
       for (const r of rowsByKey.values()) delete r.dataset.dirty;
@@ -80,8 +107,8 @@ export function renderSettingsForm(container, opts) {
   head.append(
     el('span', { class: 'settings-title', text: opts.title || 'Settings' }),
     el('span', { class: 'settings-spacer' }),
-    autoToggle,
   );
+  if (!externalGate) head.append(autoToggle);
 
   const groups = new Map();
   for (const [key, meta] of Object.entries(current)) {
@@ -332,9 +359,19 @@ export function renderSettingsForm(container, opts) {
     refresh(settings) {
       current = { ...(settings || {}) };
       for (const [key, meta] of Object.entries(current)) {
-        rowsByKey.get(key)?._setValue(meta.value);
+        // A field the operator changed but has not applied stays on screen: the poll must not
+        // revert a collected edit before the Apply that sends it.
+        if (key in pendingPatch) continue;
+        const row = rowsByKey.get(key);
+        if (row && row.dataset.dirty) continue;
+        row?._setValue(meta.value);
       }
     },
+    setManual,
+    takePending,
+    pendingCount,
+    markSaved,
+    flush,
     /** Hide rows the host draws itself (a module can own a key's control and keep the schema row out). */
     omitRows(predicate) {
       skip = typeof predicate === 'function' ? predicate : () => false;
