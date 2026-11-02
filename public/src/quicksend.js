@@ -53,7 +53,10 @@ export function mountQuickSend(container, opts) {
   let selected = null;
   let query = '';
   let activeTags = new Set();
-  let includeOtherPools = false;
+  // The pool the list reads from. `all` is the virtual view over every record; a stored pool id
+  // narrows it server-side, so the filter below never has to guess at a message's pool.
+  let activePool = 'all';
+  const NEW_POOL = '__new';
 
   const kinds = opts.kinds || ['wall'];
   const allowEmpty = opts.allowEmpty === true;
@@ -71,10 +74,12 @@ export function mountQuickSend(container, opts) {
   const tagBar = el('div', { class: 'qs-tags', role: 'group', 'aria-label': 'Filter by tag' });
   const list = el('div', { class: 'qs-list', role: 'listbox', 'aria-label': `${opts.title} messages` });
   const count = el('span', { class: 'panel-hint dim mono' });
-  const otherToggle = el('label', { class: 'qs-save', title: 'Also search the other message pools' });
-  const otherBox = el('input', { type: 'checkbox' });
-  otherToggle.append(otherBox, el('span', { text: 'all pools' }));
-  otherToggle.hidden = true;
+  const poolSelect = el('select', {
+    class: 'qs-search qs-pool-select',
+    style: { flex: '0 1 auto', maxWidth: '48%' },
+    'aria-label': `Pool to read ${opts.title} messages from`,
+    title: 'Pool to read messages from',
+  });
 
   /* ------------------------------------------------------------ composer */
 
@@ -122,7 +127,7 @@ export function mountQuickSend(container, opts) {
 
   body.append(
     el('div', { class: 'qs-pool' },
-      el('div', { class: 'qs-pool-head' }, search, otherToggle),
+      el('div', { class: 'qs-pool-head' }, search, poolSelect),
       tagBar,
       list,
     ),
@@ -181,12 +186,6 @@ export function mountQuickSend(container, opts) {
   }
 
   function matches(m) {
-    if (!includeOtherPools && opts.poolId) {
-      const pool = m.pool || m.kind;
-      if (pool !== opts.poolId) return false;
-    } else if (!includeOtherPools && !opts.poolId) {
-      if (!kinds.includes(m.kind)) return false;
-    }
     if (activeTags.size) {
       const tags = new Set(m.tags || []);
       for (const t of activeTags) if (!tags.has(t)) return false;
@@ -243,9 +242,39 @@ export function mountQuickSend(container, opts) {
     query = search.value.trim();
     paintList();
   });
-  otherBox.addEventListener('change', () => {
-    includeOtherPools = otherBox.checked;
-    paintList();
+  function paintPools(pools) {
+    const rows = Array.isArray(pools) && pools.length ? pools.slice() : [{ id: 'all', name: 'All messages' }];
+    rows.sort((a, b) => (b.id === 'all' ? 1 : 0) - (a.id === 'all' ? 1 : 0));
+    clear(poolSelect);
+    for (const p of rows) poolSelect.append(el('option', { value: p.id, text: p.name || p.label || p.id }));
+    poolSelect.append(el('option', { value: NEW_POOL, text: '＋ New pool…' }));
+    if (!rows.some((p) => p.id === activePool)) activePool = 'all';
+    poolSelect.value = activePool;
+  }
+
+  poolSelect.addEventListener('change', () => {
+    const id = poolSelect.value;
+    if (id !== NEW_POOL) {
+      activePool = id;
+      refresh().catch((err) => toast(`pool failed to load: ${err.message}`, 'error'));
+      return;
+    }
+    const label = (window.prompt('Name the new pool') || '').trim();
+    if (!label) {
+      poolSelect.value = activePool;
+      return;
+    }
+    // The pool takes the kind of the message on screen, so its records are grouped where they belong.
+    const kind = (selected && selected.kind) || 'dialog';
+    opts.api.post('/api/pools', { label, kind })
+      .then((res) => {
+        activePool = (res && res.pool && res.pool.id) || 'all';
+        return refresh();
+      })
+      .catch((err) => {
+        toast(`could not create the pool: ${err.message}`, 'error');
+        poolSelect.value = activePool;
+      });
   });
 
   /* ------------------------------------------------------------ sending */
@@ -349,21 +378,10 @@ export function mountQuickSend(container, opts) {
 
   async function refresh() {
     const r = await opts.api.get('/api/pools');
-    // the pooled view endpoint returns counts plus the messages for the requested pool; fall back
-    // to the module's own pool when the combined route is not carrying bodies
-    // `/api/pools` gives counts only; the box needs the bodies, so it reads its own pool and
-    // only reaches for every pool when the operator turns "all pools" on.
-    const want = includeOtherPools ? 'all' : (opts.poolId || (opts.kinds && opts.kinds[0]) || 'all');
-    const one = await opts.api.get(`/api/pool/${encodeURIComponent(want)}`);
-    if (want !== 'all' && one && Array.isArray(one.messages)) {
-      // views are flat message lists, so the pool name comes from `kind` (dialog ⇒ dialogs)
-      messages = one.messages.map((m) => ({ ...m, pool: opts.poolId || m.kind }));
-    } else if (one && Array.isArray(one.messages)) {
-      messages = one.messages.map((m) => ({ ...m, pool: m.kind === 'wall' ? 'wall' : `${m.kind}s` }));
-    } else {
-      messages = [];
-    }
-    otherToggle.hidden = !opts.poolId || !(r && r.counts && Object.keys(r.counts).length > 1);
+    paintPools(Array.isArray(r) ? r : r && r.pools);
+    // `/api/pools` carries counts only; the pool view carries the message bodies.
+    const one = await opts.api.get(`/api/pool/${encodeURIComponent(activePool)}`);
+    messages = one && Array.isArray(one.messages) ? one.messages : [];
     paintTags();
     paintList();
   }
