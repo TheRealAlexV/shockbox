@@ -13,6 +13,37 @@ import { DEFAULT_NOTIFY_TONE } from './sound.mjs';
 // Everything about messages (ids, text, tags, eligibility) belongs to core/pool.mjs, which the
 // alerts module reads too. That is the whole split: this module never stores a message.
 
+// Which messages a random toast may spawn from is a per-module setting, not a per-message
+// flag: `randomConfig: { poolIds, tags, messageIds }` selects by any of the three, and an
+// empty config means "every notification message in this module's pools" — what "nothing
+// flagged" used to select. The legacy `random` boolean is still readable in the pool and
+// deliberately ignored here.
+const SELECTORS = ['poolIds', 'tags', 'messageIds'];
+
+function idList(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim());
+}
+
+function normalizeConfig(raw) {
+  const cfg = raw && typeof raw === 'object' ? raw : {};
+  const out = {};
+  for (const key of SELECTORS) out[key] = idList(cfg[key]);
+  return out;
+}
+
+/** Every message matching at least one configured selector; an all-empty config matches all. */
+export function matchingMessages(records, raw) {
+  const cfg = normalizeConfig(raw);
+  const pools = new Set(cfg.poolIds);
+  const tags = new Set(cfg.tags);
+  const ids = new Set(cfg.messageIds);
+  if (!pools.size && !tags.size && !ids.size) return records.slice();
+  return records.filter((m) => pools.has(m.poolId)
+    || ids.has(m.id)
+    || (Array.isArray(m.tags) && m.tags.some((t) => tags.has(t))));
+}
+
 export default {
   id: 'notifications',
 
@@ -78,8 +109,12 @@ export default {
     return snap;
   },
 
+  randomConfig() {
+    return normalizeConfig(this.settings.get('randomConfig'));
+  },
+
   pickEligible() {
-    const list = this.pool.eligible('notification', 'random');
+    const list = matchingMessages(this.pool.eligible('notification'), this.randomConfig());
     if (!list.length) return null;
     return list[Math.floor(Math.random() * list.length)];
   },
@@ -117,7 +152,7 @@ export default {
             }
             if (!spec) {
               spec = mod.pickEligible();
-              if (!spec) throw new HttpError(409, 'no notification message is checked for random');
+              if (!spec) throw new HttpError(409, 'no notification message matches the random config');
             }
           }
           const out = mod.spawnSpec(spec, origin);
