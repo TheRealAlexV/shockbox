@@ -20,7 +20,7 @@
 import { el, frag, clear, actionButton } from '/src/ui.js';
 import { syntheticHands } from '../pages/js/engine/tracker.js';
 import { classify as classifyPose, Motion } from '../pages/js/engine/gestures.js';
-import { EFFECTS as ENGINE_EFFECTS } from '../pages/js/engine/fx.js';
+import { EFFECTS as ENGINE_EFFECTS, FxRenderer, anchorsFrom } from '../pages/js/engine/fx.js';
 
 // What this build can actually draw. The page's registry is the truth (it is the same module the
 // overlay imports), so the pane can never claim an effect the page would silently skip.
@@ -48,6 +48,8 @@ export async function render(container, ctx) {
     page: null, // last honest status line from the overlay
     live: new Map(), // effect id -> {startedAt, hands, gesture} (from the overlay's reports)
     synthetic: false,
+    underlay: true, // the camera feed under the effects; off leaves the dark backdrop
+    previewEffect: null, // the effect id the preview draws live
     log: [],
   };
 
@@ -349,14 +351,16 @@ export async function render(container, ctx) {
     const head = el('div', { class: 'panel-head' },
       el('span', { class: 'panel-title', text: 'Preview' }),
       el('span', { class: 'panel-hint mono', 'data-hfx-preview-state': s.camera }),
+      effectPicker(),
     );
-    const stage = el('div', { class: 'hfx-stage', 'data-state': s.camera });
+    const stage = el('div', { class: 'hfx-stage', 'data-state': s.camera, 'data-underlay': s.underlay ? 'on' : 'off' });
     const cam = el('video', { class: 'hfx-video', autoplay: true, muted: true, playsInline: true });
     cam.muted = true;
+    const fxLayer = previewCanvas();
     const lm = document.createElement('canvas');
     lm.className = 'hfx-landmarks';
     const hud = el('div', { class: 'hfx-hud' });
-    stage.append(cam, lm, hud);
+    stage.append(cam, fxLayer, lm, hud);
     videoEl = cam;
 
     const note = el('div', { class: 'hfx-preview-note' });
@@ -372,9 +376,11 @@ export async function render(container, ctx) {
       else note.append(el('span', { class: 'hfx-note', text: 'no camera here. The preview opens it on your click only; nothing is captured before that.' }));
     }
     note.append(
+      underlayToggle(),
       actionButton({ label: s.camera === 'on' ? 'Stop preview' : 'Start preview', variant: 'btn btn-sm hfx-preview-btn', run: async () => (s.camera === 'on' ? stopPreview() : startPreview()), onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
       actionButton({ label: s.synthetic ? 'Stop synthetic' : 'Synthetic', variant: 'btn btn-sm', run: async () => { s.synthetic = !s.synthetic; s.syntheticAt = performance.now(); synthMotion.push(null, performance.now()); }, onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
     );
+    if (s.synthetic) note.append(el('span', { class: 'hfx-note ok', text: 'synthetic hands — drawn over the camera feed when it is live, on the dark backdrop when it is not' }));
     card.append(head, stage, el('div', { class: 'panel-body hfx-preview-body' }, note));
 
     // After the DOM is in place: attach the live stream and start the landmark loop.
@@ -382,6 +388,7 @@ export async function render(container, ctx) {
       if (!videoEl) return;
       if (stream) videoEl.srcObject = stream;
       drawLandmarks();
+      startFx();
     });
     return card;
   }
@@ -599,6 +606,123 @@ export async function render(container, ctx) {
     return sel;
   }
 
+  /* -------------------------------------------------------------- effect preview */
+
+  // The pane draws with the same engine module the overlay does, on its own canvas and its own
+  // settings: the operator's list, intensity and mirror come in, but only the chosen effect is
+  // live here. The renderer and its canvas outlive a re-render (the canvas is re-attached, never
+  // remade), so the WebGL context survives the pane's status refresh.
+  let fxr = null;
+  let fxCanvas = null;
+  let fxRaf = 0;
+  let fxKey = '';
+
+  function previewCanvas() {
+    if (!fxCanvas) {
+      fxCanvas = document.createElement('canvas');
+      fxCanvas.className = 'hfx-fx';
+      fxCanvas.setAttribute('aria-hidden', 'true');
+    }
+    return fxCanvas;
+  }
+
+  /** What this build can draw, in the server's order — the preview offers only those. */
+  function previewChoices() {
+    const ids = registry().filter((e) => e.id && KNOWN.has(e.id)).map((e) => e.id);
+    const list = [...new Set(ids)];
+    return list.length ? list : [...KNOWN];
+  }
+
+  function previewEffectId() {
+    const choices = previewChoices();
+    if (s.previewEffect && choices.includes(s.previewEffect)) return s.previewEffect;
+    return (s.settings.effects || []).find((id) => choices.includes(id)) || choices[0] || null;
+  }
+
+  function effectPicker() {
+    const current = previewEffectId();
+    const sel = el('select', { class: 'hfx-select hfx-preview-effect', 'aria-label': 'effect shown in the preview' });
+    const choices = previewChoices();
+    if (!choices.length) sel.append(el('option', { value: '', text: 'no effects in this build' }));
+    for (const id of choices) {
+      const title = effectTitle({ id }, id);
+      sel.append(el('option', { value: id, text: `${title.text}${effectEnabled(id) ? '' : ' — off'}` }));
+    }
+    if (current) sel.value = current;
+    sel.addEventListener('change', () => {
+      s.previewEffect = sel.value || null;
+      startFx();
+    });
+    return sel;
+  }
+
+  function underlayToggle() {
+    const input = el('input', { type: 'checkbox', id: 'hfx-underlay' });
+    input.checked = s.underlay;
+    input.addEventListener('change', () => {
+      s.underlay = input.checked;
+      render();
+    });
+    return el('label', { class: 'hfx-underlay', title: 'the camera feed under the effects' },
+      input, el('span', { class: 'hfx-note', text: 'Underlay' }));
+  }
+
+  /**
+   * Anchors for the preview's frame. The pane has no detector of its own: with the synthetic rig on
+   * the effects follow those hands; with it off there is nothing to anchor to, so they are drawn at
+   * a fixed centre anchor rather than at a hand the pane cannot see.
+   */
+  function previewView(now) {
+    if (s.synthetic) {
+      if (!s.syntheticAt) s.syntheticAt = performance.now();
+      return anchorsFrom(syntheticHands((now - s.syntheticAt) / 1000));
+    }
+    return {
+      palms: [{ x: 0.5, y: 0.55, radius: 0.16 }],
+      fingertipPairs: [],
+      front: { x: 0.5, y: 0.55, radius: 0.12 },
+      anchor: { x: 0.5, y: 0.55, radius: 0.2 },
+      swipe: null,
+      hands: [],
+    };
+  }
+
+  function startFx() {
+    cancelAnimationFrame(fxRaf);
+    if (!fxCanvas || !fxCanvas.isConnected) return;
+    if (!fxr) {
+      fxr = new FxRenderer(fxCanvas, { onError: (msg) => push(`preview effects: ${msg}`, 'bad') });
+      if (!fxr.init()) {
+        fxr = null;
+        return;
+      }
+    }
+    const tick = (now) => {
+      fxRaf = requestAnimationFrame(tick);
+      if (!fxr || !fxr.gl) return;
+      const id = previewEffectId();
+      if (!id) return;
+      const intensity = Number((s.settings.intensity || {})[id] ?? 1);
+      const key = `${id}|${intensity}|${s.settings.mirror !== false}|${s.settings.bufferScroll ?? 0.35}`;
+      if (key !== fxKey) {
+        fxKey = key;
+        fxr.setSettings({
+          effects: [id],
+          intensity: { [id]: intensity },
+          mirror: s.settings.mirror !== false,
+          bufferScroll: Number(s.settings.bufferScroll ?? 0.35),
+          enabled: true,
+        });
+      }
+      fxr.view = previewView(now);
+      const live = fxr.live.get(id);
+      // One-shots run out; re-fire instead of leaving an empty box after the first burst.
+      if (!live || !live.active || (Number(live.age) || 0) > 3) fxr.trigger(id, { view: fxr.view });
+      fxr.render(now, fxr.view);
+    };
+    fxRaf = requestAnimationFrame(tick);
+  }
+
   /* -------------------------------------------------------------- landmark loop */
 
   let landmarkRaf = 0;
@@ -625,7 +749,7 @@ export async function render(container, ctx) {
         ctx2d.fillStyle = 'rgba(255,255,255,.75)';
         ctx2d.fillText(`overlay reports: ${p.hands} hand${p.hands === 1 ? '' : 's'} · ${p.gesture || 'none'}`, 8, h - 8);
       }
-      if (s.synthetic && s.camera !== 'on') drawSynthetic(ctx2d, w, h);
+      if (s.synthetic) drawSynthetic(ctx2d, w, h);
       else synthMotion.push(null, performance.now());
       landmarkRaf = requestAnimationFrame(tick);
     };
@@ -713,6 +837,7 @@ export async function render(container, ctx) {
 
   signal.addEventListener('abort', () => {
     cancelAnimationFrame(landmarkRaf);
+    cancelAnimationFrame(fxRaf);
     clearTimeout(refreshTimer);
     clearInterval(bodyTimer);
     stopPreview();
@@ -721,6 +846,7 @@ export async function render(container, ctx) {
 
   return () => {
     cancelAnimationFrame(landmarkRaf);
+    cancelAnimationFrame(fxRaf);
     clearTimeout(refreshTimer);
     stopPreview();
     unsub();
