@@ -786,10 +786,12 @@
 
   Instance.prototype._computeGrid = function () {
     var s = this.s;
-    // Portrait uses its own column count so the cell pitch matches 16:9's:
-    // 720×2 / 63 = 22.857 px, and 1280×2 / 112 = 22.857 px (0.0 % drift).
+    // Portrait inherits the landscape pitch so a preset's cells stay square
+    // across orientations: pitch = 1920 / gridCols, then cols = 720 / pitch.
+    // 63 is only the fallback when gridCols is absent.
+    var pitchCols = num(s.gridCols, 0);
     var wantCols = this.ratio === '9:16'
-      ? num(s.gridColsPortrait, 63)
+      ? (pitchCols > 0 ? Math.round(720 / (1920 / pitchCols)) : 63)
       : num(s.gridCols, 112);
     var cols = clamp(Math.round(wantCols), 4, 400);
     var cellShape = clamp(num(s.cellShape, 1), 0.25, 4);
