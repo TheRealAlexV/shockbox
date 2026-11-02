@@ -336,6 +336,87 @@ body {
   border-bottom-left-radius: 12px;
 }
 
+/* ================================= ios ================================= */
+/* A real iOS alert: one centred 270 px card of translucent light material, 17 px semibold
+   heading, 13 px body, and full-width actions stacked behind a hairline. The server cascades
+   dialogs with inline left/top/width, so the skin takes the geometry back for the single card. */
+
+.skin-ios .dialog {
+  left: 50% !important;
+  top: 50% !important;
+  width: 270px !important;
+  max-width: calc(100vw - 32px);
+  border-radius: 14px;
+  background: rgba(242, 242, 247, 0.82);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  color: #000;
+  transform: translate(-50%, -50%) scale(0.985);
+}
+
+.skin-ios .dialog.in {
+  transform: translate(-50%, -50%);
+}
+
+/* No icon: an iOS alert is text only. */
+.skin-ios .icon {
+  display: none;
+}
+
+.skin-ios .body {
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 3px;
+  padding: 19px 16px 15px;
+}
+
+.skin-ios .mtitle {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 22px;
+  letter-spacing: -0.4px;
+}
+
+.skin-ios .msg {
+  display: block;
+  font-size: 13px;
+  line-height: 18px;
+  color: #3c3c43;
+}
+
+.skin-ios .buttons {
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  border-top: 0.5px solid rgba(60, 60, 67, 0.29);
+}
+
+.skin-ios .btn {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 6px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #0a84ff;
+  font-size: 17px;
+  font-weight: 400;
+}
+
+.skin-ios .btn + .btn {
+  border-top: 0.5px solid rgba(60, 60, 67, 0.29);
+}
+
+.skin-ios .btn.primary {
+  font-weight: 600;
+}
+
+.skin-ios .btn:hover {
+  background: rgba(120, 120, 128, 0.12);
+}
+
 /* The stage pointer from the show preview: an annotation on the stream, not part of the alert,
    so it sits above the dialog layer and never takes a click. */
 .stage-pointer {

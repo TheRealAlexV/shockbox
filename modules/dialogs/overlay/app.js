@@ -1,7 +1,8 @@
 // Alert overlay — fake OS dialogs on the 405×720 phone strip (`V: Main Live`).
 //
-// Three skins, ported from error-popups: win95 (boxed, bevelled), win11 (flat, 8 px radius,
-// accent primary button) and macos (no title bar, centred heading, hairline-separated buttons).
+// Four skins, ported from error-popups: win95 (boxed, bevelled), win11 (flat, 8 px radius,
+// accent primary button), macos (no title bar, centred heading, hairline-separated buttons) and
+// ios (no title bar, no icon, one centred glass card with stacked full-width actions).
 // Placement is server-side; the page reports its measured box back so the server can centre
 // against the real height instead of a guess.
 
@@ -96,7 +97,7 @@ function build(entity) {
   box.className = 'dialog';
   box.dataset.id = entity.id;
 
-  if (theme !== 'macos') {
+  if (theme !== 'macos' && theme !== 'ios') {
     const bar = document.createElement('div');
     bar.className = 'titlebar';
     const title = document.createElement('div');
@@ -113,7 +114,7 @@ function build(entity) {
 
   const body = document.createElement('div');
   body.className = 'body';
-  if (theme === 'macos' && entity.title) {
+  if ((theme === 'macos' || theme === 'ios') && entity.title) {
     const head = document.createElement('div');
     head.className = 'mtitle';
     head.textContent = entity.title;
@@ -177,7 +178,7 @@ function apply(snap) {
     const next = snap.settings.theme.value || 'win11';
     if (next !== theme) {
       theme = next;
-      document.documentElement.className = `skin-${theme === 'win95' || theme === 'macos' ? theme : 'win11'}`;
+      document.documentElement.className = `skin-${['win95', 'macos', 'ios'].includes(theme) ? theme : 'win11'}`;
       sizeSent.clear();
     }
     const scale = snap.settings.scale && snap.settings.scale.value;
