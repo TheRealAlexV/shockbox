@@ -188,6 +188,21 @@ export function createPool({ file, log, onChange = null }) {
     return rec ? rec.id : undefined;
   }
 
+  /**
+   * The `random` flag is retired: dialogs and notifications draw from `randomConfig` and ignore
+   * it. Stored records must not carry it at all, so drop the key rather than storing `false`.
+   */
+  function dropRandom(rec) {
+    if (!rec || !Object.prototype.hasOwnProperty.call(rec, 'random')) return false;
+    delete rec.random;
+    return true;
+  }
+
+  /** The message shape the API hands out: never stores the retired flag, always exposes it. */
+  function publicMessage(m) {
+    return { ...m, random: false, tags: m.tags.slice(), buttons: m.buttons.map((b) => ({ ...b })) };
+  }
+
   function normalise(raw) {
     const r = raw && typeof raw === 'object' ? raw : {};
     const parsed = parseMessageBody({ ...r, text: r.text ?? r.body }, { partial: false });
@@ -202,7 +217,6 @@ export function createPool({ file, log, onChange = null }) {
       text: v.text,
       tags: v.tags,
       buttons: v.buttons,
-      random: v.random,
       storm: v.storm,
       pinned: r.pinned === true || v.pinned === true,
       icon: ICONS.includes(r.icon) ? r.icon : undefined,
@@ -228,6 +242,7 @@ export function createPool({ file, log, onChange = null }) {
       const rec = normalise(list[i]);
       if (!rec) return { error: `messages[${i}]: invalid record` };
       if (!rec.poolId) rec.poolId = poolIdForKind(rec.kind);
+      dropRandom(rec);
       if (seenText.has(rec.text)) {
         skipped += 1;
         continue;
@@ -264,23 +279,29 @@ export function createPool({ file, log, onChange = null }) {
     if (!pools.length) pools = seedPools();
     if (!list) return messages;
     const seen = new Set();
+    let dropped = false;
     messages = [];
     for (const raw of list) {
+      // `normalise` no longer copies the retired flag, so look at the record as stored to know
+      // whether this file actually needs rewriting.
+      const carriedRandom = Boolean(raw) && typeof raw === 'object' && Object.prototype.hasOwnProperty.call(raw, 'random');
       const rec = normalise(raw);
       if (!rec) continue;
       if (migrate) rec.poolId = poolIdForKind(rec.kind);
+      dropRandom(rec);
+      if (carriedRandom) dropped = true;
       if (!rec.id || seen.has(rec.id)) rec.id = `m${++seq}`;
       seen.add(rec.id);
       messages.push(rec);
     }
     syncSeq();
-    if (migrate) save();
+    if (migrate || dropped) save();
     log.info(`pool: ${messages.length} messages from ${path.basename(file)}`);
     return messages;
   }
 
   function save() {
-    const doc = { version: 5, updated: new Date().toISOString(), pools, messages };
+    const doc = { version: 6, updated: new Date().toISOString(), pools, messages };
     const tmp = `${file}.tmp`;
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -436,6 +457,7 @@ export function createPool({ file, log, onChange = null }) {
     load();
     const rec = { id: `m${++seq}`, ...values };
     if (!rec.poolId) rec.poolId = poolIdForKind(rec.kind);
+    dropRandom(rec);
     messages.push(rec);
     return rec;
   }
@@ -456,7 +478,7 @@ export function createPool({ file, log, onChange = null }) {
     const dest = pools.find((p) => p.id === to) || null;
     let insert;
     if (to === 'random') {
-      rec.random = true;
+      // The `random` view is still a tab, but the flag is gone: no record carries it.
       rec.kind = 'notification';
       insert = clamp(Number.isInteger(index) ? index : Number.MAX_SAFE_INTEGER, 0, messages.length);
     } else if (to === 'dialogs') {
@@ -465,16 +487,15 @@ export function createPool({ file, log, onChange = null }) {
     } else if (dest) {
       // A stored pool owns its kind, so landing in it is what sets the record's kind.
       rec.kind = dest.kind || rec.kind;
-      rec.random = false;
       insert = clamp(Number.isInteger(index) ? index : messages.length, 0, messages.length);
     } else {
       rec.kind = 'notification';
-      rec.random = false;
       insert = clamp(Number.isInteger(index) ? index : messages.length, 0, messages.length);
     }
     messages.splice(insert, 0, rec);
     rec.poolId = dest ? dest.id : poolIdForKind(rec.kind);
-    return { to, index: insert, kind: rec.kind, random: rec.random === true, storm: rec.storm === true };
+    dropRandom(rec);
+    return { to, index: insert, kind: rec.kind, random: false, storm: rec.storm === true };
   }
 
   function replaceAll(list, { keepOrder = false } = {}) {
@@ -507,12 +528,20 @@ export function createPool({ file, log, onChange = null }) {
     if (keepOrder) {
       // Import path: preserve the caller's array order verbatim (legacy stores carry their own
       // ordering), only new records get a fresh id. The `twin` text match above still hits.
-      const next = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values, poolId: poolIdForKind(values.kind) }));
+      const next = checked.map(({ id, values }) => {
+        const rec = { id: id || `m${++seq}`, ...values, poolId: poolIdForKind(values.kind) };
+        dropRandom(rec);
+        return rec;
+      });
       for (const rec of messages) if (!next.some((n) => n.id === rec.id)) next.push(rec);
       messages = next;
       return { count: messages.length };
     }
-    messages = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values, poolId: poolIdForKind(values.kind) }));
+    messages = checked.map(({ id, values }) => {
+      const rec = { id: id || `m${++seq}`, ...values, poolId: poolIdForKind(values.kind) };
+      dropRandom(rec);
+      return rec;
+    });
     return { count: messages.length };
   }
 
@@ -577,7 +606,7 @@ export function createPool({ file, log, onChange = null }) {
       types,
       tags,
       counts,
-      messages: list.map((m) => ({ ...m, tags: m.tags.slice(), buttons: m.buttons.map((b) => ({ ...b })) })),
+      messages: list.map(publicMessage),
     };
   }
 
@@ -618,6 +647,7 @@ export function createPool({ file, log, onChange = null }) {
     poolRecord,
     tabIds,
     knowsPool,
+    publicMessage,
     createPoolRecord,
     updatePoolRecord,
     deletePoolRecord,
@@ -752,7 +782,7 @@ export function poolRoutes({ pool, events, log = pool.log }) {
         pool.commit('add');
         broadcast();
         log.info(`message added ${rec.id} (${rec.kind}, pool ${id})`);
-        return { ok: true, id: rec.id, message: rec };
+        return { ok: true, id: rec.id, message: pool.publicMessage(rec) };
       },
     },
     {
@@ -795,7 +825,7 @@ export function poolRoutes({ pool, events, log = pool.log }) {
         const rec = pool.byId(mid);
         if (!rec) throw new HttpError(404, `unknown message ${mid}`);
         const m = req.method;
-        if (m === 'GET' || m === 'HEAD') return { id, name: (pool.poolRecord(id) || {}).label || POOL_NAMES[id] || id, message: rec };
+        if (m === 'GET' || m === 'HEAD') return { id, name: (pool.poolRecord(id) || {}).label || POOL_NAMES[id] || id, message: pool.publicMessage(rec) };
         if (m === 'DELETE') {
           pool.remove(mid);
           pool.commit('delete');
@@ -805,9 +835,10 @@ export function poolRoutes({ pool, events, log = pool.log }) {
         const parsed = parseMessageBody(body || {}, { partial: true });
         if (parsed.error) throw new HttpError(400, parsed.error);
         Object.assign(rec, parsed.values);
+        delete rec.random;
         pool.commit('update');
         broadcast();
-        return { ok: true, message: rec };
+        return { ok: true, message: pool.publicMessage(rec) };
       },
     },
   ];
