@@ -89,6 +89,47 @@
       bloom: 0.80, bloomThreshold: 0.50, bloomRadius: 1.15,
       exposure: 1.0, saturation: 1.15, contrast: 1.05,
       vignette: 0.35, grain: 0.03
+    },
+
+    // Text / signage.
+    sign: {
+      gridCols: 96, gridRows: 0,
+      // Text lives in the per-view blocks now (v2.1), so each page renders its
+      // own layout: 16:9 is wide and roomy, 9:16 stacks shorter lines.
+      views: {
+        landscape: {
+          enabled: true, inheritLook: true,
+          text: {
+            enabled: true, title: 'ON AIR',
+            source: { kind: 'inline' },
+            paras: [{ align: 'center', runs: [{ t: 'ON AIR' }] }],
+            style: { size: 0.92, font: '"Arial", "Helvetica Neue", sans-serif',
+                     tracking: 0.06, uppercase: true, scroll: 0, reveal: 0,
+                     colour: 'palette' },
+            safeArea: 'off'
+          }
+        },
+        portrait: {
+          enabled: true, inheritLook: true,
+          text: {
+            enabled: true, title: 'ON AIR',
+            source: { kind: 'inline' },
+            paras: [{ align: 'center', runs: [{ t: 'ON AIR' }] }],
+            style: { size: 0.86, font: '"Arial", "Helvetica Neue", sans-serif',
+                     tracking: 0.06, uppercase: true, scroll: 0, reveal: 0,
+                     colour: 'palette' },
+            safeArea: 'off'
+          }
+        }
+      },
+      mode: 'text',
+      ledSize: 0.95, cellShape: 1.0,
+      palette: 'mono', paletteWeight: 0.35, hdrGain: 2.4,
+      streakOpacity: 0.08, persistence: 0.05,
+      flareIntensity: 0.25, flareLength: 1.1,
+      bloom: 0.90, bloomThreshold: 0.55, bloomRadius: 1.0,
+      exposure: 1.0, saturation: 1.10, contrast: 1.05,
+      vignette: 0.45, grain: 0.02, bgColor: '#04040c'
     }
   };
 })();
