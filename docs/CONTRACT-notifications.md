@@ -51,6 +51,14 @@ Channel `notifications`.
 There are no inbound bus commands: the server acts only on HTTP. `snapshot` is a published frame
 (replayable); `relayout` and `sound` are events (not replayable).
 
+**Gotcha — query strings are ignored, not rejected.** The registry matches routes on `url.pathname`
+only (`core/registry.mjs:157` for string routes, `:169` for pages), so `?mode=obs` on an overlay
+URL is silently unread: `/notify?mode=obs` and `/notify` are the same page, and nothing in this
+module ever looks at a query string. A wrong-looking overlay is not a bad parameter — the parameter
+does not exist. The same is true of the other overlay pages (`/dialogs`, `/wall/render`,
+`/handfx`). Path-only matching is also why each page's `static` sibling directory resolves without
+per-file routes.
+
 `state.mjs` auto-close is a 400 ms `setInterval` sweep in `init()` (`routes.js:26`), cleared in
 `dispose()`.
 

@@ -36,6 +36,7 @@ import { el, clear, frag } from './ui.js';
 import { startDrawer } from './drawer.js';
 import { installToasts, toast } from './toast.js';
 import { renderSettingsForm } from './settings-form.js';
+import { mountMergedColumn, lookStore } from './merged-preview.js';
 
 const api = createApi('/');
 const root = document.getElementById('app');
@@ -256,6 +257,8 @@ async function navigate() {
   }
 
   const signature = route.kind === 'messages' ? 'messages' : `module:${route.id}`;
+  // the merged column follows the pane until the operator picks a module in the column itself
+  merged?.followRoute(route.id);
   if (state.current && state.current.signature === signature) return;
 
   // tear down the previous pane
@@ -508,6 +511,62 @@ function makeCtx(m, source, signal) {
         },
       }),
     paneSource: source,
+
+    // The merged preview column's shared look (see merged-preview.js). A pane that wants the
+    // same look the column shows reads it here instead of keeping a copy that cannot change
+    // when another pane changes it; `subscribe` tells the pane when that module's look moved.
+    sharedLook: {
+      get: (id = m.id) => lookStore.get(id),
+      // publish: the pane's own read of the look becomes the store's, which the column paints from
+      set: (patch, id = m.id) => lookStore.set(id, patch),
+      subscribe: (fn) => lookStore.subscribe((id, look) => fn(id, look)),
+      // read the server back into the store: how a change made by ANOTHER view (the column's own
+      // controls, a deck key) reaches this pane without the pane keeping a second copy
+      sync: () => lookStore.sync(),
+    },
+
+    // Shared quick-send helpers. Each module only provides `kinds` and the three callbacks;
+    // the box handles search, tags, picking, composer, and the send/schedule split.
+    quickSend: {
+      // The dialogs pool holds dialogs and alerts alike (an alert is a dialog with an icon), so
+      // the pane's box reads that whole pool rather than guessing at a separate kind.
+      kinds: (moduleId) => {
+        if (moduleId === 'wall') return ['wall'];
+        if (moduleId === 'dialogs') return ['dialog'];
+        return ['notification'];
+      },
+      poolId: (moduleId) => (moduleId === 'wall' ? 'wall' : moduleId),
+      async send(moduleId, payload) {
+        if (moduleId === 'wall') return api.post('/api/wall/cmd', { cmd: 'text.send', args: { text: payload.text, kind: payload.kind || 'wall', ...(payload.poolId ? { poolId: payload.poolId } : {}) } });
+        if (moduleId === 'dialogs') return api.post('/api/dialogs/live', payload);
+        return api.post('/api/notifications/live', payload);
+      },
+      async schedule(moduleId, payload) {
+        return api.post('/api/schedules', { module: moduleId, ...payload });
+      },
+      async save(moduleId, payload) {
+        // pool messages are created inside their own pool route, so the module maps to a pool id
+        const poolId = moduleId === 'wall' ? 'wall' : moduleId;
+        return api.post(`/api/pool/${poolId}/messages`, payload);
+      },
+    },
+
+    // Schedule listing lives on the module's own panel (the box only books). This helper is
+    // for that panel to call.
+    schedules: {
+      async list(moduleId, pending) {
+        const q = new URLSearchParams();
+        if (moduleId) q.set('module', moduleId);
+        if (pending) q.set('pending', '1');
+        return api.get(`/api/schedules?${q}`);
+      },
+      async runNow(id) {
+        return api.post(`/api/schedules/${encodeURIComponent(id)}/run`);
+      },
+      async cancel(id) {
+        return api.del(`/api/schedules/${encodeURIComponent(id)}`);
+      },
+    },
   };
   return ctx;
 }
@@ -566,6 +625,40 @@ function errorPane(err, what) {
     ),
   );
   return box;
+}
+
+/* --------------------------------------------------------- merged preview */
+
+let merged = null;
+
+/**
+ * Mount the merged preview column between the rail and the pane, once for the life of the page.
+ *
+ * Choosing a module in the column is a selection, not a navigation: the operator is watching all
+ * four while working on one, so clicking a chip must not yank the pane away from under a half-typed
+ * form. What it does do is make that module the one the column drives.
+ */
+function mountMerged() {
+  if (merged) return merged;
+  // The column is its own grid cell between the rail and <main>: inserting it into the grid is
+  // the mount, so the column's root element is the cell and nothing wraps it.
+  const marker = el('div', { class: 'merged-host', id: 'merged-host', hidden: true });
+  const main = document.getElementById('main');
+  root.insertBefore(marker, main || null);
+  // The column's root replaces its host's slot in the grid: it IS the grid child, so the host
+  // must not wrap it (and must not stay in the grid as an empty track either).
+  marker.remove();
+  merged = mountMergedColumn(marker, {
+    api,
+    bus,
+    onSelect: (id) => {
+      // a second click on the selected card is that module's primary action; nothing else to do
+      window.__shell = { ...(window.__shell || {}), mergedSelected: id };
+    },
+  });
+  merged.start();
+  window.__merged = merged;
+  return merged;
 }
 
 /* -------------------------------------------------------------- top status */
@@ -686,6 +779,10 @@ async function boot() {
   window.__shell = { ready: false, phase: 'boot', since: Date.now(), notes: [] };
   installToasts(document.getElementById('toasts'));
   wireDrawer();
+  // The merged preview column is mounted before any pane: it belongs to every route, it must be
+  // in the grid on the first frame, and a pane render must never be what creates (or destroys)
+  // it. It is a sibling of the rail and the main column, inside the app grid.
+  mountMerged();
   bus.onStatus((s) => {
     updateSseStatus();
     if (s === 'open') {

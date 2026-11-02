@@ -28,6 +28,15 @@ listens.
 - **HTTP server** (`core/server-http.mjs`) owns `/health`, `/api/modules*`, `/api/log`,
   `/api/core/*`, `/events`, then `core.extraRoutes` (pool), then the mount-prefix hook, then module
   routes, then module pages and their siblings, then `public/`, then `/mod/<id>/<path>`.
+  `GET /health` (`core/server-http.mjs:207-222`) reports `modules` as a **flat `id → status` map**
+  (`{"wall":"up"}`), not the object form — that richer shape (`{id, status, error, pages, routes,
+  …}`) is only on `GET /api/modules` (`core/server-http.mjs:223-225`, the registry's `describe()`).
+  It always answers `ok: true` as long as the process is serving, so **a green `/health` does not
+  mean OBS is live**: with OBS closed the OBS client sits at `obs: {state:"connecting", scene:null}`
+  (`core/obs.mjs:21` the state machine's `connecting`, `server-http.mjs:219`) and keeps retrying
+  with growing backoff forever — it never gives up and never reports a failure. Check
+  `obs.state === "ready"` (and for the wall, `GET /api/wall/render`'s `online`) before trusting
+  scene-dependent behaviour.
 - **Legacy port** (`core/compat-port.mjs`): when `compatPort` is non-zero, a second listener on
   that port serves only the exact routes `notifications.module.api.legacyRoutes()` returns,
   for deck actions during cutover. Currently that module exports no `legacyRoutes()`, so a
@@ -53,6 +62,16 @@ Core has exactly two generic hooks for things only a module knows:
    HandFX serves its ~20 MB MediaPipe runtime this way.
 
 There is no other core knowledge of a module: no route greps, no per-module conditions.
+
+### Who owns the process
+
+`server.mjs` is not started by hand on the rig. The owner is the **TUI supervisor**
+(`tools/tui/`, Python): the desktop shortcut runs `deploy\ShockBox-TUI.cmd`, which opens the TUI;
+the TUI starts `node server.mjs` detached, holds the port, restarts node with 2/4/8/16/30/60 s
+backoff, and keeps running after its window closes. A run that stays up `HEALTHY_S` (300 s) resets
+the sequence (`tools/tui/shockbox_tui/supervisor.py:62-65`). There is no autostart at logon — the
+old `ShockBox-Server` scheduled task was retired (`deploy/install.ps1:285-304`). Supervisor
+internals, settings and controls: [`docs/TUI.md`](TUI.md); install/start/stop: `deploy/README.md`.
 
 ## 2. The registry contract
 
@@ -204,5 +223,6 @@ module wraps one store at `state/<id>/settings.json`; a module with its own docu
    `channels` so `GET /events` subscribes new clients to it.
 7. Add a pane (`ui/pane.js`, registered by the shell) and a gate under `test/`, then wire the gate
    into `npm test` in `package.json`.
-8. Restart the server. Check `GET /health` (`modules.<id>.status === "up"`) and
+8. Restart the server. Check `GET /health` (`modules.<id> === "up"` — a flat `id → status` map;
+   the object form with `.status` and `.error` is on `GET /api/modules`) and
    `GET /api/modules/<id>/routes`.

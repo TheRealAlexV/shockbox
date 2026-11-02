@@ -12,16 +12,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { HttpError, clamp } from './id.mjs';
 
-export const POOL_IDS = ['all', 'random', 'dialogs', 'notifications'];
-export const POOL_NAMES = { all: 'All messages', random: 'Random', dialogs: 'Alerts', notifications: 'Notifications' };
+export const POOL_IDS = ['all', 'random', 'dialogs', 'notifications', 'wall'];
+export const POOL_NAMES = { all: 'All messages', random: 'Random', dialogs: 'Alerts', notifications: 'Notifications', wall: 'Wall' };
 
-export const KINDS = ['dialog', 'notification'];
+// `wall` is a message pool record too: one typography source for alerts, notifications and
+// the LED wall, so a message written once can pop as a dialog or climb the wall.
+export const KINDS = ['dialog', 'notification', 'wall'];
 export const ACTIONS = new Set(['close', 'closeAll', 'spawn', 'none']);
 export const ICONS = ['error', 'warning', 'info', 'question', 'none'];
 export const MAX_TEXT = 600;
 export const MAX_TYPE = 32;
 export const MAX_TITLE = 40;
-export const MAX_TAGS = 8;
+export const MAX_TAGS = 16;
 export const MAX_TAG_LEN = 24;
 export const MAX_BUTTONS = 5;
 export const MAX_MESSAGES = 5000;
@@ -91,6 +93,7 @@ export function parseMessageBody(body, { partial }) {
 
   if (body.random !== undefined && typeof body.random !== 'boolean') return { error: 'random must be a boolean' };
   if (body.storm !== undefined && typeof body.storm !== 'boolean') return { error: 'storm must be a boolean' };
+  if (body.pinned !== undefined && typeof body.pinned !== 'boolean') return { error: 'pinned must be a boolean' };
   if (body.kind !== undefined && !KINDS.includes(body.kind)) return { error: `kind must be one of ${KINDS.join(', ')}` };
 
   if (!partial || body.text !== undefined) {
@@ -122,8 +125,10 @@ export function parseMessageBody(body, { partial }) {
   if (!partial || body.kind !== undefined) values.kind = body.kind === undefined ? 'notification' : body.kind;
   if (!partial || body.random !== undefined) values.random = body.random === undefined ? true : body.random;
   if (!partial || body.storm !== undefined) values.storm = body.storm === undefined ? true : body.storm;
+  if (!partial || body.pinned !== undefined) values.pinned = body.pinned === true;
 
   if (!partial && !values.text) return { error: 'text must not be empty' };
+  if (body.icon !== undefined && !ICONS.includes(body.icon)) return { error: `icon must be one of ${ICONS.join(', ')}` };
   if (partial && Object.keys(values).length === 0) return { error: 'nothing to update' };
   return { values };
 }
@@ -151,7 +156,7 @@ export function createPool({ file, log, onChange = null }) {
     const v = parsed.values;
     return {
       id: typeof r.id === 'string' && r.id.trim() ? r.id.trim().slice(0, 40) : null,
-      kind: v.kind,
+      kind: r.kind === 'wall' ? 'wall' : r.kind === 'dialog' ? 'dialog' : r.kind === 'notification' ? 'notification' : v.kind,
       type: v.type,
       title: v.title || undefined,
       text: v.text,
@@ -159,8 +164,43 @@ export function createPool({ file, log, onChange = null }) {
       buttons: v.buttons,
       random: v.random,
       storm: v.storm,
+      pinned: r.pinned === true || v.pinned === true,
       icon: ICONS.includes(r.icon) ? r.icon : undefined,
     };
+  }
+
+  /**
+   * Import records (legacy pools or a PUT body) without dropping anything the store can hold.
+   * `replaceAll` validates through parseMessageBody, which has no `id`/`pinned`/`icon` slot of its
+   * own, so a straight replace would lose them on the next save.
+   */
+  function importRecords(list, { mode = 'merge' } = {}) {
+    load();
+    if (!Array.isArray(list)) return { error: 'messages must be an array' };
+    if (list.length > MAX_MESSAGES) return { error: `messages must hold at most ${MAX_MESSAGES} records` };
+    const base = mode === 'replace' ? [] : messages.slice();
+    const byText = new Map(base.map((m) => [m.text, m]));
+    const seenId = new Set(base.map((m) => m.id));
+    const seenText = new Set(base.map((m) => m.text));
+    const added = [];
+    let skipped = 0;
+    for (let i = 0; i < list.length; i++) {
+      const rec = normalise(list[i]);
+      if (!rec) return { error: `messages[${i}]: invalid record` };
+      if (seenText.has(rec.text)) {
+        skipped += 1;
+        continue;
+      }
+      if (!rec.id || seenId.has(rec.id)) {
+        const twin = byText.get(rec.text);
+        rec.id = twin && !seenId.has(twin.id) ? twin.id : `m${++seq}`;
+      }
+      seenId.add(rec.id);
+      seenText.add(rec.text);
+      added.push(rec);
+    }
+    messages = base.concat(added);
+    return { added: added.length, skipped, count: messages.length, ids: added.map((m) => m.id) };
   }
 
   function load() {
@@ -225,6 +265,11 @@ export function createPool({ file, log, onChange = null }) {
     return all().find((m) => m.id === id) || null;
   }
 
+  /** Every record, in pool order — the wall uses it to resolve `slot` sends. */
+  function list() {
+    return all().slice();
+  }
+
   function eligible(kind, flag) {
     return all().filter((m) => (!kind || m.kind === kind) && (flag ? m[flag] === true : true));
   }
@@ -266,7 +311,7 @@ export function createPool({ file, log, onChange = null }) {
     return { to, index: insert, kind: rec.kind, random: rec.random === true, storm: rec.storm === true };
   }
 
-  function replaceAll(list) {
+  function replaceAll(list, { keepOrder = false } = {}) {
     load();
     if (!Array.isArray(list)) return { error: 'messages must be an array' };
     if (list.length > MAX_MESSAGES) return { error: `messages must hold at most ${MAX_MESSAGES} records` };
@@ -291,10 +336,29 @@ export function createPool({ file, log, onChange = null }) {
         if (seen.has(id)) return { error: `messages[${i}]: duplicate id ${id}` };
         seen.add(id);
       }
-      checked.push({ id, values: parsed.values });
+      checked.push({ id, values: { ...parsed.values, ...retained(entry, parsed.values) } });
+    }
+    if (keepOrder) {
+      // Import path: preserve the caller's array order verbatim (legacy stores carry their own
+      // ordering), only new records get a fresh id. The `twin` text match above still hits.
+      const next = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values }));
+      for (const rec of messages) if (!next.some((n) => n.id === rec.id)) next.push(rec);
+      messages = next;
+      return { count: messages.length };
     }
     messages = checked.map(({ id, values }) => ({ id: id || `m${++seq}`, ...values }));
     return { count: messages.length };
+  }
+
+  /**
+   * Fields the body may carry that parseMessageBody returns only via the `!partial` branch are
+   * already in values, but `icon` and `pinned` are validated separately — pick them up here so a
+   * PUT /api/pools round-trip does not silently drop them.
+   */
+  function retained(entry, values) {
+    const out = {};
+    if (ICONS.includes(entry.icon) && values.icon === undefined) out.icon = entry.icon;
+    return out;
   }
 
   function typesAndTags() {
@@ -319,6 +383,7 @@ export function createPool({ file, log, onChange = null }) {
     const list = all().filter((m) => {
       if (poolId === 'dialogs' && m.kind !== 'dialog') return false;
       if (poolId === 'notifications' && m.kind !== 'notification') return false;
+      if (poolId === 'wall' && m.kind !== 'wall') return false;
       if (poolId === 'random' && m.random !== true) return false;
       if (randomOnly && m.random !== true) return false;
       if (stormOnly && m.storm !== true) return false;
@@ -337,6 +402,7 @@ export function createPool({ file, log, onChange = null }) {
         all: all().length,
         dialogs: all().filter((m) => m.kind === 'dialog').length,
         notifications: all().filter((m) => m.kind === 'notification').length,
+        wall: all().filter((m) => m.kind === 'wall').length,
         random: all().filter((m) => m.random === true).length,
         storm: all().filter((m) => m.storm === true).length,
       },
@@ -375,11 +441,13 @@ export function createPool({ file, log, onChange = null }) {
     commit,
     all,
     byId,
+    list,
     eligible,
     add,
     remove,
     move,
     replaceAll,
+    importRecords,
     typesAndTags,
     view,
     reorder,
@@ -414,6 +482,22 @@ export function poolRoutes({ pool, events, log = pool.log }) {
         pool.commit('replace');
         broadcast();
         return { ok: true, count: r.count };
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/pool/import',
+      handler(req, res, url, body) {
+        // Import path for the legacy stores (LEDWall Quick Text, Error Popups v1/v2). `mode:merge`
+        // is the default because an import is usually a re-run; text-identical records are skipped
+        // rather than duplicated, so the endpoint is safe to call twice.
+        const mode = body && body.mode === 'replace' ? 'replace' : 'merge';
+        const r = pool.importRecords(body && body.messages, { mode });
+        if (r.error) throw new HttpError(400, r.error);
+        pool.commit('import');
+        broadcast();
+        log.info(`pool import (${mode}): +${r.added}, skipped ${r.skipped}, total ${r.count}`);
+        return { ok: true, ...r };
       },
     },
     {

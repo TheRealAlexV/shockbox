@@ -26,6 +26,22 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
   let backoff = 500;
   let wantOpen = false;
   let lastScene = null;
+  // Diagnostics the pane and /api/core/obs report: 'connecting' forever is not a verdict.
+  let lastError = null;
+  let lastErrorAt = null;
+  let attempts = 0;
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    /* keep the raw string */
+  }
+
+  function noteError(message) {
+    lastError = message;
+    lastErrorAt = new Date().toISOString();
+    attempts += 1;
+  }
 
   function ready() {
     return identified;
@@ -39,6 +55,7 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
     try {
       sock = new WebSocket(url);
     } catch (err) {
+      noteError(`connect failed: ${err.message}`);
       log.warn(`obs connect failed: ${err.message}`);
       scheduleReconnect();
       return;
@@ -56,8 +73,11 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
       }
       onMessage(msg);
     });
-    sock.addEventListener('close', () => {
+    sock.addEventListener('close', (ev) => {
       const wasReady = identified;
+      // Close before Identify means the server refused us (bad password) or never spoke; after
+      // Identify it is a dropped link. Neither is visible from the outside without this.
+      if (!wasReady) noteError(`closed before identify (code ${ev?.code ?? '?'})`);
       identified = false;
       state = 'closed';
       ws = null;
@@ -82,6 +102,9 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
   function onMessage(msg) {
     switch (msg.op) {
       case OP_HELLO:
+        // A server that demands auth when we hold none can never identify us; say so once rather
+        // than leaving the pane on 'connecting' for an hour.
+        if (msg.d.authentication && !password) noteError('OBS requires a password; config.json obs.password is empty');
         send({
           op: OP_IDENTIFY,
           d: {
@@ -95,6 +118,8 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
         identified = true;
         state = 'ready';
         backoff = 500;
+        lastError = null;
+        attempts = 0;
         log.info(`obs identified (rpcVersion ${msg.d?.negotiatedRpcVersion})`);
         for (const fn of subs) {
           try {
@@ -196,6 +221,24 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
     },
     get scene() {
       return lastScene;
+    },
+    /**
+     * Why the link is in the state it is in. `/api/core/obs` promises this (server.mjs:229-231):
+     * 'closed' alone cannot tell a wrong password from a server that is not listening, and both
+     * look like the app's fault from outside. Password is never echoed — only whether one is set.
+     */
+    diag() {
+      return {
+        state,
+        identified,
+        url,
+        host,
+        auth: Boolean(password),
+        lastError,
+        lastErrorAt,
+        attempts,
+        nextRetryMs: identified ? 0 : backoff,
+      };
     },
     /** Convenience reads the ratio watcher and gates need. */
     async currentScene() {

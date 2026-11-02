@@ -1,0 +1,394 @@
+// Quick send — the top-of-page send box every messaging module shares.
+//
+// One box, four jobs: pick something from this module's pool (searchable, filterable by tag), type
+// something new, send it, or book it for later. It exists so the wall, the dialogs and the
+// notifications stop each growing their own half-implemented send strip, and so a message can be
+// answered with the keyboard alone: type, Enter sends, Tab reaches the list.
+//
+// Ownership: this file renders and talks to `/api/schedules` and the module's own send route. The
+// module passes `onSend`, `onSchedule` and `onSave`; it does not pass markup.
+
+import { el, clear } from './ui.js';
+import { toast } from './toast.js';
+
+const MAX_TAGS = 16;
+
+/** Local time for a <input type="datetime-local"> value. */
+function toLocalInput(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function fromLocalInput(v) {
+  if (!v) return NaN;
+  return new Date(v).getTime();
+}
+
+function inMinutes(n) {
+  return toLocalInput(Date.now() + n * 60_000);
+}
+
+/**
+ * @param {HTMLElement} container
+ * @param {{
+ *   title: string,
+ *   kinds: string[],
+ *   api: object,
+ *   poolId: string,
+ *   placeholder?: string,
+ *   who?: string,
+ *   onSend: (payload) => Promise<any>,
+ *   onSchedule: (payload) => Promise<any>,
+ *   onSave?: (payload) => Promise<any>,
+ *   allowEmpty?: boolean,
+ *   allowRandom?: boolean,
+ *   signal?: AbortSignal,
+ * }} opts
+ * @returns {{ refresh: () => Promise<void>, get selected: () => object|null }}
+ */
+export function mountQuickSend(container, opts) {
+  clear(container);
+  let messages = [];
+  let selected = null;
+  let query = '';
+  let activeTags = new Set();
+  let includeOtherPools = false;
+
+  const kinds = opts.kinds || ['wall'];
+  const allowEmpty = opts.allowEmpty === true;
+  const allowRandom = opts.allowRandom === true;
+
+  /* ------------------------------------------------------------ pool list */
+
+  const search = el('input', {
+    type: 'search',
+    class: 'qs-search',
+    placeholder: 'Search messages…',
+    autocomplete: 'off',
+    'aria-label': `Search ${opts.title} messages`,
+  });
+  const tagBar = el('div', { class: 'qs-tags', role: 'group', 'aria-label': 'Filter by tag' });
+  const list = el('div', { class: 'qs-list', role: 'listbox', 'aria-label': `${opts.title} messages` });
+  const count = el('span', { class: 'panel-hint dim mono' });
+  const otherToggle = el('label', { class: 'qs-save', title: 'Also search the other message pools' });
+  const otherBox = el('input', { type: 'checkbox' });
+  otherToggle.append(otherBox, el('span', { text: 'all pools' }));
+  otherToggle.hidden = true;
+
+  /* ------------------------------------------------------------ composer */
+
+  const titleInput = el('input', {
+    type: 'text',
+    class: 'qs-title',
+    placeholder: 'Title (optional)',
+    maxlength: '80',
+    autocomplete: 'off',
+  });
+  const textArea = el('textarea', {
+    class: 'qs-text',
+    placeholder: opts.placeholder || 'Type a message…',
+    rows: '3',
+    maxlength: '4000',
+    'aria-label': `${opts.title} message`,
+  });
+  const atInput = el('input', {
+    type: 'datetime-local',
+    class: 'qs-at',
+    'aria-label': 'Send at',
+    title: 'Leave empty to send now',
+  });
+  atInput.hidden = true;
+  const keepBox = el('input', { type: 'checkbox' });
+  const keepLabel = el('label', { class: 'qs-save', title: 'Also save this as a message in the pool' });
+  keepLabel.append(keepBox, el('span', { text: 'save to pool' }));
+
+  const sendBtn = el('button', { type: 'button', class: 'btn btn-primary qs-send', text: 'Send now' });
+  const schedToggle = el('button', {
+    type: 'button',
+    class: 'btn btn-sm',
+    text: 'Schedule',
+    title: 'Book this message for a later time',
+  });
+  const hint = el('span', { class: 'qs-hint dim' });
+
+  const body = el('div', { class: 'qs-body' });
+  const box = el('section', { class: 'qs panel' });
+  const head = el('div', { class: 'panel-head' },
+    el('span', { class: 'panel-title', text: opts.title }),
+    el('span', { class: 'panel-hint dim', text: 'pool + free text' }),
+    count,
+  );
+
+  body.append(
+    el('div', { class: 'qs-pool' },
+      el('div', { class: 'qs-pool-head' }, search, otherToggle),
+      tagBar,
+      list,
+    ),
+    el('div', { class: 'qs-compose' },
+      titleInput,
+      textArea,
+      el('div', { class: 'qs-row' }, keepLabel, hint),
+      el('div', { class: 'qs-row qs-actions' }, atInput, schedToggle, sendBtn),
+    ),
+  );
+  box.append(head, body);
+  container.append(box);
+
+  /* ------------------------------------------------------------ filtering */
+
+  function allTags() {
+    const t = new Map();
+    for (const m of messages) {
+      for (const tag of m.tags || []) t.set(tag, (t.get(tag) || 0) + 1);
+    }
+    return [...t.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  }
+
+  function paintTags() {
+    clear(tagBar);
+    const tags = allTags();
+    if (!tags.length) return;
+    // most-used first, because the useful filter is usually the common one, but cap the bar so a
+    // richly tagged pool does not push the list off screen
+    for (const [tag, n] of tags.slice(0, 22)) {
+      const on = activeTags.has(tag);
+      const b = el('button', {
+        type: 'button',
+        class: 'qs-tag',
+        'aria-pressed': on ? 'true' : 'false',
+        title: `${n} message${n === 1 ? '' : 's'}`,
+        text: tag,
+      });
+      b.addEventListener('click', () => {
+        if (activeTags.has(tag)) activeTags.delete(tag);
+        else activeTags.add(tag);
+        paintTags();
+        paintList();
+      });
+      tagBar.append(b);
+    }
+    if (activeTags.size) {
+      const clearBtn = el('button', { type: 'button', class: 'qs-tag qs-tag-clear', text: 'clear' });
+      clearBtn.addEventListener('click', () => {
+        activeTags.clear();
+        paintTags();
+        paintList();
+      });
+      tagBar.append(clearBtn);
+    }
+  }
+
+  function matches(m) {
+    if (!includeOtherPools && opts.poolId) {
+      const pool = m.pool || m.kind;
+      if (pool !== opts.poolId) return false;
+    } else if (!includeOtherPools && !opts.poolId) {
+      if (!kinds.includes(m.kind)) return false;
+    }
+    if (activeTags.size) {
+      const tags = new Set(m.tags || []);
+      for (const t of activeTags) if (!tags.has(t)) return false;
+    }
+    if (!query) return true;
+    const q = query.toLowerCase();
+    return (m.text || '').toLowerCase().includes(q)
+      || (m.title || '').toLowerCase().includes(q)
+      || (m.tags || []).some((t) => t.includes(q));
+  }
+
+  function paintList() {
+    clear(list);
+    const shown = messages
+      .filter(matches)
+      .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.uses || 0) - (a.uses || 0));
+    count.textContent = `${shown.length}/${messages.length}`;
+    if (!shown.length) {
+      list.append(el('div', { class: 'qs-empty dim', text: messages.length ? 'nothing matches that filter' : `no ${opts.title.toLowerCase()} messages yet` }));
+      return;
+    }
+    for (const m of shown.slice(0, 200)) {
+      const text = m.text || '';
+      const btn = el('button', {
+        type: 'button',
+        class: 'qs-item',
+        role: 'option',
+        'aria-selected': selected && selected.id === m.id ? 'true' : 'false',
+        title: text,
+      });
+      btn.append(
+        el('span', { class: 'qs-item-kind', 'data-kind': m.kind || 'wall', text: m.pool || m.kind || '' }),
+        el('span', { class: 'qs-item-text' },
+          m.title ? el('span', { class: 'qs-item-title', text: m.title }) : null,
+          el('span', { class: 'qs-item-body', text: text || '(no text)' }),
+          m.tags && m.tags.length
+            ? el('span', { class: 'qs-item-tags dim', text: m.tags.slice(0, 6).join(' · ') })
+            : null,
+        ),
+        m.pinned ? el('span', { class: 'qs-pin', text: '●' }) : null,
+      );
+      btn.addEventListener('click', () => {
+        selected = m;
+        textArea.value = m.text || '';
+        titleInput.value = m.title || '';
+        paintList();
+        textArea.focus();
+      });
+      list.append(btn);
+    }
+  }
+
+  search.addEventListener('input', () => {
+    query = search.value.trim();
+    paintList();
+  });
+  otherBox.addEventListener('change', () => {
+    includeOtherPools = otherBox.checked;
+    paintList();
+  });
+
+  /* ------------------------------------------------------------ sending */
+
+  function payload() {
+    const text = textArea.value.trim();
+    const base = {};
+    if (selected && !text.trim()) base.poolId = selected.id;
+    else if (text) base.text = text;
+    if (titleInput.value.trim()) base.title = titleInput.value.trim();
+    if (selected && selected.kind && !base.kind) base.kind = selected.kind;
+    return base;
+  }
+
+  let busy = false;
+  async function fire(scheduled) {
+    if (busy) return;
+    const body2 = payload();
+    if (!body2.text && !body2.poolId) {
+      toast('nothing to send — type a message or pick one', 'error');
+      return;
+    }
+    const at = scheduled ? fromLocalInput(atInput.value) : NaN;
+    if (scheduled && !Number.isFinite(at)) {
+      toast('pick a date and time first', 'error');
+      atInput.focus();
+      return;
+    }
+    busy = true;
+    sendBtn.disabled = true;
+    schedToggle.disabled = true;
+    try {
+      if (scheduled) {
+        await opts.onSchedule({ ...body2, at });
+        toast(`booked for ${new Date(at).toLocaleString()}`, 'ok');
+        atInput.hidden = true;
+        schedToggle.dataset.on = '';
+        sendBtn.textContent = 'Send now';
+      } else {
+        await opts.onSend(body2);
+        toast(`${opts.title.toLowerCase()} sent`, 'ok');
+      }
+      if (keepBox.checked && body2.text && opts.onSave) {
+        try {
+          await opts.onSave({ text: body2.text, title: body2.title, kind: body2.kind, tags: [] });
+          keepBox.checked = false;
+          await refresh();
+        } catch (err) {
+          toast(`saved send, but pool save failed: ${err.message}`, 'error');
+        }
+      }
+      selected = null;
+      textArea.value = '';
+      titleInput.value = '';
+      atInput.value = '';
+      paintList();
+    } catch (err) {
+      toast(`${scheduled ? 'schedule' : 'send'} failed: ${err.message}`, 'error');
+    } finally {
+      busy = false;
+      sendBtn.disabled = false;
+      schedToggle.disabled = false;
+    }
+  }
+
+  sendBtn.addEventListener('click', () => {
+    const wantsLater = !atInput.hidden && !!atInput.value;
+    fire(wantsLater);
+  });
+
+  schedToggle.addEventListener('click', () => {
+    const on = !atInput.hidden;
+    atInput.hidden = on;
+    schedToggle.dataset.on = on ? '' : 'true';
+    if (on) {
+      sendBtn.textContent = 'Send now';
+      atInput.value = '';
+    } else {
+      if (!atInput.value) atInput.value = inMinutes(5);
+      sendBtn.textContent = 'Schedule';
+      atInput.focus();
+    }
+  });
+
+  // Enter sends from the composer; Shift+Enter is a newline. The textarea keeps its own meaning for
+  // Enter once the message is more than one line, so this only fires for a plain single keystroke.
+  textArea.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendBtn.click();
+    }
+  });
+  titleInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      textArea.focus();
+    }
+  });
+
+  /* ------------------------------------------------------------ data */
+
+  async function refresh() {
+    const r = await opts.api.get('/api/pools');
+    // the pooled view endpoint returns counts plus the messages for the requested pool; fall back
+    // to the module's own pool when the combined route is not carrying bodies
+    // `/api/pools` gives counts only; the box needs the bodies, so it reads its own pool and
+    // only reaches for every pool when the operator turns "all pools" on.
+    const want = includeOtherPools ? 'all' : (opts.poolId || (opts.kinds && opts.kinds[0]) || 'all');
+    const one = await opts.api.get(`/api/pool/${encodeURIComponent(want)}`);
+    if (want !== 'all' && one && Array.isArray(one.messages)) {
+      // views are flat message lists, so the pool name comes from `kind` (dialog ⇒ dialogs)
+      messages = one.messages.map((m) => ({ ...m, pool: opts.poolId || m.kind }));
+    } else if (one && Array.isArray(one.messages)) {
+      messages = one.messages.map((m) => ({ ...m, pool: m.kind === 'wall' ? 'wall' : `${m.kind}s` }));
+    } else {
+      messages = [];
+    }
+    otherToggle.hidden = !opts.poolId || !(r && r.counts && Object.keys(r.counts).length > 1);
+    paintTags();
+    paintList();
+  }
+
+  refresh().catch((err) => {
+    list.append(el('div', { class: 'qs-empty dim', text: `pool unavailable: ${err.message}` }));
+  });
+
+  return {
+    refresh,
+    get selected() {
+      return selected;
+    },
+    select(message) {
+      selected = message;
+      textArea.value = message ? message.text || '' : '';
+      paintList();
+    },
+    setText(text) {
+      textArea.value = text;
+    },
+    focus() {
+      textArea.focus();
+    },
+  };
+}
+
+export { MAX_TAGS };

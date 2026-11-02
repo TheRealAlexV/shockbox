@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Windows TUI controller for ShockBox: supervises server.mjs, edits settings, reads /health"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "PolyForm-Noncommercial-1.0.0"
 dependencies = [
   # The UI half. Core modules (supervisor, control, settings, apiclient, paths, logtail) import
   # nothing outside the standard library, so the supervisor works on a box where Textual is broken.

@@ -121,20 +121,6 @@
       "group": "effects"
     }
   },
-  "files": {
-    "pages": [
-      {
-        "route": "/body",
-        "title": "Hand FX body tracking",
-        "file": "pages/body.html",
-        "headers": {
-          "Cross-Origin-Opener-Policy": "same-origin",
-          "Cross-Origin-Embedder-Policy": "require-corp",
-          "Cross-Origin-Resource-Policy": "cross-origin"
-        }
-      }
-    ]
-  },
   "pages": [
     {
       "route": "/handfx",

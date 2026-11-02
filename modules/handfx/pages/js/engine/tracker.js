@@ -28,7 +28,8 @@ const DEVICES = {
 import { makeHand, OPEN_PALM } from './pose.js';
 
 const MODEL_CACHE = 'handfx:models-v1';
-const MODEL_KEY = '/handfx/model/hand_landmarker.task';
+const MODEL_KEY_LOCAL = '/handfx/model/hand_landmarker.task?from=local';
+const MODEL_KEY_CDN = '/handfx/model/hand_landmarker.task?from=cdn';
 
 /** The wasm fileset the SDK is handed. Directory names match the module's vendor aliases. */
 export function wasmFileset(base = '/api/handfx/vendor') {
@@ -44,14 +45,21 @@ export function wasmFileset(base = '/api/handfx/vendor') {
  * Fetch the model once, keep the bytes in Cache Storage, serve them to the SDK from there. A
  * cache hit costs no network; a miss downloads from the module (a local file when the rig has
  * one) or the official model URL when it does not.
+ *
+ * Two cache keys, not one: the bytes in Cache Storage were indistinguishable by origin, so a copy
+ * downloaded from the CDN in an earlier run was served to a page whose server now has the file on
+ * disk, and nothing in the network panel or the resource timing could tell which had been used.
+ * The key names its source, so a page that wants the local model never gets a CDN copy and the
+ * browser evidence is readable.
  */
 export async function fetchModel({ local, url, signal } = {}) {
   const source = local ? '/api/handfx/model' : url;
   if (!source) throw new Error('no model source');
+  const key = local ? MODEL_KEY_LOCAL : MODEL_KEY_CDN;
   const cache = typeof caches !== 'undefined' ? await caches.open(MODEL_CACHE) : null;
   if (cache) {
-    const hit = await cache.match(MODEL_KEY);
-    if (hit) return { buffer: await hit.arrayBuffer(), cached: true, source };
+    const hit = await cache.match(key);
+    if (hit) return { buffer: await hit.arrayBuffer(), cached: true, source, from: local ? 'local' : 'cdn' };
   }
   const res = await fetch(source, { signal, cache: 'no-cache' });
   if (!res.ok) throw new Error(`model download failed: HTTP ${res.status} from ${source}`);
@@ -59,12 +67,12 @@ export async function fetchModel({ local, url, signal } = {}) {
   if (!buffer.byteLength) throw new Error(`model download was empty: ${source}`);
   if (cache) {
     try {
-      await cache.put(MODEL_KEY, new Response(buffer, { headers: { 'content-type': 'application/octet-stream' } }));
+      await cache.put(key, new Response(buffer, { headers: { 'content-type': 'application/octet-stream' } }));
     } catch {
       /* a full or disabled cache is not a failure: the bytes in hand are what matter */
     }
   }
-  return { buffer, cached: false, source };
+  return { buffer, cached: false, source, from: local ? 'local' : 'cdn' };
 }
 
 /** Detection/tracking confidence from the pane's sensitivity (0.4–2), clamped sane. */
@@ -97,6 +105,8 @@ export class Tracker {
     this.deviceLabel = '';
     this.source = 'camera'; // camera | synthetic
     this.synthetic = null;
+    // Where the model bytes came from (`local` = the module's own file, `cdn` = the model URL).
+    this.modelSource = null;
     this._t0 = 0;
   }
 
@@ -105,6 +115,7 @@ export class Tracker {
       state: this.state,
       error: this.error,
       model: this.model,
+      modelSource: this.modelSource,
       runtime: this.runtime,
       deviceLabel: this.deviceLabel,
       source: this.source,
@@ -204,6 +215,9 @@ export class Tracker {
         }
       }
       this.landmarker = landmarker;
+      // Which copy was used is not visible from the picture: a CDN download and the module's own
+      // file both end here as "ready". Keep it so the pane and the browser gate can ask.
+      this.modelSource = { from: model.from, source: model.source, cached: model.cached, bytes: model.buffer.byteLength };
       this._setState({ model: 'ready' });
     } catch (err) {
       if (!(err instanceof MediaError)) this._setState({ model: 'failed' });

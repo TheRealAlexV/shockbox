@@ -12,8 +12,7 @@ Source: `modules/wall/server.js`, `commands.mjs`, `ratio.mjs`, `module.json`, `u
 {
   "id": "wall", "title": "LED Wall", "version": "1.0.0", "mount": "server.js",
   "pages": [
-    { "route": "/wall/render",   "file": "engine/display.html" },
-    { "route": "/wall/portrait", "file": "pages/display-portrait.html" }
+    { "route": "/wall/render", "file": "engine/display.html" }
   ]
 }
 ```
@@ -22,7 +21,10 @@ Source: `modules/wall/server.js`, `commands.mjs`, `ratio.mjs`, `module.json`, `u
   Neither is declared in `module.json`; a client asking `?channels=wall,wall-state` gets both.
 - No `order` (defaults to 100). No `settings` block in the manifest — the settings schema below is
   built in `server.js`, not by the registry.
-- `/wall/portrait` is served but unused (the 9:16 picture is a fence inside `/wall/render`).
+- **`/wall/render` is the only page.** There is no `/wall/portrait` route: `module.json` does not
+  declare it, nothing in the server or the shell references it, and `modules/wall/pages/display-portrait.html`
+  is unreachable dead weight. The 9:16 picture is a fence inside `/wall/render`, and the view
+  list below survives only at the wire level.
 
 ## HTTP routes (all under `/api/wall`)
 
@@ -32,7 +34,7 @@ Source: `modules/wall/server.js`, `commands.mjs`, `ratio.mjs`, `module.json`, `u
 | PATCH | `/settings` | any subset of the settings keys | `{ok, changed[], settings, ratio}` |
 | POST | `/cmd` | `{cmd, args?, view?}` | dispatcher answer: `{…, ok, note, delivered}`; `{seq, ok:false, note:'refused: scene forces 16:9', ratio}` for a refused toggle |
 | GET | `/cmd` | — | `{ok, commands[], seq}` |
-| POST | `/state` | `{view:'landscape'\|'portrait', state{…}}` | `{ok, online}`; stores what the page reports as its last-known state |
+| POST | `/state` | `{view:'landscape'\|'portrait', state{…}}` | `{ok, online}`; stores what the page reports as its last-known state. The server still accepts `view:'portrait'` (`modules/wall/server.js:405`), but **no page serves it**: `/wall/render` reports itself as landscape, so the `portrait` slot stays offline |
 | GET | `/state` | — | `{ok, seq, gates, views, online, history}` |
 | PUT | `/state` | `{gates:{landscapeLive?,portraitLive?}}` | `{ok, gates}`; 400 on any other key |
 | GET | `/render` | — | `{ok, settings:{look,ratio,fence,rev}, online:{landscape,portrait}, seq}` |
@@ -121,7 +123,11 @@ ratio watcher through `ctx.core.settings` (`server.js:89`).
 | route | file | expects |
 |---|---|---|
 | `/wall/render` | `engine/display.html` + `engine/*.js` | the wall canvas; opens SSE `/events?channels=wall&view=<landscape\|portrait>`, posts `/api/wall/state` ≤1 per 1.5 s, reads `/api/wall/render` | 
-| `/wall/portrait` | `pages/display-portrait.html` | a dedicated portrait source; kept, unused |
+
+Only `/wall/render` is a page. There is **no `/wall/portrait` route**: `pages/display-portrait.html`
+exists in the tree but nothing serves it, so a browser source pointed at `/wall/portrait` gets the
+shell's 404, not a portrait renderer. Use `/wall/render` with `ratio: 9:16` (or the fence) for the
+9:16 picture.
 
 Pane: `ui/pane.js` in the admin shell — settings form (writes `PATCH /settings`), preview with a
 draggable fence (`POST /broadcast` while dragging, `PUT /fence` on release), ratio and blackout

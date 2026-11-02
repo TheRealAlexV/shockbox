@@ -14,7 +14,11 @@
     {
       "route": "/wall/render",
       "file": "engine/display.html",
-      "title": "LED wall (16:9 render surface, OBS browser source)"
+      "title": "LED wall (16:9 render surface, OBS browser source)",
+      "headers": {
+        "cross-origin-opener-policy": "same-origin",
+        "cross-origin-embedder-policy": "require-corp"
+      }
     }
   ],
   "settings": {
@@ -272,6 +276,84 @@
     "acsTonemap": {
       "type": "number",
       "default": 0,
+      "min": 0,
+      "max": 1,
+      "step": 1,
+      "group": "look"
+    },
+    "imageOn": {
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 1,
+      "step": 1,
+      "group": "look",
+      "note": "1 = the uploaded picture is on the wall, 0 = the pattern is"
+    },
+    "imageRev": {
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "group": "look",
+      "note": "The revision of /api/wall/image the wall should be showing (bumped by each upload)"
+    },
+    "imageX": {
+      "type": "number",
+      "default": 0.5,
+      "min": 0,
+      "max": 1,
+      "step": 0.005,
+      "group": "look"
+    },
+    "imageY": {
+      "type": "number",
+      "default": 0.5,
+      "min": 0,
+      "max": 1,
+      "step": 0.005,
+      "group": "look"
+    },
+    "imageScale": {
+      "type": "number",
+      "default": 0.6,
+      "min": 0.05,
+      "max": 4,
+      "step": 0.01,
+      "group": "look"
+    },
+    "imageRotate": {
+      "type": "number",
+      "default": 0,
+      "min": -180,
+      "max": 180,
+      "step": 1,
+      "group": "look"
+    },
+    "imageColour": {
+      "type": "enum",
+      "default": "raw",
+      "values": [
+        "raw",
+        "match",
+        "palette"
+      ],
+      "group": "look"
+    },
+    "imageBits": {
+      "type": "enum",
+      "default": "8",
+      "values": [
+        "8",
+        "10",
+        "12"
+      ],
+      "group": "look"
+    },
+    "imageDither": {
+      "type": "number",
+      "default": 1,
       "min": 0,
       "max": 1,
       "step": 1,

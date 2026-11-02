@@ -231,6 +231,66 @@ async function main() {
     );
     ok('unknown cmd is a 400', bad && bad.status === 400 && /unknown cmd/.test(bad.body.error || ''), JSON.stringify(bad));
 
+    // 3b. Pool-sourced text: the module resolves `poolId`/`slot` into an `item` on the
+    // SERVER (resolvePoolArgs), so the page only ever sees a fully-formed item and a pool
+    // record edited after the send cannot render stale. Proven here end-to-end.
+    const poolAdd = await fetch(`${srv.url}/api/pool/wall/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'pool probe 2026', kind: 'wall', type: 'Info' }),
+    }).then((r) => r.json());
+    ok('wall pool accepts a message', poolAdd && poolAdd.ok === true && poolAdd.message && poolAdd.message.id, JSON.stringify(poolAdd));
+    const poolId = poolAdd && poolAdd.message && poolAdd.message.id;
+    if (poolId) {
+      const byPool = await fetch(`${srv.url}/api/wall/cmd`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cmd: 'text.send', args: { poolId } }),
+      }).then(async (r) => ({ status: r.status, body: await r.json() }));
+      ok('text.send by poolId accepted', byPool.status === 200 && byPool.body.ok === true, JSON.stringify(byPool));
+
+      // Wait for the send to *land*: the engine answers text.send by committing text mode, so
+      // "mode is text" is the applied condition. Waiting on the JSON string itself is always
+      // truthy (it is a non-empty string), which is how this read a stale empty text object.
+      const poolText = await waitFor(
+        c,
+        `(function(i){var t=i.textObject()||{};var hit=t&&t.paras&&JSON.stringify(t.paras).indexOf('pool probe 2026')>=0;return hit?JSON.stringify({title:t.title,source:t.source,paras:t.paras,mode:i.s&&i.s.mode}):null;})(window.LEDWALL_INSTANCE)`,
+      );
+      ok('pool row reaches the page as an item', /pool probe 2026/.test(poolText || ''), String(poolText));
+      // The engine derives `source: {kind:'pool', id}` from item.id — this is the schema the
+      // module.json text contract described and nothing ever supplied before.
+      ok('pool text carries its source id', /"kind":"pool"/.test(poolText || '') && /"id":"m1"/.test(poolText || ''), String(poolText));
+
+      const bySlot = await fetch(`${srv.url}/api/wall/cmd`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cmd: 'text.send', args: { slot: 1 } }),
+      }).then(async (r) => ({ status: r.status, body: await r.json() }));
+      ok('text.send by slot resolves', bySlot.status === 200 && bySlot.body.ok === true, JSON.stringify(bySlot));
+
+      const otherKind = await fetch(`${srv.url}/api/pool/dialogs/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: 'not a wall message', kind: 'dialog', type: 'Info' }),
+      }).then((r) => r.json());
+      if (otherKind && otherKind.message) {
+        const wrongPool = await fetch(`${srv.url}/api/wall/cmd`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cmd: 'text.send', args: { poolId: otherKind.message.id } }),
+        }).then(async (r) => ({ status: r.status, body: await r.json() }));
+        ok('a non-wall pool message is refused by the wall', wrongPool.status === 404, JSON.stringify(wrongPool));
+        await fetch(`${srv.url}/api/pool/dialogs/messages/${otherKind.message.id}`, { method: 'DELETE' }).catch(() => {});
+      }
+    }
+    const badPool = await evaluate(
+      c,
+      `fetch('/api/wall/cmd',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cmd:'text.send',args:{poolId:'nope-not-a-message'}})}).then(async r=>({status:r.status,body:await r.json()}))`,
+      true,
+    );
+    ok('unknown poolId is a 404', badPool && badPool.status === 404, JSON.stringify(badPool));
+    if (poolId) await fetch(`${srv.url}/api/pool/wall/messages/${poolId}`, { method: 'DELETE' }).catch(() => {});
+
     // 4. The heartbeat marks the page online, through its own POST /api/wall/state.
     const online = await waitFor(c, `fetch('/api/wall/render').then(r=>r.json()).then(j=>j.online.landscape === true)`, 8000);
     ok('page heartbeat marks it online', Boolean(online));
@@ -306,6 +366,103 @@ async function main() {
       );
       ok('fence edge is lit against the dimmed wall', px.inside > px.outside + 12, `ring ${px.inside.toFixed(0)} vs outside ${px.outside.toFixed(0)}`);
     }
+
+    // 5b. The three lookup selectors. `look.palette` is the ramp only and `look.pattern` is
+    // the animation only: each must change exactly its own dimension and leave the other, and
+    // the mode, alone. Proven on the live page, not on the whitelist alone.
+    const selBefore = await evaluate(
+      c,
+      `(function(i){var s=i.s;return JSON.stringify({palette:s.palette,pattern:(s.views&&s.views[i.view]&&s.views[i.view].pattern)||s.pattern,mode:s.mode});})(window.LEDWALL_INSTANCE)`,
+    );
+    const sel0 = JSON.parse(selBefore);
+    const palRes = await fetch(`${srv.url}/api/wall/cmd`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: 'look.palette', args: { delta: 1 } }),
+    }).then((r) => r.json());
+    ok('look.palette accepted', palRes && palRes.ok === true, JSON.stringify(palRes));
+    const palChanged = await waitFor(
+      c,
+      `(function(i){return i.s.palette !== ${JSON.stringify(sel0.palette)};})(window.LEDWALL_INSTANCE)`,
+      4000,
+    );
+    const afterPal = JSON.parse(
+      await evaluate(
+        c,
+        `(function(i){var s=i.s;return JSON.stringify({palette:s.palette,pattern:(s.views&&s.views[i.view]&&s.views[i.view].pattern)||s.pattern,mode:s.mode});})(window.LEDWALL_INSTANCE)`,
+      ),
+    );
+    ok('look.palette changes the palette', Boolean(palChanged), `${sel0.palette} -> ${afterPal.palette}`);
+    ok('look.palette leaves the pattern alone', afterPal.pattern === sel0.pattern, `pattern ${sel0.pattern} -> ${afterPal.pattern}`);
+    ok('look.palette leaves the mode alone', afterPal.mode === sel0.mode, `mode ${sel0.mode} -> ${afterPal.mode}`);
+
+    const patRes = await fetch(`${srv.url}/api/wall/cmd`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: 'look.pattern', args: { name: 'comet' } }),
+    }).then((r) => r.json());
+    ok('look.pattern accepted', patRes && patRes.ok === true, JSON.stringify(patRes));
+    const patApplied = await waitFor(
+      c,
+      `(function(i){var v=(i.s.views&&i.s.views[i.view])||{};return (v.pattern||i.s.pattern) === 'comet';})(window.LEDWALL_INSTANCE)`,
+      4000,
+    );
+    const afterPat = JSON.parse(
+      await evaluate(
+        c,
+        `(function(i){var s=i.s;return JSON.stringify({palette:s.palette,pattern:(s.views&&s.views[i.view]&&s.views[i.view].pattern)||s.pattern,mode:s.mode});})(window.LEDWALL_INSTANCE)`,
+      ),
+    );
+    ok('look.pattern changes the pattern', Boolean(patApplied), `pattern ${afterPal.pattern} -> ${afterPat.pattern}`);
+    ok('look.pattern leaves the palette alone', afterPat.palette === afterPal.palette, `palette ${afterPal.palette} -> ${afterPat.palette}`);
+
+    // 5c. `preset.save` snapshots the live look under a name, the name becomes the running
+    // preset, and the saved look survives a page reload (so a saved preset is usable by the
+    // OBS source, not just by the pane that made it).
+    const saveRes = await fetch(`${srv.url}/api/wall/cmd`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: 'preset.save', args: { name: 'probe-look' } }),
+    }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    ok('preset.save accepted', saveRes.status === 200 && saveRes.body.ok === true, JSON.stringify(saveRes.body));
+    const savedLive = await evaluate(
+      c,
+      `fetch('/api/wall/render').then(r=>r.json()).then(j=>JSON.stringify({order:j.settings.presets.order, saved:Object.keys(j.settings.presets.saved)}))`,
+      true,
+    );
+    ok('saved preset is in the bank', /probe-look/.test(savedLive || ''), String(savedLive));
+    const savedLook = JSON.parse(savedLive || '{}').saved || [];
+    ok('saved preset carries the look', savedLook.indexOf('probe-look') >= 0, JSON.stringify(savedLook));
+    // The saved preset must not carry a text pool: nothing under the view's text.
+    const savedBody = await evaluate(
+      c,
+      `fetch('/api/wall/render').then(r=>r.json()).then(j=>JSON.stringify(j.settings.presets.saved['probe-look']||{}))`,
+      true,
+    );
+    ok('saved preset holds no text-pool data', !/paras|text|pool/i.test(savedBody || ''), String(savedBody).slice(0, 200));
+    // And it applies by name from the bus, which is what the pane's dropdown posts.
+    await fetch(`${srv.url}/api/wall/cmd`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: 'look.palette', args: { name: 'lava' } }),
+    });
+    const appliedByName = await fetch(`${srv.url}/api/wall/cmd`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: 'preset.set', args: { name: 'probe-look' } }),
+    }).then((r) => r.json());
+    ok('preset.set accepts the saved name', appliedByName && appliedByName.ok === true, JSON.stringify(appliedByName));
+    const backToSaved = await waitFor(c, 'window.LEDWALL_INSTANCE.s.palette !== "lava"', 4000);
+    ok('applying the saved preset restores its palette', Boolean(backToSaved), String(await evaluate(c, 'window.LEDWALL_INSTANCE.s.palette')));
+    // `sign` was retired from the deck's preset cycle; a next/prev must land on a real preset.
+    const cyc = await fetch(`${srv.url}/api/wall/cmd`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cmd: 'preset.next' }),
+    }).then((r) => r.json());
+    ok('preset.next answers', cyc && cyc.ok === true, JSON.stringify(cyc));
+    const maybeSign = await evaluate(c, 'window.LEDWALL_INSTANCE.label');
+    ok('preset.next never lands on the retired "sign"', maybeSign !== 'sign', `label=${maybeSign}`);
 
     // 6. No page errors. The engine logs to console on a broken script.
     const errors = c.events

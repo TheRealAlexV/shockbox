@@ -22,9 +22,14 @@
 import { el, clear, dot, actionButton, fmtAgo, every } from '/src/ui.js';
 import { toast } from '/src/toast.js';
 import { renderSettingsForm } from '/src/settings-form.js';
+import { mountQuickSend } from '/src/quicksend.js';
+import { mountSchedulePanel } from '/src/schedule-panel.js';
+import { mountPreview } from '/src/preview.js';
 
 const CANVAS_W = 405;
 const CANVAS_H = 720;
+// The 810×1440 dialog canvas inside the 2560×1440 picture: a centred 9:16 strip.
+const FENCE = { x: (2560 - 810) / 2 / 2560, w: 810 / 2560, y: 0 };
 
 const THEMES = { win11: 'Windows 11', win95: 'Windows 95', macos: 'macOS' };
 
@@ -183,14 +188,15 @@ export async function render(container, ctx) {
   /* --- preview: the phone strip ------------------------------------------ */
 
   const countOut = el('span', { class: 'dg-count mono', text: '0' });
-  const stage = el('div', { class: 'dg-stage' });
-  const desk = el('div', { class: 'dg-desk skin-win11' }); // the 405×720 canvas, scaled by CSS
   const emptyNote = el('div', { class: 'dg-empty' },
     el('span', { class: 'dg-empty-mark' }),
     el('span', { text: 'no alerts on the strip' }),
   );
+  // The shared preview: the dialogs are the window's layer, drawn in the 405×720 canvas space.
+  const desk = el('div', { class: 'dg-desk' }); // the canvas root the layer scales
   desk.append(emptyNote);
-  stage.append(desk);
+  const previewHost = el('div', { class: 'dg-preview-host' });
+  const pv = mountPreview(previewHost, { interactive: false, fence: false, windowed: false });
 
   const previewMode = el('span', { class: 'dg-mode' });
   const previewPanel = el('section', { class: 'panel dg-preview' },
@@ -198,10 +204,24 @@ export async function render(container, ctx) {
       el('span', { class: 'panel-title', text: 'Phone strip' }),
       countOut,
       previewMode,
-      el('span', { class: 'panel-hint mono dim', text: '405 × 720 · live cascade' }),
+      el('span', { class: 'panel-hint mono dim', text: '810 × 1440 canvas · live cascade' }),
     ),
-    stage,
+    previewHost,
   );
+  pv.setFenceVisible(true);
+  pv.setFence(FENCE);
+  pv.setLayer(desk);
+  // The window is sized from the frame's width, so its pixel size is what the layer scales by;
+  // the component writes --pv-lit-w/-h on the window for exactly that.
+  const scaleLayer = () => {
+    const win = pv.window;
+    const w = parseFloat(getComputedStyle(win).getPropertyValue('--pv-lit-w')) || win.clientWidth;
+    if (w > 0) desk.style.transform = `scale(${w / CANVAS_W})`;
+    emptyNote.hidden = desk.querySelectorAll('.dialog').length > 0;
+  };
+  const winRO = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => scaleLayer()) : null;
+  winRO?.observe(pv.window);
+  timers.push(() => winRO?.disconnect());
 
   /** One preview dialog: the overlay's own structure, placed at the entity's canvas box. */
   function previewDialog(entity) {
@@ -291,8 +311,10 @@ export async function render(container, ctx) {
     previewMode.dataset.theme = themeKey;
     const rows = [...live].sort((a, b) => (a.born || 0) - (b.born || 0));
     for (const node of [...desk.querySelectorAll('.dialog')]) node.remove();
-    emptyNote.hidden = rows.length > 0;
     for (const entity of rows) desk.appendChild(previewDialog(entity));
+    // The layer root was cleared-and-refilled by setLayer only once; re-hand it so a clone for
+    // the dimmed half stays the same content, then re-scale to the window's current width.
+    pv.setLayer(desk);
     // The newest one is the one the operator just triggered: mark it so a spawn is findable
     // inside a full cascade.
     const newest = rows[rows.length - 1];
@@ -300,6 +322,8 @@ export async function render(container, ctx) {
     countOut.textContent = `${rows.length}${capacity ? ` / ${capacity}` : ''}`;
     countOut.dataset.state = capacity && rows.length >= capacity ? 'full' : 'ok';
     desk.dataset.rev = String(seqRev);
+    emptyNote.hidden = rows.length > 0;
+    scaleLayer();
   }
 
   function cssId(id) {
@@ -397,7 +421,6 @@ export async function render(container, ctx) {
   let scaleTimer = null;
   scaleRange.addEventListener('input', () => {
     scaleVal.textContent = Number(scaleRange.value).toFixed(2);
-    desk.style.setProperty('--dg-scale', scaleRange.value);
     clearTimeout(scaleTimer);
     scaleTimer = setTimeout(() => patchSettings({ scale: Number(scaleRange.value) }), 220);
   });
@@ -413,8 +436,32 @@ export async function render(container, ctx) {
     el('span', { class: 'look-label', text: 'Scale' }), scaleRange, scaleVal,
   );
   // `quick` sits between the control bar and the body: one line, above the preview.
+  // Quick send goes above the control bar, because "send something" is the page's main verb.
+  const quickSlot = el('div', { class: 'qs-slot' });
+  const quickBox = mountQuickSend(quickSlot, {
+    title: 'Quick send',
+    api,
+    poolId: 'dialogs',
+    kinds: ['dialog'],
+    placeholder: 'Pop a dialog — text, or pick from the pool…',
+    allowRandom: true,
+    onSend: (p) => api.post('/api/dialogs/live', p.text
+      ? { text: p.text, ...(p.title ? { title: p.title } : {}) }
+      : { poolId: p.poolId }),
+    onSchedule: (p) => api.post('/api/schedules', {
+      module: 'dialogs',
+      at: p.at,
+      payload: p.text ? { text: p.text, ...(p.title ? { title: p.title } : {}) } : { poolId: p.poolId },
+    }),
+    onSave: (p) => api.post('/api/pool/dialogs/messages', { text: p.text, title: p.title || undefined, kind: 'dialog' }),
+    signal: ctx.signal,
+  });
+
   clear(container);
-  container.append(header, controlBar, quick, body);
+  const schedSlot = el('div', { class: 'sch-slot' });
+  mountSchedulePanel(schedSlot, { module: 'dialogs', api, title: 'Scheduled dialogs', signal: ctx.signal });
+
+  container.append(header, quickSlot, schedSlot, controlBar, quick, body);
 
   function paintQuick() {
     const themeKey = THEMES[settingsMeta.theme?.value] ? settingsMeta.theme.value : 'win11';

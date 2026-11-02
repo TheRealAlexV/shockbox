@@ -1,0 +1,219 @@
+/* Scheduled sends panel — a compact queue under the quick-send box.
+   A row is when (+ repeat, + missed) + what + the verbs; nothing here is decorative. */
+
+.sch {
+  margin-bottom: 12px;
+}
+
+.sch-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sch-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 168px;
+  overflow-y: auto;
+}
+
+.sch-row {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+  border-bottom: var(--hair) solid var(--line);
+}
+
+.sch-row:last-child {
+  border-bottom: 0;
+}
+
+.sch-row[data-status='sent'] {
+  opacity: 0.55;
+}
+
+.sch-row[data-status='cancelled'] {
+  opacity: 0.4;
+}
+
+.sch-row[data-status='failed'] {
+  color: var(--bad, #ff7a7a);
+}
+
+/* A missed window is a fact the operator must see, so it outranks the row's own dimming. */
+.sch-row[data-missed='true'] .sch-when-main {
+  color: var(--warn, #ffb454);
+}
+
+.sch-when {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.sch-when-main {
+  color: var(--accent);
+}
+
+.sch-repeat {
+  font-size: 10px;
+}
+
+.sch-row[data-status='sent'] .sch-when,
+.sch-row[data-status='cancelled'] .sch-when {
+  color: var(--dim);
+}
+
+.sch-badge {
+  font-size: 9px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.sch-missed {
+  background: color-mix(in srgb, var(--warn, #ffb454) 22%, transparent);
+  color: var(--warn, #ffb454);
+  border: var(--hair) solid var(--warn, #ffb454);
+}
+
+.sch-late {
+  color: var(--dim);
+  border: var(--hair) solid var(--line);
+}
+
+.sch-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sch-error {
+  font-size: 10px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sch-empty {
+  padding: 12px 8px;
+  font-size: 12px;
+  text-align: center;
+}
+
+/* --- grouped list (the control page's all-modules view) ---------------------------- */
+
+.sch-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px 2px;
+}
+
+.sch-group-head:not(:first-child) {
+  border-top: var(--hair) solid var(--line);
+  margin-top: 4px;
+}
+
+.sch-group-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.sch-group-count {
+  font-size: 10px;
+}
+
+/* --- repeat picker: shared by the booking bar and the inline editor ------------------ */
+
+.sch-rep {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sch-rep-every,
+.sch-rep-daily {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sch-rep-every[hidden],
+.sch-rep-daily[hidden] {
+  display: none;
+}
+
+.sch-rep-kind,
+.sch-rep-n,
+.sch-rep-unit,
+.sch-rep-at {
+  font-size: 11px;
+  padding: 2px 4px;
+  height: auto;
+}
+
+.sch-rep-n {
+  width: 52px;
+}
+
+.sch-rep-at {
+  width: 96px;
+}
+
+/* --- inline editor (never a native prompt) ----------------------------------------- */
+
+.sch-row-edit {
+  grid-template-columns: 1fr;
+  padding: 6px 8px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.sch-edit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.sch-edit-at {
+  font-size: 11px;
+  padding: 2px 4px;
+  width: 168px;
+  height: auto;
+}
+
+.sch-edit-text {
+  font-size: 11px;
+  padding: 2px 4px;
+  height: auto;
+  flex: 1 1 160px;
+  min-width: 120px;
+}
+
+@media (max-width: 720px) {
+  .sch-row {
+    grid-template-columns: 100px minmax(0, 1fr) auto auto auto;
+  }
+
+  .sch-edit-at {
+    width: 100%;
+  }
+}

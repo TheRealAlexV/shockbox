@@ -111,6 +111,24 @@
     dither: 1.0,              // 0 = off, 1 = on
     acsTonemap: 1.0,          // 0 = plain clamp, 1 = ACES filmic
 
+    // ── image layer ──────────────────────────────────────────────────────────
+    // One picture on the wall, sampled by LEDs like everything else (not an <img> overlay).
+    // The file is `/api/wall/image`; `imageRev` is the engine's texture key, so only a new
+    // upload makes a page re-download it.
+    imageOn: 0,               // 0 = pattern only, 1 = the picture is on the wall
+    imageRev: 0,              // bumped by each upload
+    imageX: 0.5,              // 0–1   centre of the picture, fraction of the wall width
+    imageY: 0.5,              // 0–1   centre of the picture, fraction of the wall height
+    imageScale: 0.6,          // 0.05–4 picture width as a fraction of the wall width
+    imageRotate: 0,           // -180–180 degrees
+    imageColour: 'raw',       // raw | match (nearest live-ramp colour) | palette (luminance)
+    imageBits: '8',           // '8' | '10' | '12' per channel
+    // Off by default: the wall re-emits every cell through its LED emitter profile, which
+    // already re-quantises an 8-bit picture, and the ordered dither only recovers colours
+    // that are gone before the picture reaches the LEDs. It is the option that earns its
+    // keep on a HDR-ish source at 10 or 12 bit, so it stays opt-in.
+    imageDither: 0,           // 0 = no ordered dither, 1 = 4x4 Bayer
+
     // deck / OBS (read by control.html, written into the source URL)
     deckDefault: { preset: 'neonwave', scale: 2, ratio: '9:16' },
 

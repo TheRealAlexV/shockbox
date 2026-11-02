@@ -28,7 +28,9 @@ Source: `modules/handfx/server.js`, `module.json`, `ui/pane.js`, `pages/`, `page
 
 Both pages are served via the core header hook so MediaPipe's wasm can run (`crossOriginIsolated`).
 `mountPrefix: '/vendor/'` + `mountFile` serve the vendored runtime from
-`/api/handfx/vendor/…`.
+`/api/handfx/vendor/…`. The manifest's `pages` array is the only page list the registry reads
+(`core/registry.mjs:116`); the duplicate `files.pages` block that used to sit beside it was never
+read and has been removed.
 
 **Export shape:** the default export is an object whose `channels`, `mountPrefix` and `mountFile`
 are getters that build the API on first touch (`self(ctx)`), because the context only arrives in
@@ -92,6 +94,39 @@ from `POST /ack` — never as a frame.
 read by `pages/js/` — the page's next-effect gesture is hardcoded to `palmTouch`
 (`pages/js/overlay/main.js:40`). The default (`bothFingertips`) is also the lightning gesture.
 
+### Merge semantics (what wins when a page and the document disagree)
+
+The page receives settings on two paths — the snapshot/`/status` seed and every `settings` bus
+event — and the renderer merges each one onto what it already has in `setSettings()`
+(`pages/js/engine/fx.js:551-564`):
+
+- **`intensity` merges key-by-key** onto the current map (`Object.assign({}, current, incoming)`,
+  `fx.js:556`): patching one effect's intensity leaves the other 22 alone. A missing key falls back
+  to `1` at draw time (`fx.js:619`), and an intensity clamped to `≤0.001` stops that effect drawing
+  without removing it from the list (`fx.js:620`).
+- **`skins` replaces the whole map** when present, and is left untouched when absent (`fx.js:557-559`),
+  which is what lets deleting a key fall back to the default orb. It is a map of effect id →
+  `'projectile' | 'heart'`; the renderer's registry accepts exactly those two (`SKINS`,
+  `modules/handfx/server.js:78`), and **only `shoot` wears a skin today** (`server.js:274-278` writes
+  `skins.shoot`; `module.json` `skins.help` says the same). An unknown skin is a 400, never coerced.
+- **`effects` replaces** the list, and any effect not in it stops drawing immediately
+  (`fx.js:563`). `effect.set` is the only command that writes it.
+- **`nextGesture` is inert**: it is never delivered to the page by anything that reads it, so the
+  merge never sees it. Do not build a deck key on it.
+- **`bufferScroll`** is a plain scalar overwrite; the renderer reads it as the lift of an effect
+  rising from a low palm, `(1 - y) * bufferScroll * 0.6` in field heights (`fx.js:1304`), and the
+  overlay defaults it to `0.35` when absent (`pages/js/overlay/main.js:106`).
+
+### `nextGesture` and `lightning` are mutually exclusive
+
+The "next effect" gesture must not be the gesture that fires `lightning`. The classifier returns
+`bothFingertips` for lightning (`main.js:37`), and the page hardcodes `palmTouch` as "next"
+(`main.js:40`). `module.json`'s `nextGesture` enum therefore exists to stop the operator picking
+`bothFingertips` for stepping the list: the same two-hand fingertip gesture cannot both arch
+lightning and advance the cursor. Valid values: `bothFingertips` (default — i.e. "no separate
+next gesture", because the page ignores it), `palmTouch`, `bothPalmsUp`, `fist`; only `palmTouch`
+matches what ships.
+
 ## Pages
 
 | route | file | expects |
@@ -104,12 +139,40 @@ synthetic hand), `gestures.js` (pure classifier, motion, gate), `fx.js` (WebGL2 
 registry, anchors), `fx-glsl.js` / `fx-glsl2.js` (GLSL ES 3.00, no extensions), `pose.js` (hand
 geometry).
 
-### Effect registry (23)
+### Effect / skin model (23 effects, two skins)
 
-`fireball`, `lightning`, `sparkring`, `embers`, `smoke`, `aura`, `wires`, `frost`, `portal`,
-`disco`, `slime`, `inkflow`, `shatter`, `cyber`, `bloomlife`, `echo`, `bodyonfire`, `bodysmoke`,
-`frozenbody`, `edit`, `electroshock`, `meteor`, `shoot`.
+The registry is 23 ids (`modules/handfx/server.js:51-75` `EFFECTS` for the server's copy, the
+implementations live in `pages/js/engine/fx.js`): `fireball`, `lightning`, `sparkring`, `embers`,
+`smoke`, `aura`, `wires`, `frost`, `portal`, `disco`, `slime`, `inkflow`, `shatter`, `cyber`,
+`bloomlife`, `echo`, `bodyonfire`, `bodysmoke`, `frozenbody`, `edit`, `electroshock`, `meteor`,
+`shoot`. The server knows ids only, never parameters.
 
+**Skins.** A skin is a visual variant of one effect, not a separate effect: `skins` is an
+`effect id → 'projectile' | 'heart'` map (`module.json` `settings.skins`; `SKINS` at
+`server.js:78`). Only `shoot` has implementations for both today — an entry for any other id is
+harmless but unread by the renderer. Absent means the default projectile orb. Two writers:
+the pane's skin switch and `projectile.fire {skin}` (`server.js:274-278`, which validates against
+`SKINS` and 400s on anything else rather than coercing).
+
+### Command table (what a deck key posts)
+
+`POST /api/handfx/cmd {cmd, args?}`; `cmd` must be in `CMDS` (`server.js:32-41`) or the answer is
+400 `unknown cmd: … (known: …)`. All payloads below are the real ones from `server.js:261-320`.
+
+| cmd | args | who acts | answer |
+|---|---|---|---|
+| `effect.next` | — | page (owns the cursor) | `{ok, seq}` |
+| `effect.prev` | — | page | `{ok, seq}` |
+| `effect.set` | `{value: [effectId, …]}` — or legacy `{id: effectId}` | server writes `settings.effects` on `value`, else publishes | `{ok, changed, settings}` with `value`; `{ok, seq}` with `id`; 400 `unknown effect: …` |
+| `tracking.toggle` | — | server flips `settings.enabled` | `{ok, changed, enabled, settings}` |
+| `mirror.toggle` | — | server flips `settings.mirror` | `{ok, changed, mirror, settings}` |
+| `projectile.fire` | `{skin?: 'projectile'\|'heart'}` | server records `settings.skins.shoot` when `skin` is given, then publishes | `{ok, seq}`; 400 `unknown skin: …` |
+| `edit.clear` | — | page wipes the operator's drawn canvas | `{ok, seq}` |
+| `reload` | — | page reloads | `{ok, seq}` |
+
+Every publish is stamped with `args.at` and `args.id`. Commands that only publish still reach the
+page on the `handfx` channel; `next`/`prev`/`reload` are deliberately the page's, because the
+cursor the operator sees is the page's own.
 - `bodyonfire`, `bodysmoke`, `frozenbody` read the body mask and draw nothing until one exists.
 - `inkflow`, `echo` use the history buffer; `electroshock`, `echo` sample a per-frame snapshot of
   the accumulated scene.

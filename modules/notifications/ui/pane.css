@@ -38,45 +38,33 @@
   color: var(--fg-2);
 }
 
-/* ----------------------------------------------------------------- stage */
+/* ------------------------------------------------------- preview component */
 
-.nt-stage {
-  position: relative;
-  display: flex;
-  justify-content: center;
+/* The shared preview owns the frame; the layer is the module's 405×720 canvas inside it. */
+.nt-preview-host {
   padding: 12px;
   border: var(--hair) solid var(--line);
-  background:
-    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 9px),
-    var(--bg-1);
-  overflow: hidden;
+  background: var(--bg-1);
 }
 
-/* The canvas is authored at 405×720 and scaled to the column: every px inside it is a strip
-   px, so the toast sizes read as real numbers, not a fitted approximation. */
-.nt-strip {
-  --nt-scale: 1;
+/* The overlay canvas at its own px size; scaled into the window by pane.js. Every px in here
+   is a strip px, so the toast sizes read as real numbers, not a fitted approximation. */
+.nt-layer {
   --nt-h: 76px;
-  position: relative;
-  flex: 0 0 auto;
+  position: absolute;
+  left: 0;
+  top: 0;
+  /* the overlay canvas in its own px: 405×720 at scale 1 (810×1440 in OBS at 2×) */
   width: 405px;
   height: 720px;
-  transform: scale(var(--nt-scale));
-  transform-origin: top center;
-  border: 1px solid var(--line-2);
-  background:
-    linear-gradient(180deg, rgba(177, 140, 255, 0.05), transparent 120px),
-    #101014;
-  border-radius: 10px;
-  overflow: hidden;
+  transform-origin: top left;
+  background: #101014;
   pointer-events: none;
-  /* the phone's own shadow, so the canvas reads as a surface inside the panel */
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(255, 255, 255, 0.03);
 }
 
 /* --- the preview toast: the overlay's own structure --------------------- */
 
-.nt-strip .toast {
+.nt-layer .toast {
   position: absolute;
   left: 14px;
   right: 14px;
@@ -91,7 +79,7 @@
   transition: top 180ms ease;
 }
 
-.nt-strip .toast[data-newest='true'] {
+.nt-layer .toast[data-newest='true'] {
   animation: nt-in 220ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
 }
 
@@ -101,11 +89,11 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .nt-strip .toast[data-newest='true'] { animation: none; }
-  .nt-strip .toast { transition: none; }
+  .nt-layer .toast[data-newest='true'] { animation: none; }
+  .nt-layer .toast { transition: none; }
 }
 
-.nt-strip .lead {
+.nt-layer .lead {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -115,13 +103,13 @@
   border-radius: 8px;
 }
 
-.nt-strip .glyph {
+.nt-layer .glyph {
   width: 18px;
   height: 18px;
   fill: currentColor;
 }
 
-.nt-strip .body {
+.nt-layer .body {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
@@ -129,7 +117,7 @@
   gap: 2px;
 }
 
-.nt-strip .title {
+.nt-layer .title {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.01em;
@@ -139,7 +127,7 @@
   text-overflow: ellipsis;
 }
 
-.nt-strip .text {
+.nt-layer .text {
   font-size: 13px;
   line-height: 1.25;
   display: -webkit-box;
@@ -149,14 +137,14 @@
   word-break: break-word;
 }
 
-.nt-strip .acts {
+.nt-layer .acts {
   flex: 0 0 auto;
   align-self: center;
   display: flex;
   gap: 6px;
 }
 
-.nt-strip .btn {
+.nt-layer .btn {
   font: inherit;
   font-size: 11px;
   font-weight: 600;
@@ -171,25 +159,25 @@
 
 /* --- the four looks, copied from the overlay ---------------------------- */
 
-.nt-strip .t-ios {
+.nt-layer .t-ios {
   background: rgba(246, 246, 248, 0.97);
   color: #101014;
   border-radius: 16px;
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.32), inset 0 0 0 1px rgba(255, 255, 255, 0.7);
 }
 
-.nt-strip .t-ios .lead { background: #e9e9ee; color: #3a3a40; }
+.nt-layer .t-ios .lead { background: #e9e9ee; color: #3a3a40; }
 
-.nt-strip .t-android {
+.nt-layer .t-android {
   background: #f7f7f9;
   color: #14161a;
   border-radius: 20px;
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
 }
 
-.nt-strip .t-android .lead { background: #dfe3ea; color: #2c313a; }
+.nt-layer .t-android .lead { background: #dfe3ea; color: #2c313a; }
 
-.nt-strip .t-win11 {
+.nt-layer .t-win11 {
   background: #f3f3f3;
   color: #1a1a1a;
   border-radius: 8px;
@@ -197,9 +185,9 @@
   border-right: 4px solid #2b88d8;
 }
 
-.nt-strip .t-win11 .lead { background: #e5e5e5; color: #0078d4; }
+.nt-layer .t-win11 .lead { background: #e5e5e5; color: #0078d4; }
 
-.nt-strip .t-macos {
+.nt-layer .t-macos {
   background: rgba(236, 236, 238, 0.96);
   color: #1b1b1d;
   border-radius: 12px;
@@ -207,54 +195,23 @@
   backdrop-filter: blur(10px);
 }
 
-.nt-strip .t-macos .lead { background: #dcdcdf; color: #3b3b3f; }
+.nt-layer .t-macos .lead { background: #dcdcdf; color: #3b3b3f; }
 
-/* --- ruler + empty state ------------------------------------------------ */
-
-/* One tick per stack slot down the left edge: the capacity has a shape, not just a number. */
-.nt-ruler {
-  position: absolute;
-  left: 3px;
-  top: 14px;
-  bottom: 14px;
-  width: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.nt-ruler-tick {
-  flex: 1 1 0;
-  min-height: 6px;
-  border-radius: 1px;
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.nt-ruler-tick[hidden] { display: none; }
+/* --- empty state -------------------------------------------------------- */
 
 .nt-empty {
   position: absolute;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  color: var(--fg-4);
-  font-size: 11px;
+  font-size: 26px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   white-space: nowrap;
+  color: rgba(255, 255, 255, 0.28);
 }
 
 .nt-empty[hidden] { display: none; }
-
-.nt-empty-mark {
-  width: 22px;
-  height: 2px;
-  background: var(--line-3);
-}
 
 /* --- panel head bits ---------------------------------------------------- */
 
@@ -397,5 +354,5 @@
 
 @media (max-width: 760px) {
   .nt-side { grid-template-columns: minmax(0, 1fr); }
-  .nt-stage { padding: 8px; }
+  .nt-preview-host { padding: 8px; }
 }

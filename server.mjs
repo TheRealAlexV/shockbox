@@ -18,6 +18,7 @@ import { loadRegistry } from './core/registry.mjs';
 import { createObsClient } from './core/obs.mjs';
 import { Settings } from './core/settings.mjs';
 import { createPool, poolRoutes } from './core/pool.mjs';
+import { createScheduler } from './core/schedule.mjs';
 import { createServer } from './core/server-http.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -193,6 +194,34 @@ registry = await loadRegistry({
   ctx: registryCtx,
 });
 
+// Scheduled sends live in core because a schedule is a fact about time, not about a module. The
+// delivery callback maps a booked job onto the same route a click would have called, so there is
+// exactly one implementation of "send this" per module.
+const scheduler = createScheduler({
+  dir: (sub) => path.join(STATE_DIR, sub),
+  log: log.scope('schedule'),
+  async deliver(job, body) {
+    const isCmd = Boolean(job.payload && job.payload.cmd);
+    const path = (job.payload && job.payload.path) || defaultSendPath(job);
+    const method = (job.payload && job.payload.method) || 'POST';
+    // A booked wall *message* is a `text.send` command: the wall has no message route of its own,
+    // and this is the one place that knows it. A booked command already carries its envelope.
+    const sent = !isCmd && !(job.payload && job.payload.path) && job.module === 'wall'
+      ? { cmd: 'text.send', args: body.text ? { text: body.text } : { poolId: body.poolId }, origin: 'schedule' }
+      : body;
+    const res = await httpServer.request(method, path, sent);
+    if (res.status >= 400) throw new Error(`${method} ${path} → ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+    return { path, method, status: res.status, body: res.body };
+  },
+});
+
+function defaultSendPath(job) {
+  // the wall takes everything as a command envelope, so a booked wall send is a text.send cmd
+  if (job.module === 'wall') return '/api/wall/cmd';
+  if (job.module === 'dialogs') return '/api/dialogs/live';
+  return '/api/notifications/live';
+}
+
 const httpServer = createServer({
   port: PORT,
   host: HOST,
@@ -210,6 +239,9 @@ const httpServer = createServer({
     // Core never names the module; it asks every loaded module for its extra routes.
     extraRoutes: [
       ...poolRoutes({ pool, events, log: log.scope('pool') }),
+      // Scheduled sends: /api/schedules (list, book, run now, cancel). Registered here rather than
+      // in a module so the wall, the dialogs and the notifications share one queue.
+      ...scheduler.routes,
       // Origin-level routes a module registers for itself (`/audio/<name>`). Evaluated here so a
       // module that fails cannot take the server down; `ctx.sounds` is already in the context.
       ...registry.entries
@@ -237,6 +269,7 @@ const httpServer = createServer({
 
 async function main() {
   const addr = await httpServer.listen(HOST, PORT);
+  scheduler.start();
   log.info(`listening on http://${addr.address}:${addr.port}`);
 
   if (coreSettings.get('obsEnabled')) {

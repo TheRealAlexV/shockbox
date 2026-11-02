@@ -42,14 +42,18 @@ browser source at `http://127.0.0.1:8972/<page>`.
 
 ## Tests
 
-`npm test` runs the gates in order and stops on the first failure. Each boots its own server and
-its own headless Chrome on free ports, so it is safe while the live server runs.
+`npm test` runs the 10 gates below, in order, and stops on the first failure. Each boots its own
+server and its own headless Chrome on free ports, so it is safe while the live server runs.
 
-`npm run test:ci` runs exactly what `.github/workflows/test.yml` runs on a push — `npm test` plus
-the visual proof in report mode — so a red CI run reproduces locally in one command.
+CI (`.github/workflows/test.yml`, on `push` **and** `pull_request`) runs `npm test` **and**
+`npm run test:handfx-visual:strict` as two separate jobs. `npm run test:ci` approximates that
+locally, but it runs the visual proof in **report mode** — a local convenience, not what CI runs.
+`node test/glsl-check.mjs` is not part of `npm test`. Full detail, including the TUI's pytest
+suite: [`docs/TESTING.md`](docs/TESTING.md).
 
 | gate | proves |
 |---|---|
+| `test/log-rotation.mjs` | the 8 MB rotation, `.1` numbering, and the 32 MB / 64 MB caps |
 | `test/ratio.mjs` | the scene-forced ratio state machine: entry, leave, restore, reconnect |
 | `test/ratio-commands.mjs` | `ratio.toggle` / `ratio.force16x9` are answered by the server, not forwarded to a page |
 | `test/api-smoke.mjs` | core routes ahead of module routes, the pool, `/events` channels, module assets |
@@ -70,8 +74,9 @@ Separate gates (not in `npm test`):
   not cover more than 97 % of the frame (`smoke`, `disco`, `inkflow`, `echo`, `edit`, `embers`,
   `wires`, `shoot` are exempt by name). By default it **reports**: every check runs and failures are
   printed with their numbers, but the exit code stays 0 unless the page cannot boot. `--strict`
-  (`npm run test:handfx-visual:strict`) exits 1 on any failed check — that is the local gate; CI uses
-  report mode because `disco`/`slime` sit near the thresholds on a software GL stack.
+  (`npm run test:handfx-visual:strict`) exits 1 on any failed check — that is the local gate **and**
+  the CI gate (`.github/workflows/test.yml:79-81`). Report mode is local-only, kept because
+  `disco`/`slime` sit near the thresholds on a software GL stack.
 - `npm run test:sound` — `test/sound.mjs` alone.
 - `node test/glsl-check.mjs` — compiles the wall engine shaders in headless Chrome.
 
@@ -83,8 +88,17 @@ Per-module API contracts: `docs/CONTRACT-{wall,notifications,dialogs,handfx}.md`
 
 ## Deploy
 
-On the rig: `C:\OBS\ShockBox`, started by the scheduled task `ShockBox-Server`
-(`ShockBox.cmd start`), listening on port 8972.
+On the rig: `C:\OBS\ShockBox`. Start it by double-clicking the **ShockBox** desktop shortcut; the
+chain from there is
+
+`ShockBox.lnk` → `deploy\ShockBox-TUI.cmd` → `.tui-venv\Scripts\python.exe -m shockbox_tui`
+→ the TUI's detached supervisor → `node server.mjs`, listening on port 8972.
+
+The supervisor is the process owner: it owns the port, restarts node with backoff, and survives
+closing the TUI window. Nothing starts ShockBox at logon or after a reboot — the scheduled task
+`ShockBox-Server` was retired (`deploy/install.ps1:285-304` ends and unregisters it), and no
+`ShockBox.cmd` exists. If you want it running at logon, put the shortcut in your Startup folder;
+see `deploy/README.md:63-72`. TUI detail: [`docs/TUI.md`](docs/TUI.md).
 
 ## Licence
 

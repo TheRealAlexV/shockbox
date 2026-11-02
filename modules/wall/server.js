@@ -15,7 +15,10 @@
 // treats `seq` as a cursor and asks for a replay on reconnect (see ENGINE-API.md).
 
 import { HttpError } from '../../core/id.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
 import { validateCommand, COMMANDS } from './commands.mjs';
+import { MAX_BYTES, acceptUpload, nameFor } from './image.mjs';
 
 // Commands the server answers itself (settings it owns) instead of forwarding to the page bus.
 const RATIO_CMDS = { 'ratio.toggle': '_ratioToggle', 'ratio.force16x9': '_ratioForce' };
@@ -23,6 +26,65 @@ const RATIO_CMDS = { 'ratio.toggle': '_ratioToggle', 'ratio.force16x9': '_ratioF
 const RING_MAX = 500;
 const STALE_MS = 10_000; // a page that stops posting /state is offline after this
 const HISTORY_MAX = 200;
+
+// The wall's text pool is the core message pool, filtered to the wall's own pool id
+// (`kind: 'wall'`). Resolved here rather than on the page: the page has only a
+// last-known snapshot, so a message edited after the send would render stale — and a
+// `poolId` that resolves to nothing must fail at the POST, not silently on the wall.
+const WALL_POOL = 'wall';
+
+// What a preset captures — the look of the wall. Deliberately excludes grid geometry (a property
+// of the installation, not of a look) and everything under `views.*.text` (a preset must never
+// touch a text-mode message pool).
+//
+// Two runtimes need this list: this module writes a preset to disk, and the render page applies
+// one. Keeping a copy in each is how `image*` came to be captured here and not there, so the list
+// is read out of the engine source once, at load, and fails loudly if it cannot be.
+const PRESET_DIMS = readPresetDims();
+
+function readPresetDims() {
+  const src = fs.readFileSync(new URL('./engine/engine.js', import.meta.url), 'utf8');
+  const m = /var PRESET_DIMS = \[([\s\S]*?)\];/.exec(src);
+  if (!m) throw new Error('wall: PRESET_DIMS not found in engine/engine.js');
+  const body = m[1].replace(/\/\/[^\n]*/g, '');
+  const dims = [...body.matchAll(/'([^']+)'/g)].map((x) => x[1]);
+  if (!dims.length) throw new Error('wall: PRESET_DIMS in engine/engine.js is empty');
+  return dims;
+}
+
+function poolMessage(pool, id) {
+  const rec = pool && typeof pool.byId === 'function' ? pool.byId(id) : null;
+  return rec && rec.kind === WALL_POOL ? rec : null;
+}
+
+function poolSlot(pool, slot) {
+  const list = pool && typeof pool.list === 'function' ? pool.list() : [];
+  const mine = list.filter((m) => m.kind === WALL_POOL);
+  return mine[slot - 1] || null;
+}
+
+/** Turn a `poolId`/`slot` send into the `item` the engine consumes. */
+export function resolvePoolArgs(pool, args) {
+  if (args && typeof args.item === 'object' && args.item) return args;
+  if (!args || (args.poolId === undefined && args.slot === undefined)) return args;
+  const rec = args.poolId !== undefined ? poolMessage(pool, args.poolId) : poolSlot(pool, args.slot);
+  if (!rec) {
+    const what = args.poolId !== undefined ? `pool message ${args.poolId}` : `wall pool slot ${args.slot}`;
+    throw new HttpError(404, `text.send: no ${what}`);
+  }
+  const item = {
+    id: rec.id,
+    title: rec.title || '',
+    paras: [{ align: 'center', runs: [{ t: rec.text }] }],
+  };
+  // The scope must survive resolution: validateCommand reads `args.view`, and a send that
+  // loses it is addressed to nobody and silently ignored by every page.
+  const out = { item };
+  for (const k of ['duration', 'view', 'preset', 'pattern', 'safe']) {
+    if (args[k] !== undefined) out[k] = args[k];
+  }
+  return out;
+}
 
 import { createRatioWatcher, normaliseSceneList } from './ratio.mjs';
 
@@ -33,7 +95,10 @@ export default {
 
   channels: ['wall', 'wall-state'],
 
-  pages: { control: { file: 'pages/control.html', title: 'LED wall control' } },
+  // The pane (module.json `ui.pane` → ui/pane.js) is the operator surface; there is no
+  // separate control.html page. A page entry here is only for what OBS loads as a browser
+  // source, and that is declared in module.json `pages[]`.
+  pages: {},
 
   init(ctx) {
     this.ctx = ctx;
@@ -48,7 +113,21 @@ export default {
     this.lastSnapshot = null;
     this.ratioState = null;
     this.renderRev = 0;
+    // Operator-saved presets (`preset.save`). Kept beside the module state, not inside the
+    // wall's settings document: a preset is a *look*, and the shipped ones live in the engine
+    // (engine/presets/presets.js). This is the only place a saved look is stored.
+    this.savedPresets = {};
+    // The image layer's file, as last accepted by `POST /api/wall/image`. `rev` is what the
+    // engine keys its texture on: a new upload bumps it, and a page that renders the revision it
+    // already holds never re-downloads the picture. The bytes live under the wall's state dir.
+    this.image = null; // { rev, file, mime, w, h, bytes, name }
+    this.imageRev = 0;
+    // Every picture a saved preset might point at. A preset captures `imageRev`, so restoring a
+    // look has to be able to serve the revision it names even when a newer upload replaced the
+    // live one; `revs` is `{ [rev]: { rev, file, mime, w, h, bytes } }`, loaded from disk.
+    this.imageRevs = {};
     this.load();
+    this.loadImage();
     // Settings are the control pane's document; every change is one snapshot frame, so a
     // freshly loaded OBS page and a deck press converge on the same state. The hook is
     // additive (`ctx.settings.on('change', …)`), never assigned: the core's own onChange is how
@@ -95,6 +174,125 @@ export default {
 
   file(name) {
     return this.ctx.paths?.stateFile ? this.ctx.paths.stateFile('wall', name) : null;
+  },
+
+  /** Where an upload is stored: `<state>/wall/images/<sha1>.<ext>`. */
+  imageDir() {
+    const fs = this.ctx.fs;
+    const d = this.file('images');
+    if (d && fs) fs.mkdirSync(d, { recursive: true });
+    return d;
+  },
+
+  /**
+   * Re-attach the picture this module was last holding, so an OBS reload (or a server restart)
+   * brings the wall back with its image and no upload needed. The settings document carries
+   * `imageRev` + the placement; this file carries the bytes.
+   */
+  loadImage() {
+    try {
+      const fs = this.ctx.fs;
+      const f = this.file('image.json');
+      if (!f || !fs) return;
+      const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (!raw || typeof raw !== 'object' || !raw.file) return;
+      const abs = this.file(path.join('images', raw.file));
+      if (!abs || !fs.existsSync(abs)) return;
+      this.image = raw;
+      this.imageRev = Number(raw.rev) || 1;
+      // The picture a given revision points at is what a preset restores, so the table lives
+      // beside the live record and is loaded with it.
+      const rf = this.file('image-revs.json');
+      if (rf && fs.existsSync(rf)) {
+        const revs = JSON.parse(fs.readFileSync(rf, 'utf8'));
+        if (revs && typeof revs === 'object') this.imageRevs = revs;
+      }
+      if (!this.imageRevs[this.imageRev]) this.imageRevs[this.imageRev] = { ...raw };
+    } catch (err) {
+      if (err.code !== 'ENOENT') this.log.warn(`wall: cannot read image state (${err.message})`);
+    }
+  },
+
+  saveImage() {
+    try {
+      const fs = this.ctx.fs;
+      const f = this.file('image.json');
+      if (!f || !fs) return;
+      fs.mkdirSync(this.ctx.paths.dir('wall'), { recursive: true });
+      const tmp = `${f}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(this.image || null, null, 1));
+      fs.renameSync(tmp, f);
+      const rf = this.file('image-revs.json');
+      if (rf) {
+        const rtmp = `${rf}.tmp`;
+        fs.writeFileSync(rtmp, JSON.stringify(this.imageRevs || {}, null, 1));
+        fs.renameSync(rtmp, rf);
+      }
+    } catch (err) {
+      this.log.warn(`wall: image state save failed (${err.message})`);
+    }
+  },
+
+  /**
+   * The picture revision `rev` names, or the live one when `rev` is absent/0. A preset's
+   * `imageRev` is a revision, not "whatever is live": after the operator uploads a second
+   * picture, applying the preset must bring back the first, not paint the second in its place.
+   */
+  imageForRev(rev) {
+    const n = Math.round(Number(rev) || 0);
+    if (n && this.imageRevs[n]) return this.imageRevs[n];
+    return this.image || null;
+  },
+
+  /**
+   * Take one upload: validate, store, make it the live picture and tell every page.
+   *
+   * The placement keys are written through the settings document (not beside it), so
+   * `preset.save` captures the transform with the look and a reload restores exactly what the
+   * operator saw. The engine keys its texture on `imageRev`, so this is the one thing that
+   * makes a page re-download.
+   */
+  acceptImage(buf) {
+    const fs = this.ctx.fs;
+    if (!fs) throw new HttpError(500, 'wall: no filesystem');
+    const info = acceptUpload(buf);
+    const dir = this.imageDir();
+    if (!dir) throw new HttpError(500, 'wall: no state directory');
+    const name = `${nameFor(buf)}.${info.ext}`;
+    const abs = this.file(path.join('images', name));
+    fs.writeFileSync(abs, buf);
+    this.imageRev += 1;
+    this.image = {
+      rev: this.imageRev,
+      file: name,
+      mime: info.mime,
+      w: info.w,
+      h: info.h,
+      bytes: info.bytes,
+      at: Date.now(),
+    };
+    this.imageRevs[this.image.rev] = { ...this.image };
+    this.saveImage();
+    const S = this.ctx.settings;
+    if (S) {
+      S.patch({ imageOn: 1, imageRev: this.imageRev });
+      this._bumpRender();
+      const { look, ratio, fence } = this.renderSettings();
+      this.broadcastState({ look, ratio, fence }, 'image');
+      this.pushState();
+    }
+    this.log.info(`wall image: ${name} ${info.w}x${info.h} ${info.bytes} B rev ${this.imageRev}`);
+    return { ...this.image, limit: MAX_BYTES };
+  },
+
+  /** The stored file for a GET, or null. */
+  imageFile(rev) {
+    const fs = this.ctx.fs;
+    const meta = rev ? this.imageRevs[Math.round(Number(rev))] : this.image;
+    if (!meta || !fs) return null;
+    const abs = this.file(path.join('images', meta.file));
+    if (!abs || !fs.existsSync(abs)) return null;
+    return { abs, meta };
   },
 
   load() {
@@ -163,10 +361,56 @@ export default {
     };
   },
 
+  // A state push is the page's view of the server: the flat look frame the page applies (see
+  // `snapshotFrame`), not the operator-facing diagnostic `state()`.
   pushState() {
-    const snap = this.state();
-    this.events.publish('wall-state', 'snapshot', snap);
+    const snap = this.snapshotFrame('push');
+    this.events.emit('wall', 'state.snapshot', snap);
     return snap;
+  },
+
+  /**
+   * How the live picture sits on the wall, in the one number the engine needs.
+   *
+   * `aspect` is (picture height / picture width) / (wall width / wall height): exactly the
+   * vertical stretch that makes a picture `imageScale` of the wall WIDTH come out at the file's
+   * own proportions. Derived from the dimensions read out of the uploaded header and from the
+   * ratio (a 16:9 wall is 16/9 of a wall-height tall), so it is the same geometry on a fresh
+   * upload, after a reload, and out of a preset — no page ever guesses it from a decoded bitmap,
+   * and the picture is never stretched by the wall's shape.
+   */
+  imageGeometry() {
+    const s = this.ctx.settings;
+    const meta = this.image;
+    const w = Number(meta && meta.w) || 0;
+    const h = Number(meta && meta.h) || 0;
+    const picH = w > 0 && h > 0 ? h / w : 1;
+    const ratio = String((s && (typeof s.get === 'function' ? s.get('ratio') : s.ratio)) || '16:9');
+    const parts = ratio.split(':').map(Number);
+    const wallAspect = parts.length === 2 && parts[0] > 0 && parts[1] > 0 ? parts[0] / parts[1] : 16 / 9;
+    return { picH, wallAspect, aspect: picH / wallAspect, w, h };
+  },
+
+  /**
+   * The look frames a page receives, in the shape it applies: `{look, ratio, fence, rev, presets}`.
+   *
+   * Two callers needed the same shape — `broadcastState` when the control pane changes something,
+   * and `pushState` on every state push — and `presets` was only ever added by the first. A page
+   * that connected, or that missed the one frame a save emitted, therefore never learned the
+   * operator's saved presets, and `preset.set` for one of them resolved to the shipped defaults.
+   */
+  snapshotFrame(note) {
+    const { look, ratio, fence } = this.renderSettings();
+    return {
+      rev: this.renderRev || 0,
+      note: note || 'snapshot',
+      t: Date.now(),
+      look,
+      ratio,
+      fence,
+      presets: this.presetsForPage(),
+      imageGeometry: this.imageGeometry(),
+    };
   },
 
   /**
@@ -196,7 +440,34 @@ export default {
       // to round on its own. `grid` is whichever page is live; the value is advisory for the pane.
       fence: s ? this.fenceCellsFor(s.get('fence')) : null,
       rev: this.renderRev,
+      // The image layer's identity. Derived from what the module actually holds, never from the
+      // settings document alone: a page holding a picture for a revision this server no longer
+      // has must re-download instead of trusting a stale key.
+      image: this.image
+        ? { rev: this.image.rev, file: this.image.file, mime: this.image.mime, w: this.image.w, h: this.image.h, bytes: this.image.bytes, limit: MAX_BYTES }
+        : null,
+      // How the picture sits in the placements `look` describes. `aspect` is the picture's
+      // height over its width divided by the wall's own aspect, which is exactly the vertical
+      // stretch the engine needs to draw the file at its own proportions while `imageScale`
+      // stays "fraction of the wall WIDTH". Derived here, on the server, from the dimensions it
+      // read out of the uploaded header: the page never guesses it from a decoded bitmap, so a
+      // picture restored out of a preset has the same geometry as the one just uploaded.
+      imageGeometry: this.imageGeometry(),
+      // Every preset the pane's Preset dropdown offers: the shipped looks plus the operator's
+      // own. The page hands these to the engine so `preset.set` resolves a saved name too.
+      presets: this.presetsForPage(),
     };
+  },
+
+  /**
+   * The preset bank the page and the pane both read: shipped names plus saved ones, with the
+   * saved look attached so the engine can apply it without another round trip.
+   */
+  presetsForPage() {
+    const shipped = ['neonwave', 'arctic', 'chase', 'bassline', 'ember'];
+    const saved = this.savedPresets || {};
+    const names = shipped.concat(Object.keys(saved).filter((n) => shipped.indexOf(n) < 0));
+    return { order: names, saved };
   },
 
   /**
@@ -250,6 +521,12 @@ export default {
     if (Object.prototype.hasOwnProperty.call(patch, 'look')) snap.look = patch.look || null;
     if (Object.prototype.hasOwnProperty.call(patch, 'ratio')) snap.ratio = patch.ratio ?? null;
     if (Object.prototype.hasOwnProperty.call(patch, 'fence')) snap.fence = patch.fence || null;
+    // The preset bank rides every frame: a page that connected after a save, or missed the one
+    // frame the save emitted, would otherwise resolve a saved name to nothing and load defaults.
+    snap.presets = this.presetsForPage();
+    // The picture's geometry rides with the look: a page that applies an `imageScale` needs the
+    // same stretch the uploader had, or restoring a preset draws the picture at another aspect.
+    snap.imageGeometry = this.imageGeometry();
     // `live` frames are drag previews: they reach the pages and are not persisted. Only the
     // committed value (a settings PATCH) becomes `lastSnapshot`, so a restart inside a drag
     // restores what the operator actually chose.
@@ -272,18 +549,68 @@ export default {
     };
   },
 
-  /** What /api/modules/wall/state answers: the bus view, the settings document, the ratio. */
-  state() {
+  /**
+   * Ingest the picture the operator dropped on the wall. The route names the picture; the
+   * settings document names where it sits. The engine keys its texture on `rev`, so only this
+   * bumps it — a drag changes the transform and never re-downloads the file.
+   */
+  sendImageCommand(cmd, args = {}) {
+    const S = this.ctx.settings;
+    const push = (note) => {
+      if (!S) return;
+      this._bumpRender();
+      const { look, ratio, fence } = this.renderSettings();
+      this.broadcastState({ look, ratio, fence }, 'image');
+      this.pushState();
+      this.log.info(`wall image: ${note}`);
+    };
+    if (cmd === 'wall.image.clear') {
+      if (S) S.patch({ imageOn: 0 });
+      push('cleared');
+      return { seq: this.seq, delivered: 0, ok: true, note: 'cleared', image: null };
+    }
+    // A placement-only command moves the picture that is already stored; only a command that
+    // actually carries bytes stores a new one.
+    const hasBody = Buffer.isBuffer(args.body) ? args.body.length > 0 : Boolean(args.body);
+    let rec = this.image ? { ...this.image, limit: MAX_BYTES } : null;
+    if (hasBody) rec = this.acceptImage(args.body);
+    const patch = {};
+    if (args.rev !== undefined) {
+      patch.imageRev = args.rev;
+      patch.imageOn = 1;
+    }
+    if (args.x !== undefined) patch.imageX = args.x;
+    if (args.y !== undefined) patch.imageY = args.y;
+    if (args.scale !== undefined) patch.imageScale = args.scale;
+    if (args.rotate !== undefined) patch.imageRotate = args.rotate;
+    if (args.colour !== undefined) patch.imageColour = args.colour;
+    if (args.bits !== undefined) patch.imageBits = String(args.bits);
+    if (args.dither !== undefined) patch.imageDither = args.dither;
+    if (S && Object.keys(patch).length) S.patch(patch);
+    if (!hasBody) push(Object.keys(patch).length ? 'placement' : 'resend');
     return {
-      ...this.snapshot(),
-      commands: COMMANDS,
-      settings: this.ctx.settings ? this.ctx.settings.describe() : null,
-      snapshot: this.lastSnapshot || null,
-      ratio: this.ratio ? this.ratio.state : null,
+      seq: this.seq,
+      delivered: (this.events.clientsByChannel?.() || {}).wall || 0,
+      ok: true,
+      note: hasBody ? 'image set' : 'image placed',
+      image: rec,
     };
   },
 
   send(cmd, args = {}, view = null) {
+    if (cmd === 'text.send') args = resolvePoolArgs(this.ctx.pool, args);
+    // The image commands are answered here: the server owns the file, so `wall.image.set` is an
+    // upload (bytes in, revision out) and `wall.image.clear` is a release. Neither is forwarded
+    // as a bare message — the pages learn the outcome through the settings snapshot, which
+    // carries `imageRev`/`imageOn` the same way it carries every other look key.
+    if (cmd === 'wall.image.set' || cmd === 'wall.image.clear') {
+      return this.sendImageCommand(cmd, args || {});
+    }
+    // `preset.save` is answered here, not by the page: the look being captured is the settings
+    // document the SERVER already holds (the pane writes every look change to it in the same
+    // round trip), and the saved preset has to survive an OBS reload. Reading it off a page
+    // would capture whatever that page happened to have applied last, and lose it on reload.
+    if (cmd === 'preset.save') return this._savePreset(args || {});
     const { rec, view: scope } = validateCommand(cmd, args, view);
     // Ratio commands are answered by the server, not the page: the ratio is persisted here and
     // a forcing scene must win over the key (a17).
@@ -308,8 +635,53 @@ export default {
     return { seq: entry.seq, delivered };
   },
 
-  /** 9:16 <-> 16:9, refused inside a forcing scene. */
-  _ratioToggle() {
+  /**
+   * Origin-level route for the picture upload. Core's HTTP layer parses every module route body
+   * as JSON, so a picture body cannot arrive through `routes()`; `POST /api/wall/image` is
+   * registered here instead, is read RAW by core (content types that are not JSON) and handed
+   * over verbatim. It delegates to the same `wall.image.set` path a script would call.
+   *
+   * `DELETE /api/wall/image` is the same as `wall.image.clear`, for a `fetch(del)` shape.
+   */
+  coreExtraRoutes() {
+    const mod = this;
+    return [
+      {
+        method: 'POST',
+        path: '/api/wall/image',
+        // The picture arrives as bytes, not JSON (core reads it raw and passes the Buffer).
+        rawBody: true,
+        rawLimit: MAX_BYTES,
+        async handler(req, res, url, body) {
+          const fs = mod.ctx.fs;
+          const buf = Buffer.isBuffer(body) ? body : Buffer.from(body && body.__rawBody ? body.__rawBody : '');
+          if (!buf.length) throw new HttpError(400, 'image: empty body');
+          if (buf.length > MAX_BYTES) throw new HttpError(413, `image: ${buf.length} bytes > ${MAX_BYTES}`);
+          if (!fs) throw new HttpError(500, 'wall: no filesystem');
+          const rec = mod.acceptImage(buf);
+          return { ok: true, cmd: 'wall.image.set', image: rec };
+        },
+      },
+      {
+        method: 'DELETE',
+        path: '/api/wall/image',
+        handler() {
+          const out = mod.sendImageCommand('wall.image.clear', {});
+          return { ...out, ok: true };
+        },
+      },
+      {
+        // What the picture is, and the size ceiling, without downloading it.
+        method: 'GET',
+        path: '/api/wall/image/info',
+        handler() {
+          return { ok: true, image: mod.image ? { ...mod.image, limit: MAX_BYTES } : null, limit: MAX_BYTES };
+        },
+      },
+    ];
+  },
+
+  /** 9:16 <-> 16:9, refused inside a forcing scene. */  _ratioToggle() {
     const cur = this.ctx.settings.get('ratio') || '16:9';
     const next = cur === '16:9' ? '9:16' : '16:9';
     if (next === '9:16' && this.ratio && this.ratio.state.forcing) {
@@ -318,6 +690,40 @@ export default {
     }
     this.ctx.settings.set('ratio', next);
     return { seq: this.seq, delivered: 0, ok: true, note: 'ratio', ratio: next };
+  },
+
+  /**
+   * Snapshot the current look under `args.name` and make it the live preset.
+   *
+   * Only look dimensions are captured (PRESET_DIMS mirrors engine.js): grid geometry belongs to
+   * the physical installation, and nothing under `views.*.text` is ever read — a preset must
+   * never carry or overwrite a text-mode message pool.
+   */
+  _savePreset(args) {
+    const name = typeof args.name === 'string' ? args.name.trim() : '';
+    if (!name) throw new HttpError(400, 'preset.save: name is required');
+    if (!/^[A-Za-z0-9 ._:-]{1,64}$/.test(name)) {
+      throw new HttpError(400, 'preset.save: name must be 1..64 chars of [A-Za-z0-9 ._:-]');
+    }
+    const S = this.ctx.settings;
+    const look = {};
+    for (const f of PRESET_DIMS) {
+      const v = S.get(f);
+      if (v !== undefined && v !== null) look[f] = JSON.parse(JSON.stringify(v));
+    }
+    // The named look becomes the one the wall runs, so the saved preset and the live look
+    // cannot drift apart. `preset` is a real schema field (module.json), so this is the same
+    // write the pane's dropdown makes.
+    look.preset = name;
+    this.savedPresets[name] = look;
+    S.patch(look);
+    this._bumpRender();
+    const { look: lk, ratio, fence } = this.renderSettings();
+    const presets = this.presetsForPage();
+    this.broadcastState({ look: lk, ratio, fence }, 'preset.save');
+    this.pushState();
+    this.log.info(`wall preset saved: ${name}`);
+    return { seq: this.seq, delivered: 0, ok: true, note: 'preset saved', preset: name, presets };
   },
 
   // Put it back to 16:9 whatever happened: the pane's escape hatch.
@@ -336,6 +742,63 @@ export default {
     const S = () => mod.ctx.settings;
     return [
       {
+        // The picture itself. No `uniforms` in the URL: the last accepted upload is the
+        // picture (a new one replaces it), and the version query only defeats a stale cache.
+        method: 'GET',
+        path: '/image',
+        handler(req, res, url) {
+          const found = mod.imageFile(url && url.searchParams ? url.searchParams.get('rev') : 0);
+          if (!found) {
+            res.writeHead(404, { 'content-type': 'application/json', 'cache-control': 'no-store', 'access-control-allow-origin': '*' });
+            res.end(JSON.stringify({ ok: false, error: 'no image' }));
+            return undefined;
+          }
+          const fs = mod.ctx.fs;
+          const buf = fs.readFileSync(found.abs);
+          res.writeHead(200, {
+            'content-type': found.meta.mime || 'application/octet-stream',
+            'cache-control': 'no-store',
+            'access-control-allow-origin': '*',
+            'content-length': buf.length,
+            'x-wall-image': found.meta.file,
+            'x-wall-image-rev': String(found.meta.rev),
+            'x-wall-image-w': String(found.meta.w || 0),
+            'x-wall-image-h': String(found.meta.h || 0),
+          });
+          res.end(buf);
+          return undefined;
+        },
+      },
+      {
+        // A typed command path: `wall.image.set` with the bytes as `body`, or
+        // `wall.image.clear`. `POST /api/wall/image` is the browser's own door (core mediates
+        // the raw body there); this one exists so a script or the deck can drive the same thing
+        // through the normal JSON envelope.
+        method: 'POST',
+        path: '/image/set',
+        handler(req, res, url, body) {
+          if (!body || typeof body !== 'object' || !body.cmd) throw new HttpError(400, 'body must be {cmd, args}');
+          const out = mod.send(body.cmd, body.args || {});
+          return { ...out, ok: out.ok !== false };
+        },
+      },
+      {
+        // The same door the browser posts bytes to, for a JSON client: `{body: "<base64>"}`.
+        // base64 rather than a JSON string of binary, so a UTF-8 round trip cannot corrupt it.
+        method: 'POST',
+        path: '/image/upload',
+        handler(req, res, url, body) {
+          if (!body || typeof body !== 'object' || typeof body.base64 !== 'string') {
+            throw new HttpError(400, 'body must be {base64}');
+          }
+          const buf = Buffer.from(body.base64, 'base64');
+          if (!buf.length) throw new HttpError(400, 'image: empty body');
+          if (buf.length > MAX_BYTES) throw new HttpError(413, `image: ${buf.length} bytes > ${MAX_BYTES}`);
+          const rec = mod.acceptImage(buf);
+          return { ok: true, cmd: 'wall.image.set', image: rec };
+        },
+      },
+      {
         // One snapshot for the control pane: settings document, ratio state, engine document
         // and the last broadcast, so a refresh is a single round trip (notifications' shape).
         method: 'GET',
@@ -350,6 +813,7 @@ export default {
             settings: S().describe(),
             ratio: mod.ratio ? mod.ratio.state : null,
             render: mod.renderSettings(),
+            image: mod.image ? { ...mod.image, limit: MAX_BYTES } : null,
             snapshot: mod.lastSnapshot || null,
           };
         },
@@ -359,14 +823,27 @@ export default {
         path: '/settings',
         handler(req, res, url, body) {
           // Schema validation is the module manifest's job, exactly as notifications does it.
-          const changed = S().patch(body || {});
+          // The page hands back the dims a preset it just applied carries, and a few preset
+          // dimensions are page state with no schema field (`mode` is the view's, not the
+          // document's). The document refuses a patch containing one unknown key - which made
+          // every write-back fail wholesale - so keys this document does not own are dropped
+          // here rather than by every caller.
+          const raw = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+          const known = S().schema || null;
+          const patch = {};
+          const dropped = [];
+          for (const [k, v] of Object.entries(raw)) {
+            if (known && !(k in known)) { dropped.push(k); continue; }
+            patch[k] = v;
+          }
+          const changed = S().patch(patch);
           if (changed.length && mod.events) {
             mod._bumpRender();
             const { look, ratio, fence } = mod.renderSettings();
             mod.broadcastState({ look, ratio, fence }, 'settings');
             mod.pushState();
           }
-          return { ok: true, changed, settings: S().describe(), ratio: mod.ratio ? mod.ratio.state : null };
+          return { ok: true, changed, dropped, settings: S().describe(), ratio: mod.ratio ? mod.ratio.state : null };
         },
       },
       {

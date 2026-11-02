@@ -233,7 +233,14 @@ function build(ctx) {
       // Everything the pane and the page need in one read: the settings document, the effect
       // registry, the bus contract and whether the vendored runtime is on disk.
       { path: '/status', method: 'GET', handler: (req, res) => send(res, 200, status()) },
-
+      // The bare list a client may expect from the page's own registry — `Object.keys(EFFECTS)`,
+      // strings in renderer order. `/status` carries the same ids with their titles and gestures;
+      // this one exists so "the effects" is never a shape a client has to unpack to get right.
+      {
+        path: '/effects',
+        method: 'GET',
+        handler: (req, res) => send(res, 200, EFFECTS.map((e) => e.id)),
+      },
       {
         path: '/settings',
         method: 'PATCH',
@@ -368,6 +375,11 @@ function build(ctx) {
             // Cached for a day: re-read is cheap, and a new model file swaps on restart anyway.
             'cache-control': 'public, max-age=86400',
             'content-length': st.size,
+            // The overlay is cross-origin isolated (COEP require-corp), so every subresource it
+            // loads is checked. Same-origin is all this file needs: a CDN fallback is a URL, not a
+            // reason to let another origin embed the model.
+            'cross-origin-resource-policy': 'same-origin',
+            'x-handfx-model-source': 'local',
           });
           if (req.method === 'HEAD') return res.end();
           fs.createReadStream(file).pipe(res);

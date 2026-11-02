@@ -200,18 +200,18 @@ try {
   })()`, true);
   ok('the module ships a notifications pane', paneSrcN);
 
-  const previewN = await c.waitFor('Boolean(document.querySelector(".nt-stage .nt-strip"))', 10000);
+  const previewN = await c.waitFor("Boolean(document.querySelector('#pane .nt-preview .pv-window [data-style]'))", 10000);
   // The old hardcoded pane said "Live toasts" and drew .live-stack; the module pane draws .nt-strip.
   const oldPaneN = await c.eval('Boolean(document.querySelector(".live-stack")) || /^Live toasts/m.test(document.body.innerText)');
   ok('notifications pane renders (module pane, not the shell fallback)', previewN && !oldPaneN, `strip:${previewN} old:${oldPaneN}`);
 
   const liveN = await notifyLive();
   const paintedN = JSON.parse(await c.eval(`JSON.stringify({
-    rows: [].slice.call(document.querySelectorAll('.nt-strip .toast')).map(function(n){
+    rows: [].slice.call(document.querySelectorAll('#pane .nt-preview .pv-window [data-style] .toast')).map(function(n){
       return { id: n.dataset.id, top: n.style.top, h: n.style.height, text: n.querySelector('.text') ? n.querySelector('.text').textContent : '' };
     }),
     count: document.querySelector('.nt-stack-count') ? document.querySelector('.nt-stack-count').textContent : '',
-    style: document.querySelector('.nt-strip') ? document.querySelector('.nt-strip').dataset.style : '',
+    style: document.querySelector('#pane .nt-preview .pv-window [data-style]') ? document.querySelector('#pane .nt-preview .pv-window [data-style]').dataset.style : '',
     look: document.querySelector('.nt-mode') ? document.querySelector('.nt-mode').textContent : '',
   })`));
   const wantN = (liveN.live || []).map((e) => e.id).sort().join(',');
@@ -232,7 +232,7 @@ try {
     if(b) b.click(); return Boolean(b); })()`);
   await sleep(900);
   const lookAfter = (await notifyLive()).settings.style.value;
-  const paintedAfter = await c.eval('document.querySelector(".nt-strip") ? document.querySelector(".nt-strip").dataset.style : ""');
+  const paintedAfter = await c.eval(`document.querySelector('#pane .nt-preview .pv-window [data-style]') ? document.querySelector('#pane .nt-preview .pv-window [data-style]').dataset.style : ''`);
   ok('the look control changes the settings document', lookAfter === 'macos' && lookBefore !== lookAfter, `${lookBefore} → ${lookAfter}`);
   ok('the preview follows the look the server settled on', paintedAfter === lookAfter, `strip ${paintedAfter}`);
 
@@ -266,7 +266,7 @@ try {
   let ssePainted = 0;
   for (let i = 0; i < 30; i++) {
     await sleep(200);
-    ssePainted = await c.eval('[].slice.call(document.querySelectorAll(".nt-strip .toast")).length');
+    ssePainted = await c.eval(`[].slice.call(document.querySelectorAll('#pane .nt-preview .pv-window [data-style] .toast')).length`);
     if (ssePainted === (await notifyLive()).live.length) break;
   }
   const serverN = (await notifyLive()).live.length;
@@ -308,19 +308,20 @@ try {
   await sleep(300);
   const mountedD = await c.waitFor('document.readyState === "complete" && Boolean(document.querySelector(".pane"))', 12000);
   if (!mountedD) console.log(await mountDiagnostics(c, c.events, 'shell mount (dialogs)'));
-  const previewD = await c.waitFor('Boolean(document.querySelector(".dg-stage .dg-desk"))', 10000);
-  const oldPaneD = await c.eval('Boolean(document.querySelector(".live-card")) && !document.querySelector(".dg-desk")');
+  const previewD = await c.waitFor('Boolean(document.querySelector("#pane .pv-frame") && document.querySelector("#pane .dg-desk"))', 10000);
+  const oldPaneD = await c.eval('Boolean(document.querySelector(".live-card")) && !document.querySelector("#pane .dg-desk")');
   ok('alerts pane renders (module pane, not the shell fallback)', mountedD && previewD && !oldPaneD, `desk:${previewD} old:${oldPaneD}`);
 
   const liveD = await dialogLive();
   const paintedD = JSON.parse(await c.eval(`JSON.stringify({
-    rows: [].slice.call(document.querySelectorAll('.dg-desk .dialog')).map(function(n){
+    // scoped to the module pane: the merged preview column draws its own desk and its own dialogs
+    rows: [].slice.call(document.querySelectorAll('#pane .dg-desk .dialog')).filter(function(n){ return !n.closest('.pv-layer-out'); }).map(function(n){
       return { id: n.dataset.id, geo: n.dataset.geo, left: n.style.left, top: n.style.top, w: n.style.width, h: n.style.height,
                text: n.querySelector('.msg') ? n.querySelector('.msg').textContent : '',
                title: n.querySelector('.ttitle') ? n.querySelector('.ttitle').textContent : '' };
     }),
-    theme: document.querySelector('.dg-desk') ? document.querySelector('.dg-desk').dataset.theme : '',
-    scale: document.querySelector('.dg-desk') ? document.querySelector('.dg-desk').dataset.scale : '',
+    theme: document.querySelector('#pane .dg-desk') ? document.querySelector('#pane .dg-desk').dataset.theme : '',
+    scale: document.querySelector('#pane .dg-desk') ? document.querySelector('#pane .dg-desk').dataset.scale : '',
     count: document.querySelector('.dg-count') ? document.querySelector('.dg-count').textContent : '',
   })`));
   const wantD = (liveD.live || []).map((e) => e.id).sort().join(',');
@@ -340,7 +341,7 @@ try {
     if(b) b.click(); return Boolean(b); })()`);
   await sleep(900);
   const themeAfter = (await dialogLive()).settings.theme.value;
-  const skinAfter = await c.eval('document.querySelector(".dg-desk") ? document.querySelector(".dg-desk").className : ""');
+  const skinAfter = await c.eval('document.querySelector("#pane .dg-desk") ? document.querySelector("#pane .dg-desk").className : ""');
   ok('the theme control changes the settings document', themeAfter === 'macos' && themeBefore !== themeAfter, `${themeBefore} → ${themeAfter}`);
   ok('the preview follows the skin the server settled on', /skin-macos/.test(skinAfter), skinAfter);
 
@@ -372,7 +373,9 @@ try {
   let paintedDCount = 0;
   for (let i = 0; i < 30; i++) {
     await sleep(200);
-    paintedDCount = await c.eval('[].slice.call(document.querySelectorAll(".dg-desk .dialog")).length');
+    // the preview clones the layer once to dim the half outside the fence, so count only the live
+    // layer's children — the clone is aria-hidden
+    paintedDCount = await c.eval('[].slice.call(document.querySelectorAll("#pane .dg-desk .dialog")).filter(function(n){ return !n.closest(".pv-layer-out"); }).length');
     if (paintedDCount === (await dialogLive()).live.length) break;
   }
   const serverD2 = (await dialogLive()).live.length;

@@ -30,6 +30,59 @@
 
   if (!GRADE || !SIM) throw new Error('LEDWall: config.js, grade.js and sim.js must load first');
 
+  // ── Preset dimensions ─────────────────────────────────────────────────────
+  // What a preset *is*: the look of the wall. Deliberately excludes grid geometry (`gridCols`,
+  // `gridRows`, `cellShape`) because that is a property of the physical installation, not of a
+  // look, and it excludes everything under `views.*.text` because a preset must never reach the
+  // text-mode message pool.  `preset.save` copies exactly these keys off the live settings.
+  // One list, two runtimes: `server.js` imports it (it is exported below) and this page uses it.
+  // A dimension added to a preset must be added once, or a saved look loses it on the way back.
+  var PRESET_DIMS = [
+    'mode', 'pattern', 'speed', 'transitionSpeed',
+    'palette', 'paletteWeight', 'bgColor', 'hdrGain',
+    'ledSize', 'streakOpacity', 'flashDensity', 'waveFrequency', 'persistence',
+    'flareIntensity', 'flareLength', 'flareRotation',
+    'bloom', 'bloomThreshold', 'bloomRadius',
+    'exposure', 'saturation', 'contrast', 'lift', 'vignette', 'grain',
+    'dither', 'acsTonemap', 'bits',
+    // The picture is part of the look: where it sits, how it is coloured, how deep. `imageRev`
+    // names the stored upload so loading the preset puts the same picture back.
+    'imageX', 'imageY', 'imageScale', 'imageRotate', 'imageColour', 'imageBits', 'imageDither',
+    'imageRev',
+    'textScroll', 'safeArea'
+  ];
+
+  /** Operator-saved presets live beside the shipped ones in the same lookup the engine reads. */
+  function applySavedPresets(saved) {
+    Object.keys(saved || {}).forEach(function (n) { PRESETS[n] = saved[n]; });
+    return PRESETS;
+  }
+
+  /**
+   * How fast the palette scrolls across LIT TEXT cells, per pattern.
+   *
+   * In text mode the pattern selector no longer switches what the cells do (a glyph cell is
+   * always a lit LED); it switches the motion of the colour ramp running through them, so
+   * "pattern = animation only" still means something while a notice is on air. Indexed by
+   * SIM.PATTERNS so the list order stays the engine's own.
+   */
+  var TEXT_SCROLL_RATE = {
+    random: 0.10, wave: 0.04, bottomCenter: 0.06, sweep: 0.14, bars: 0.08, ripple: 0.07,
+    plasma: 0.05, chase: 0.20, sweepMirror: 0.12, comet: 0.16,
+    matrix: 0.09, spectrum: 0.11, orbits: 0.06, rain: 0.07, equalizer: 0.10, static: 0.00,
+    heartbeat: 0.05
+  };
+
+  function textScrollRate(idx) {
+    var name = SIM.PATTERNS[idx];
+    var rate = TEXT_SCROLL_RATE[name];
+    return typeof rate === 'number' ? rate : 0.04;
+  }
+
+  function savedPresetList() {
+    return Object.keys(PRESETS);
+  }
+
   var BLOOM_MIPS = 5;
 
   // ── Small helpers ──────────────────────────────────────────────────────────
@@ -123,6 +176,7 @@
   function i1(gl, prog, name, v) { var l = loc(gl, prog, name); if (l) gl.uniform1i(l, v); }
   function f2(gl, prog, name, x, y) { var l = loc(gl, prog, name); if (l) gl.uniform2f(l, x, y); }
   function f3(gl, prog, name, x, y, z) { var l = loc(gl, prog, name); if (l) gl.uniform3f(l, x, y, z); }
+  function f4(gl, prog, name, x, y, z, w) { var l = loc(gl, prog, name); if (l) gl.uniform4f(l, x, y, z, w); }
 
   // ── LED draw shaders ──────────────────────────────────────────────────────
 
@@ -132,9 +186,13 @@
     'uniform vec2  u_grid;      // cols, rows',
     'uniform float u_extent;    // quad half-size, in cell units',
     'uniform sampler2D u_sim;',
+    'uniform vec4  u_imgXf;      // x, y (picture centre, wall uv), scale, unused',
+    'uniform vec2  u_imgRot;     // cos, sin',
+    'uniform vec2  u_imgSize;    // half width, half height (cell-pitch units)',
     'out vec2  v_p;             // local offset from cell centre, cell units',
     'out float v_br;',
     'flat out float v_pal;',
+    'out vec2  v_cell;          // this LED place on the wall, in cell units',
     'void main() {',
     '  int cols = int(u_grid.x + 0.5);',
     '  int id = gl_InstanceID;',
@@ -143,10 +201,14 @@
     '  vec4 st = texelFetch(u_sim, ivec2(col, row), 0);',
     '  v_br  = st.r;',
     '  v_pal = st.b;',
+    // The picture's placement maths lives in the fragment shader, on this interpolated wall
+    // position: per-instance would quantise the picture to the cell grid, and it stays one frame
+    // behind a settings change.
     '  vec2 corner = vec2(float((gl_VertexID & 1) << 1) - 1.0,',
     '                     float(((gl_VertexID >> 1) & 1) << 1) - 1.0);',
     '  v_p = corner * u_extent;',
     '  vec2 c = vec2(float(col) + 0.5, float(row) + 0.5) + v_p;',
+    '  v_cell = c;',
     '  vec2 clip = vec2(c.x / u_grid.x, 1.0 - c.y / u_grid.y) * 2.0 - 1.0;',
     '  gl_Position = vec4(clip, 0.0, 1.0);',
     '}'
@@ -165,17 +227,132 @@
     'uniform float u_flareRot;    // radians',
     'uniform float u_hdrGain;',
     'uniform float u_streak;      // unused here, keeps the uniform block stable',
+    'uniform float u_global;      // the look exposure an image cell is lit at',
     'in vec2  v_p;',
     'in float v_br;',
     'flat in float v_pal;',
+    'in vec2  v_cell;           // this fragment in cell units, interpolated',
+    'uniform sampler2D u_image;  // the uploaded picture, RGBA8',
+    'uniform vec2  u_grid;        // cols, rows (the picture plane is derived from it)',
+    'uniform float u_imgOn;       // 0 = no image layer, 1 = sample it where it covers the wall',
+    'uniform vec4  u_imgXf;       // x, y (picture centre, wall uv), scale, unused',
+    'uniform vec2  u_imgRot;      // cos(theta), sin(theta)',
+    'uniform float u_imgMode;     // 0 raw, 1 match the ramp, 2 luminance through the ramp',
+    'uniform vec2  u_imgSize;     // aspect compensation: (1, picture aspect / wall aspect)',
+    'uniform float u_bits;        // picture bit depth per channel: 4, 8 or 12',
+    'uniform float u_imgDither;   // 0 = flat quantise, 1 = 4x4 Bayer offset before quantising',
     'out vec4 o;',
     'void main() {',
-    '  if (v_br < 0.002) { o = vec4(0.0); return; }',
     '  vec2 px = v_p * u_pxPerCell;',
     '  float d = length(px);',
-    // A palette coord of -1 means "this cell is a literal colour" (text with
-    // style.colour = '#rrggbb'); everything else samples the LUT.
+    '  // -- the picture plane, computed HERE from the interpolated wall position --',
+    '  // Deriving uv per fragment rather than per instance matters for two reasons:',
+    '  // (1) the LED instance spans several pixels, so a per-instance uv quantises the',
+    '  // picture to the cell grid and its colour-space, and (2) `flat`/interpolated',
+    '  // placement attributes survive a settings change one frame late, which is what',
+    '  // made a moved picture keep drawing at its old place for a frame.',
+    // The picture plane is expressed in WALL fractions on both axes: `u_imgXf.xy` is the
+    // picture centre (0..1 of the wall, down-positive) and `u_imgXf.z` its width as a fraction
+    // of the wall width. The box that comes out is `scale` of the wall WIDE; `u_imgSize.y`
+    // stretches that plane vertically to the picture's own aspect (`scale * h / w / (W / H)`,
+    // computed by the server from the uploaded file's real dimensions). Without the stretch a
+    // square picture was drawn 0.6 wide and 0.34 tall, i.e. an aspect the picture never had, and
+    // `scale` meant a different thing on each axis.
+    '  vec2 rel = (vec2(v_cell.x / u_grid.x, v_cell.y / u_grid.y) - u_imgXf.xy) / max(u_imgXf.z, 1e-4);',
+    '  vec2 uvImg = vec2(u_imgRot.x * rel.x + u_imgRot.y * rel.y,',
+    '                    -u_imgRot.y * rel.x + u_imgRot.x * rel.y) + 0.5;',
+    '  uvImg.y = (uvImg.y - 0.5) / max(u_imgSize.y, 1e-3) + 0.5;',
+    '  // A palette coord of -1 means "this cell is a literal colour" (text with',
+    '  // style.colour = "#rrggbb"); everything else samples the LUT.',
     '  vec3 base = v_pal < -0.5 ? u_textColor : texture(u_lut, vec2(v_pal, 0.5)).rgb;',
+    '  // -- the image layer: the inverse of "picture centred on (x, y), `scale` of the wall',
+    '  // wide, rotated". A picture on this wall is LIT LEDs, not a tint of the pattern: every',
+    '  // cell inside the box emits the picture colour, and the pattern behind it is dropped',
+    '  // there (the earlier version added the picture to the pattern, so a dark patch of the',
+    '  // photograph stayed dark and the box on screen was a sprinkle of lit cells, not a',
+    '  // picture). A picture covers the wall; it does not filter it.',
+    '  vec3 imgCol = vec3(0.0);',
+    '  float imgA = 0.0;',
+    // The sample is taken OUTSIDE the box test on purpose. Inside an `if` the compiler is free
+    // to treat a sampler read as non-differentiable and flatten `texture()` to its LOD-0
+    // constant, which on a uniform picture is indistinguishable from "the picture never
+    // arrived": the box lit in the right colour but reading as the texture's average. Sampled
+    // unconditionally (and with an explicit LOD), then discarded outside the box, the picture is
+    // the pixels that were uploaded.
+    '  vec2 imgUv = vec2(clamp(uvImg.x, 0.0, 1.0), 1.0 - clamp(uvImg.y, 0.0, 1.0));',
+    '  vec4 imgS = textureLod(u_image, imgUv, 0.0);',
+    // The layer obeys u_imgOn and nothing else: pattern, exposure and blackout drive the
+    // composite behind it. A picture that only shows when the pattern happens to light the same
+    // cell is pattern-gated, not composited.
+    '  if (u_imgOn > 0.5) {',
+    '    if (uvImg.x >= 0.0 && uvImg.x <= 1.0 && uvImg.y >= 0.0 && uvImg.y <= 1.0) {',
+    '      vec3 ic = imgS.rgb;',
+    '      imgA = 1.0;',
+    '      float lum = dot(ic, vec3(0.2126, 0.7152, 0.0722));',
+    '      if (u_imgMode > 1.5) {',
+    '        // palette: luminance drives the ramp - the picture\'s own hue is discarded',
+    '        imgCol = texture(u_lut, vec2(clamp(lum, 0.0, 1.0), 0.5)).rgb;',
+    '      } else if (u_imgMode > 0.5) {',
+    '        // match: the nearest entry of the LIVE ramp, so the picture only uses colours the',
+    '        // LEDs can emit (32 samples over a 256-entry ramp is close enough that a neighbour',
+    '        // never beats the chosen entry by more than a hint)',
+    '        float best = 1e9;',
+    '        vec3 bestCol = ic;',
+    // Every candidate is decoded once, before the loop: a `texture()` whose only consumer sits
+    // inside a loop body is the other place a driver flattens a live ramp to a constant, and a
+    // frozen ramp is exactly what makes "match" read as "raw".
+    '        vec3 ramp[32];',
+    '        for (int j = 0; j < 32; j++) {',
+    '          ramp[j] = texture(u_lut, vec2((float(j) + 0.5) / 32.0, 0.5)).rgb;',
+    '        }',
+    '        for (int i = 0; i < 32; i++) {',
+    '          vec3 cand = ramp[i];',
+    '          vec3 dd = cand - ic;',
+    '          float dist = dot(dd, dd);',
+    '          if (dist < best) { best = dist; bestCol = cand; }',
+    '        }',
+    '        imgCol = bestCol;',
+    '      } else {',
+    '        imgCol = ic;',
+    '      }',
+    '      // -- bit depth: the picture\'s colour only --',
+    '      // N levels per channel (8, 10 or 12 bit). 8 bit is 256 levels, already finer than the',
+    '      // uploaded picture, so at the bottom of the ladder the quantiser is the identity and',
+    '      // dithering it would only add noise. 4 bit was not an LED depth: 16 levels per channel',
+    '      // is coarser than anything the wall\'s ramp can show and made every colour mode look',
+    '      // like it had lost the picture.',
+    '      // the ordered dither offsets by up to half a level before quantising, so the cells',
+    '      // along a gradient land on DIFFERENT levels and the eye resolves the intermediate',
+    '      // colours that no cell can show on its own.',
+    '      float lv = max(pow(2.0, u_bits) - 1.0, 2.0);',
+    '      if (u_imgDither > 0.5) {',
+    // The block is 4x4 CELLS, not 4x4 pixels: a cell is one LED and its neighbours are the
+    // only other things the same patch of wall is made of, so the pattern has to repeat over
+    // the LEDs or the eye never sees it through the emitter profile.
+    '        int bx = int(mod(floor(v_cell.x), 4.0));',
+    '        int by = int(mod(floor(v_cell.y), 4.0));',
+    // A constant-index fold of the 4x4 Bayer matrix (WebGL2 cannot index a matrix dynamically).
+    '        float bayer = 0.0;',
+    '        if (by == 0) { if (bx == 0) bayer = 0.0; else if (bx == 1) bayer = 8.0; else if (bx == 2) bayer = 2.0; else bayer = 10.0; }',
+    '        else if (by == 1) { if (bx == 0) bayer = 12.0; else if (bx == 1) bayer = 4.0; else if (bx == 2) bayer = 14.0; else bayer = 6.0; }',
+    '        else if (by == 2) { if (bx == 0) bayer = 3.0; else if (bx == 1) bayer = 11.0; else if (bx == 2) bayer = 1.0; else bayer = 9.0; }',
+    '        else { if (bx == 0) bayer = 15.0; else if (bx == 1) bayer = 7.0; else if (bx == 2) bayer = 13.0; else bayer = 5.0; }',
+    '        float boff = (bayer / 16.0 - 0.5) / lv;',
+    // Spread across the three emitters (blue carries three times the offset, green three
+    // quarters, red none): the SAME offset on every channel just makes every level per channel
+    // and lands the cell on its nearest quantum again, which is why the earlier one-per-channel
+    // version could only ever remove colours.
+    '        imgCol += vec3(0.0, 0.75 * boff, 3.0 * boff);',
+    '      }',
+    '      imgCol = floor(clamp(imgCol, 0.0, 1.0) * lv + 0.5) / lv;',
+    '    }',
+    '  }',
+    // A picture cell is lit the way any other cell is lit: the look's exposure (`u_global`,
+    // the same `exposure` the composite grades with) times the emitter profile below. The pattern's `v_br` is NOT applied on top - inside the
+    // box the picture IS the cell content, and multiplying it by whatever the pattern happened
+    // to be doing would make the photo dim and patchy (and would make a colour patch of the
+    // pattern show through a colour mode that is supposed to replace it).
+    '  if (imgA > 0.5) { base = imgCol; }',
     '  float r = u_radiusPx;',
     // Emitter profile, all radii relative to the LED radius so it holds at any
     // grid density: pin-point core, soft lamp body, crisp edge at 0.78 r.
@@ -199,6 +376,17 @@
     '',
     '  float br = v_br;',
     '  float gain = 1.0 + (u_hdrGain - 1.0) * br * br;',
+    // The exposure multiplier is NOT re-applied to a picture cell. `base` already carries it -
+    // imgCol is `texture * u_global * (u_exposure/2)`, and the code below multiplies by u_global
+    // again. That squared the exposure, so a restored image preset and a live-edited one sat at
+    // different brightnesses for the same `exposure` and the gate that compares the two saw a
+    // colour shift rather than the picture it uploaded.
+    '  if (imgA > 0.5) { br = 1.0; gain = 1.0 + (u_hdrGain - 1.0); }',
+    // A cell with no pattern behind it and no picture on it is unlit. This test MOVED here from
+    // the top of main(): it used to run before the picture was consulted, so a picture cell on a
+    // dark band of the wall was dropped before it could be drawn and the box on screen was a
+    // copy of the pattern's lit cells rather than the picture.
+    '  if (br < 0.002 && imgA < 0.5) { o = vec4(0.0); return; }',
     '  o = vec4(base * clamp(s, 0.0, 1.0) * br * gain, 1.0);',
     '}'
   ].join('\n');
@@ -274,6 +462,11 @@
     this.opts = opts;
     this.s = merge(DEFAULTS, settings || {});
     this.onStats = typeof opts.onStats === 'function' ? opts.onStats : null;
+
+    // Operator-saved presets, handed in by the page (`boot.js` pulls them from the server) or
+    // pushed later by `ledwall:saved-presets`. Kept on the instance so `preset.set` sees them.
+    this.savedPresets = {};
+    applySavedPresets(opts.savedPresets || {});
 
     this.scale = num(opts.scale, num(this.s.deckDefault && this.s.deckDefault.scale, 2));
 
@@ -357,6 +550,16 @@
     this.grid = null;
     this.lutTex = null;
     this.textTex = null;
+    // The image layer: one RGBA8 texture holding whatever /api/wall/image last served, plus the
+    // revision it was uploaded at, so a settings-only change never re-downloads the picture.
+    this.imgTex = null;
+    this.imgRev = null;       // revision the texture holds
+    this.imgAspect = 1;       // picture width / height (diag; the shader uses imageGeometry)
+    this.imageGeometry = null; // {aspect} from the server: picture aspect / wall aspect
+    this.imgLoading = 0;      // in-flight fetches (diag)
+    this.imgLoaded = 0;       // successful uploads (diag)
+    this.imgError = '';       // last download/decode failure, verbatim
+    this.imgInfo = null;      // {rev, file, w, h} as the server described it
     this.textSize = [0, 0];
     this.textKey = '';
     this.textMs = 0;          // last rasteriser cost, ms (proved in diag)
@@ -374,6 +577,11 @@
     this.sceneTex = null;
     this.sceneFbo = null;
     this.bloom = [];
+    this.persistOk = 0;       // look writes that reached the document (diag)
+    this.persistFail = 0;     // look writes that did not (diag)
+    this.imgProbe = null;     // one pixel of the decoded picture, to prove the decode happened
+    this.imgAbort = null;     // AbortController of the fetch in flight
+    this.imgWantRev = null;   // revision the wall currently WANTS (a late upload is dropped)
     this.simTex = [null, null];
     this.simFbo = [null, null];
     this.simCur = 0;
@@ -564,6 +772,156 @@
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 1, gl.RGBA, gl.UNSIGNED_BYTE, data);
   };
 
+  // ── the image layer ───────────────────────────────────────────────────────
+
+  /**
+   * Upload the picture the server is holding, when its revision moved.
+   *
+   * Same shape as `_syncLUT`: keyed, so a settings change (a drag, a colour mode pick) costs one
+   * integer compare and never a re-download. The bytes come from `/api/wall/image` (the file the
+   * server stored at upload time); a decode failure is recorded in `imgError` and leaves the
+   * previous picture on the wall rather than blanking it.
+   */
+  Instance.prototype._syncImage = function () {
+    var gl = this.gl;
+    var s = this.eff || this.s;
+    var rev = Math.round(num(s.imageRev, 0));
+    var clear = !(num(s.imageOn, 0) >= 0.5);
+    if (clear) {
+      // Only the texture that IS the stored picture is dropped. A layer switched on again on the
+      // next frame - a preset that carries `imageOn: 1`, an operator toggling the box - must not
+      // find the upload thrown away and a fresh download put between it and the wall.
+      if (this.imgTex && this.imgRev === rev) return;
+      if (this.imgTex) { gl.deleteTexture(this.imgTex); this.imgTex = null; }
+      this.imgRev = null;
+      this.imgInfo = null;
+      // The picture the operator just removed must not arrive later: an in-flight download for
+      // this revision is cancelled here, or its `then` puts the texture straight back on the wall.
+      if (this.imgAbort) { try { this.imgAbort.abort(); } catch (e1) { /* already settled */ } this.imgAbort = null; }
+      this.imgWantRev = null;
+      return;
+    }
+    // The guard is "this revision is already loaded", and it used to be `this.imgLoading` as well:
+    // any in-flight download - including one for a revision that is already stale - then pinned
+    // the picture forever. A layer switched on while the first fetch was still running never got
+    // its texture, which is why "the picture does not show" survived a correct upload.
+    var have = this.imgTex && this.imgRev === rev;
+    if (have) return;
+    var self = this;
+    var url = '/api/wall/image?v=' + rev + '.' + (self.imgLoaded + 1);
+    this.imgLoading++;
+    // A picture request must not outlive the frame it belongs to. Two of these open at once (the
+    // look flips imageOn on and off while a fetch is in flight) is how "removing the image" left
+    // the layer on screen: the late response uploaded a texture for a revision nobody wanted.
+    if (this.imgAbort) { try { this.imgAbort.abort(); } catch (e0) { /* already settled */ } }
+    var ac = (typeof AbortController === 'function') ? new AbortController() : null;
+    this.imgAbort = ac;
+    this.imgWantRev = rev;
+    fetch(url, ac ? { signal: ac.signal } : undefined)
+      .then(function (r) {
+        if (!r.ok) throw new Error('image ' + r.status);
+        self.imgInfo = {
+          rev: rev,
+          file: r.headers.get('x-wall-image') || '',
+          w: Number(r.headers.get('x-wall-image-w') || 0),
+          h: Number(r.headers.get('x-wall-image-h') || 0)
+        };
+        return r.blob();
+      })
+      .then(function (blob) {
+        return createImageBitmap(blob);
+      })
+      .then(function (bmp) {
+        // Late arrivals are dropped, not uploaded: the layer may have been switched off (or
+        // another revision uploaded) between the request and the decode, and drawing that
+        // picture anyway is the "it comes back on its own" the operator saw.
+        if (self.imgWantRev !== rev) { if (bmp.close) bmp.close(); return; }
+        var w = bmp.width, h = bmp.height;
+        // The decoded image is copied through a 2D canvas rather than passed straight to
+        // texImage2D: an ImageBitmap's upload is where a WebGL2 context can silently produce an
+        // all-zero level 0, and a canvas is the one source that is always pixel-exact.
+        var c2d = document.createElement('canvas');
+        c2d.width = w;
+        c2d.height = h;
+        var ctx2d = c2d.getContext('2d');
+        ctx2d.drawImage(bmp, 0, 0);
+        self.imgProbe = Array.prototype.slice.call(ctx2d.getImageData(0, 0, 1, 1).data);
+        if (!self.imgTex) self.imgTex = self._makeTex(w, h, false, gl.LINEAR);
+        // Level 0: the decoded bitmap. Re-creating the texture per upload (rather than
+        // respecifying the level-0 image of a live one) keeps the uploaded picture independent
+        // of whatever unit happened to be active when the fetch resolved.
+        gl.activeTexture(gl.TEXTURE0 + 3);
+        gl.bindTexture(gl.TEXTURE_2D, self.imgTex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c2d);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        // Deliberately NOT a mipmap-complete texture: the engine's own _makeTex leaves
+        // MIN_FILTER at LINEAR (not LINEAR_MIPMAP_LINEAR) for exactly this reason — a texture
+        // that claims mipmapping but has only level 0 samples black in WebGL2, and black is what
+        // an un-set MIN_FILTER looks like here.
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        self.imgErr = gl.getError();
+        if (bmp.close) bmp.close();
+        if (self.imgErr) throw new Error('image texture upload: gl error ' + self.imgErr);
+        self.imgAspect = w / Math.max(1, h);
+        self.imgRev = rev;
+        self.imgLoaded++;
+        self.imgError = '';
+      })
+      .catch(function (e) {
+        // A cancelled request is the operator's own action (the layer went off, a new picture
+        // arrived), not a failure worth reporting.
+        if (e && e.name === 'AbortError') return;
+        self.imgError = (e && e.message) ? e.message : String(e);
+      })
+      .then(function () {
+        self.imgLoading = Math.max(0, self.imgLoading - 1);
+      });
+  };
+
+  /** Placement + mode, straight onto the LED program. */
+  Instance.prototype._drawImageUniforms = function (s) {
+    var gl = this.gl, p = this.progLed;
+    // The placement is written here, with the LED program bound and from the same `s` the
+    // diffuse pass reads: the settings object the pane edits is not the object this draw uses,
+    // so reading it twice is how the transform ends up one value on one pass and another on the
+    // next.
+    //   u_imgXf = (centre x, centre y as down-positive, scale, 0)
+    //   u_imgRot = (cos, sin)
+    //   u_imgSize = (1, aspect compensation for the HEIGHT)
+    //     `scale` is a fraction of the WALL WIDTH (the pane draws its rectangle the same way).
+    //     The wall is not square, so a picture `scale` wide is `scale / wallAspect` tall in
+    //     wall-height fractions; the shader works in width fractions on both axes, so that
+    //     height has to be stretched by `wallAspect` to come back out square in cells.
+    // The vertical stretch is the server's `imageGeometry.aspect` (picture aspect / wall
+    // aspect), derived from the uploaded file's real size. Falling back to the wall's own aspect
+    // keeps a page that was handed only a look (a bare harness, a URL preset) drawing a square
+    // box instead of dividing by zero.
+    var geom = this.imageGeometry || null;
+    var aspect = geom && num(geom.aspect, 0) > 0
+      ? num(geom.aspect, 1)
+      : (this.W > 0 && this.H > 0 ? this.W / this.H : (112 / 63));
+    var on = (num(s.imageOn, 0) >= 0.5) && this.imgTex ? 1 : 0;
+    var scale = clamp(num(s.imageScale, 1), 0.05, 4);
+    var mode = String(s.imageColour || 'raw');
+    f1(gl, p, 'u_imgOn', on);
+    f1(gl, p, 'u_imgMode', mode === 'match' ? 1 : (mode === 'palette' ? 2 : 0));
+    f4(gl, p, 'u_imgXf', clamp(num(s.imageX, 0.5), 0, 1), clamp(num(s.imageY, 0.5), 0, 1), scale, 0);
+    var rot = num(s.imageRotate, 0) * Math.PI / 180;
+    f2(gl, p, 'u_imgRot', Math.cos(rot), Math.sin(rot));
+    f2(gl, p, 'u_imgSize', 1, aspect);
+    // Bit depth: the picture's own channel levels. Only 8/10/12 are depths an LED wall can be
+    // asked for; anything else - including the retired '4' and whatever an older saved preset
+    // carries - is 8, where the quantiser is effectively the identity.
+    var bits = Math.round(num(s.imageBits, 8));
+    f1(gl, p, 'u_bits', bits === 10 || bits === 12 ? bits : 8);
+    f1(gl, p, 'u_imgDither', num(s.imageDither, 1) >= 0.5 ? 1 : 0);
+  };
+
   /**
    * Resolve this page's effective look.
    *
@@ -646,6 +1004,61 @@
   // ── Settings ─────────────────────────────────────────────────────────────
 
   /** Called on mount and on setSettings; `force` re-syncs derived state. */
+  /**
+   * Tell the server what this page now looks like, so the look the operator just applied survives
+   * the document, the next snapshot frame and a page reload.
+   *
+   * `preset.save` and `preset.set` change the look on this page first — the server's document is
+   * written from the control pane, not from here — so without this the saved/loaded preset lives
+   * only in memory and the next `state.snapshot` (a heartbeat, a fence drag) restores whatever the
+   * document still holds. Fire-and-forget: a missed write leaves the page rendering the right
+   * look, which is why the failure is counted rather than thrown.
+   */
+  Instance.prototype._persistLook = function (look) {
+    if (!look || typeof look !== 'object') return Promise.resolve(false);
+    // The page and the server are one origin (the wall is served by the ShockBox server), so the
+    // write is relative. It used to be prefix-built from the agent's base URL, which is absolute:
+    // that made a same-origin PATCH a cross-origin request, which a page served with the wall's
+    // COEP (`require-corp`) blocks - the write then failed every time while a hand-written
+    // relative fetch from the same page returned 200.
+    var url = '/api/wall/settings';
+    this.persistOk = this.persistOk || 0;
+    this.persistFail = this.persistFail || 0;
+    var self = this;
+    var done = function (ok, why) {
+      if (ok) { self.persistOk++; } else { self.persistFail++; self.persistErr = why || ''; }
+      return ok;
+    };
+    // Ordered writes: a load that follows a save within one round trip used to race it, and the
+    // document kept whichever request happened to finish last. Chaining keeps the newest look
+    // the newest write, which is what "the document agrees with the wall" means.
+    var prev = this._persistQueue || Promise.resolve();
+    this._persistQueue = prev.then(function () { return self._persistLookNow(look, done); });
+    // A failed write must not poison the queue: the next look still has to be sent.
+    this._persistQueue = this._persistQueue.catch(function () { return false; });
+    return this._persistQueue;
+  };
+
+  /** One PATCH, serialised by `_persistLook`. `done` counts the outcome on the instance. */
+  Instance.prototype._persistLookNow = function (look, done) {
+    if (!look || typeof look !== 'object') return Promise.resolve(false);
+    var url = '/api/wall/settings';
+    try {
+      return fetch(url, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(look)
+      }).then(function (r) {
+        if (r && r.ok) return done(true);
+        return r.text().catch(function () { return ''; }).then(function (t) {
+          return done(false, 'HTTP ' + (r && r.status) + ' ' + String(t || '').slice(0, 200));
+        });
+      }, function (e) { return done(false, 'network ' + ((e && e.message) || e)); });
+    } catch (e) {
+      return Promise.resolve(done(false));
+    }
+  };
+
   Instance.prototype._syncDerived = function () {
     var eff = this._resolveView();
     this.patternIndex = SIM.PATTERN_INDEX[eff.pattern] !== undefined
@@ -672,6 +1085,7 @@
 
     this._syncLUT();
     this._syncText();
+    this._syncImage();
 
     // `reveal` is milliseconds *per character*, so the total type-on window is
     // ms × characters; the shader only needs a normalised 0..1 progress.
@@ -894,6 +1308,7 @@
     f1(gl, this.progSim, 'u_textScroll', this.scrollCells);
     f1(gl, this.progSim, 'u_reveal', this._revealProgress());
     f1(gl, this.progSim, 'u_textHex', this.textUseHex ? 1 : 0);
+    f1(gl, this.progSim, 'u_textScrollRate', textScrollRate(this.patternIndex));
     f1(gl, this.progSim, 'u_cdScale', this.floatCB ? 1.0 : 0.25);
     i1(gl, this.progSim, 'u_pattern', this.patternIndex);
     /* Intensity for the eyecandy patterns.  Derived from waveFrequency so the
@@ -975,9 +1390,13 @@
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, simTex);
     i1(gl, this.progLed, 'u_sim', 0);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.imgTex || null);
+    i1(gl, this.progLed, 'u_image', 2);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
     i1(gl, this.progLed, 'u_lut', 1);
+    this._drawImageUniforms(s);
     f2(gl, this.progLed, 'u_grid', g.cols, g.rows);
     f1(gl, this.progLed, 'u_extent', extentCells);
     f2(gl, this.progLed, 'u_pxPerCell', g.pitchX, g.pitchY);
@@ -987,6 +1406,7 @@
     f1(gl, this.progLed, 'u_flareLen', flareLen);
     f1(gl, this.progLed, 'u_flareRot', num(s.flareRotation, 0) * Math.PI / 180);
     f1(gl, this.progLed, 'u_hdrGain', num(s.hdrGain, 2.2));
+    f1(gl, this.progLed, 'u_global', clamp(num(s.exposure, 1), 0.2, 3));
     f1(gl, this.progLed, 'u_streak', streak);
     f3(gl, this.progLed, 'u_textColor', this.textHex[0], this.textHex[1], this.textHex[2]);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, g.cols * g.rows);
@@ -1695,8 +2115,13 @@
    * back over their choice.
    */
   Instance.prototype._noteLookCommand = function (cmd) {
-    var isPreset = (cmd === 'preset.set' || cmd === 'preset.next' || cmd === 'preset.prev');
-    var isPattern = (cmd === 'pattern.set' || cmd === 'pattern.next' || cmd === 'pattern.prev');
+    var isPreset = (cmd === 'preset.set' || cmd === 'preset.next' || cmd === 'preset.prev' ||
+                    cmd === 'preset.save');
+    // `look.pattern` is the animation-only half of a look change, so it is a pattern command;
+    // `look.palette` is a colour change and touches neither dimension (a palette already
+    // reaches text cells live through the LUT, see sim.js — no override to release).
+    var isPattern = (cmd === 'pattern.set' || cmd === 'pattern.next' || cmd === 'pattern.prev' ||
+                     cmd === 'look.pattern');
     if (!isPreset && !isPattern) return false;
     var h = this.holds[this.view];
     var snap = (h && h.snap) || (this.textLook && this.textLook.view === this.view ? this.textLook.snap : null);
@@ -1769,7 +2194,10 @@
 
   // ── Command bus (agent → page) ────────────────────────────────────────────
 
-  var PRESET_ORDER = ['neonwave', 'arctic', 'chase', 'bassline', 'sign', 'ember'];
+  // Deck cycling order. `sign` was a text behaviour bolted onto the preset bank and is gone:
+  // it carried no look of its own, so `preset.next` landed on a preset that did not exist and
+  // the wall flickered through an empty look. Operator-saved presets are appended after these.
+  var PRESET_ORDER = ['neonwave', 'arctic', 'chase', 'bassline', 'ember'];
 
   /**
    * One command, from the deck through services/ledwall-agent.  Returns
@@ -1812,6 +2240,10 @@
         case 'preset.next':
         case 'preset.prev': {
           var order = PRESET_ORDER.filter(function (n) { return !!PRESETS[n]; });
+          savedPresetList().forEach(function (n) {
+            if (order.indexOf(n) < 0) order.push(n);
+          });
+          if (!order.length) { note = 'ignored: no presets'; break; }
           var i = order.indexOf(this.label);
           var d = cmd === 'preset.next' ? 1 : -1;
           var next = order[(((i < 0 ? 0 : i) + d) % order.length + order.length) % order.length];
@@ -1819,14 +2251,103 @@
           changed = true;
           break;
         }
-        case 'preset.set':
+        case 'preset.set': {
           if (!a.name) { note = 'ignored: no name'; break; }
-          this.applyPreset(String(a.name));
+          var setName = String(a.name);
+          this.applyPreset(setName);
+          changed = true;
+          // The server writes its document from the control pane, not from this page, so a preset
+          // applied here has to be handed back: otherwise the look lives only in this engine's
+          // memory and the next `state.snapshot` puts the document's (pre-load) values back.
+          // Everything the preset touched is sent, omissions included — a preset that omits a
+          // dimension means "default", and the document has to agree.
+          try {
+            if (typeof this._persistLook === 'function') {
+              var lk = this.getSettings();
+              // Every dimension the preset carries is handed back, omissions included. The
+              // server drops the ones its document does not own (`mode` is page state); sending
+              // the whole set keeps this side free of a second schema to keep in step.
+              var out = {};
+              PRESET_DIMS.forEach(function (f) {
+                if (lk[f] !== undefined) out[f] = lk[f];
+              });
+              out.preset = setName;
+              // Keep the page's own view of the document quiet until this write lands: the
+              // snapshot it triggers is the one that must win, not one already in flight.
+              var self2 = this;
+              this.presetLoadingUntil = Date.now() + 1500;
+              this._persistLook(out).then(function (ok) {
+                // Once the document has the preset, the page may follow frames again.
+                if (ok) self2.presetLoadingUntil = 0;
+              });
+            }
+          } catch (e1) { note = 'applied; persist threw: ' + (e1 && e1.message); }
+          break;
+        }
+
+        case 'preset.save': {
+          // Capture the look the wall is showing *now* as a named preset. Only the look
+          // dimensions a preset can carry are copied: grid geometry is operator-owned and a
+          // pool record is never read here (presets must not touch text-mode message pools).
+          if (!a.name) { note = 'ignored: no name'; break; }
+          var savedName = String(a.name);
+          var saved = {};
+          PRESET_DIMS.forEach(function (f) {
+            if (self.s[f] !== undefined) saved[f] = cloneJSON(self.s[f]);
+          });
+          this.savedPresets[savedName] = saved;
+          applySavedPresets(this.savedPresets);
+          this._patchField('preset', savedName);
+          changed = true;
+          note = 'saved:' + savedName;
+          break;
+        }
+
+        case 'look.palette':
+          // Palette is the *ramp only*: which colours the LEDs emit. The pattern (what the
+          // cells do over time) and every other look dimension stay exactly as they are.
+          if (!a.name && a.delta === undefined && a.set === undefined) { note = 'ignored: no name'; break; }
+          if (a.name !== undefined) {
+            if (!PALETTES[String(a.name)]) { note = 'ignored: unknown palette'; break; }
+            this._patchField('palette', String(a.name));
+          } else {
+            var pOrder = Object.keys(PALETTES);
+            var pi = pOrder.indexOf(this.s.palette);
+            if (pi < 0) pi = 0;
+            if (a.set !== undefined) {
+              var si = Math.round(num(a.set, 0));
+              pi = ((si % pOrder.length) + pOrder.length) % pOrder.length;
+            } else {
+              pi = (pi + (num(a.delta, 1) >= 0 ? 1 : -1) + pOrder.length) % pOrder.length;
+            }
+            this._patchField('palette', pOrder[pi]);
+          }
+          changed = true;
+          break;
+
+        case 'look.pattern':
+          // Pattern is *animation only*: the same palette keeps the same colours while the
+          // cells change what they do. Mode is left alone, so a live text stays on air.
+          if (!a.name && a.delta === undefined && a.set === undefined) { note = 'ignored: no name'; break; }
+          var patKeepText = this._textOnAir();
+          if (a.name !== undefined) {
+            if (SIM.PATTERN_INDEX[String(a.name)] === undefined) { note = 'ignored: unknown pattern'; break; }
+            this._setViewField('pattern', SIM.PATTERNS[SIM.PATTERN_INDEX[String(a.name)]]);
+          } else {
+            var pIdx = this.patternIndex;
+            if (a.set !== undefined) {
+              var sIdx = Math.round(num(a.set, 0));
+              pIdx = ((sIdx % SIM.PATTERNS.length) + SIM.PATTERNS.length) % SIM.PATTERNS.length;
+            } else {
+              pIdx = (pIdx + (num(a.delta, 1) >= 0 ? 1 : -1) + SIM.PATTERNS.length) % SIM.PATTERNS.length;
+            }
+            this._setViewField('pattern', SIM.PATTERNS[pIdx]);
+          }
+          if (!patKeepText) this._setViewField('mode', 'pattern');
           changed = true;
           break;
 
         case 'pattern.next':
-        case 'pattern.prev':
         case 'pattern.set': {
           var idx;
           if (cmd === 'pattern.set') {
@@ -1972,6 +2493,30 @@
           // Contract: only the admin UI's explicit "reload source" sends this.
           // The display pages never schedule a reload of their own.
           if (window.location && window.location.reload) window.location.reload();
+          changed = true;
+          break;
+
+        case 'wall.image.set': {
+          // The upload route answers this on the server (it owns the file), but a deck or the
+          // pane can also pin a placement: the picture is already there, only the transform
+          // moves. Anything not named is left alone.
+          var imgPatch = {};
+          var keys = ['x', 'y', 'scale', 'rotate', 'colour', 'bits', 'dither'];
+          var fields = ['imageX', 'imageY', 'imageScale', 'imageRotate', 'imageColour', 'imageBits', 'imageDither'];
+          for (var ki = 0; ki < keys.length; ki++) {
+            if (a[keys[ki]] !== undefined) imgPatch[fields[ki]] = a[keys[ki]];
+          }
+          if (a.rev !== undefined) {
+            imgPatch.imageRev = num(a.rev, 0);
+            imgPatch.imageOn = 1;
+          }
+          if (!Object.keys(imgPatch).length) { note = 'ignored: no image arguments'; break; }
+          this.setSettings(imgPatch);
+          changed = true;
+          break;
+        }
+        case 'wall.image.clear':
+          this.setSettings({ imageOn: 0 });
           changed = true;
           break;
 
@@ -2213,6 +2758,9 @@
       if (msg.seq <= this.seq) return;      // replay after a reconnect
       this.seq = msg.seq;
     }
+    // What the server actually sent, kept for diag().agent.lastCmd. Recorded after the
+    // replay guard so a reconnect cannot leave stale args behind a fresh command.
+    this._lastArgs = msg.args || null;
     this.received++;
     var res;
     try {
@@ -2224,6 +2772,7 @@
     }
     if (res && res.ok) this.applied++; else this.ignored++;
     this.lastCmd = { cmd: msg.cmd, res: res, at: Date.now() };
+    if (this._lastArgs) this.lastCmd.args = this._lastArgs;
     if (res && res.note && res.note.indexOf('error') === 0) this.errors++;
     this.pushState();
   };
@@ -2349,6 +2898,9 @@
     },
     patterns: SIM.PATTERNS,
     palettes: Object.keys(PALETTES),
-    presets: Object.keys(PRESETS)
+    presets: savedPresetList,
+    applySavedPresets: applySavedPresets,
+    // The dimensions a preset carries, so a test can prove the page and the server agree.
+    presetDims: PRESET_DIMS.slice()
   };
 })();

@@ -24,6 +24,10 @@
 import { el, clear, dot, actionButton } from '/src/ui.js';
 import { toast } from '/src/toast.js';
 import { renderSettingsForm } from '/src/settings-form.js';
+// the shared module preview: one 16:9 frame + 9:16 window for every pane (see preview.js)
+import { mountPreview } from '/src/preview.js';
+import { mountQuickSend } from '/src/quicksend.js';
+import { mountSchedulePanel } from '/src/schedule-panel.js';
 
 /* The wall surface the preview draws, in the render page's pixel space at scale 2. */
 const WALL_W = 2560;
@@ -37,7 +41,13 @@ const HANDLED = new Set(['ratio', 'fence', 'blackout', 'pattern', 'preset', 'fen
 const LOOK_GROUPS = ['look', 'general', 'behaviour', 'timing', 'audio', 'advanced', 'obs', 'ratio', 'compat'];
 
 /* Palette stops mirrored from the engine (engine/config.js, window.LEDWALL_PALETTES), so the
- * preview's still can be tinted like the wall without running WebGL. */
+ * preview's still can be tinted like the wall without running WebGL.
+ *
+ * Key order is the engine's own bank order on purpose: `look.palette` with no name steps through
+ * `Object.keys(LEDWALL_PALETTES)`, so a name's place in this object (and therefore in the
+ * dropdown) has to be its place in the engine's list or a step and a pick disagree. This is the
+ * same list `engine/config.js` puts in window.LEDWALL_PALETTES; nothing fetches the engine file
+ * here — the pane must paint even when no render page is open. */
 const PALETTES = {
   synthwave: ['#7b2ff7', '#c026d3', '#ff2d95'],
   arctic: ['#9fb8d8', '#e6fbff', '#3a86ff'],
@@ -47,6 +57,13 @@ const PALETTES = {
   candy: ['#ff5ec4', '#6f5bff', '#7bffd4'],
   mono: ['#ffffff', '#c8dcff', '#9fb8d8'],
 };
+// The engine's default ramp and look, named once: a live look that says nothing about its
+// palette is the engine's default, and the dropdown must point at what the wall is running.
+const DEFAULT_PALETTE = 'neonwave';
+
+/* a select shows exactly one option and nothing else, so the placeholder has to be the default
+   the wall runs: `— preset —` would read as "no preset" when the wall is in fact rendering one */
+const DEFAULT_PRESET = 'neonwave';
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -109,6 +126,12 @@ const GROUP_LABEL = {
 const PATTERNS = ['random', 'wave', 'bottomCenter', 'sweep', 'bars', 'ripple', 'plasma', 'chase',
   'sweepMirror', 'comet', 'matrix', 'spectrum', 'orbits', 'rain', 'equalizer', 'static', 'heartbeat'];
 const PALETTE_NAMES = Object.keys(PALETTES);
+// A preset saved by hand carries a `+` next to its name, so an operator-made look reads apart
+// from the shipped ones in a list that is otherwise just names. The value is always the raw name.
+const SAVED_PRESET_PREFIX = '+ ';
+// Mirrors server.js / commands.mjs: a name outside this is a refused command, so the inline save
+// field answers it here instead of sending a request that can only fail.
+const PRESET_NAME_RE = /^[A-Za-z0-9 ._:-]{1,64}$/;
 
 /** Turn core's describe() map into the shape the shell's settings form renders. */
 function lookRows(meta) {
@@ -139,6 +162,19 @@ export async function render(container, ctx) {
   const unsubs = [];
   const timers = [];
 
+  /* One look for every view of the wall.
+   *
+   * This pane used to keep its `look` to itself, so a palette the merged column set was invisible
+   * here and vice versa. `ctx.sharedLook` is the shell's store (merged-preview.js): this pane
+   * PUBLISHES every look it reads from the server into it, and PAINTS from it when it changes —
+   * two directions through one object, no second copy. `synth` still holds the page's own answer
+   * for a command, because a page command is not in the settings document.
+   *
+   * `shared` is null when the shell has no store (a pane mounted by a test harness): every call
+   * below degrades to the old behaviour, which is why this is a small change and not a rewrite.
+   */
+  const shared = ctx.sharedLook || null;
+
   let live = null; // last /live body
   let renderDoc = null; // last /render settings doc
   let online = { landscape: false, portrait: false };
@@ -146,6 +182,8 @@ export async function render(container, ctx) {
   let seq = 0;
 
   let fencePx = null; // committed fence px, or null = whole wall
+  let frameEl = null; // the preview frame node, for drawing the module's own layer at its size
+  let textOn = true; // the server's text-layer visibility, mirrored so the toggle can flip it
   let fenceCells = null; // server's cells for that rect (or derived)
   let pitch = null; // {x,y}
   let cols = 112;
@@ -163,11 +201,9 @@ export async function render(container, ctx) {
     headStatus,
   );
 
-  /* --- quick controls: pattern / preset / blackout / ratio ----------------- */
+  /* --- quick controls: the three dropdowns / blackout / ratio ---------------- */
 
-  const patternName = el('span', { class: 'wall-chip-name mono', text: '—' });
-  const presetName = el('span', { class: 'wall-chip-name mono', text: '—' });
-  const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'live' });
+const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'live' });
   const ratioWrap = el('div', { class: 'wall-ratio' });
   const ratioSeg = el('div', { class: 'segmented', role: 'radiogroup', 'aria-label': 'Wall ratio' });
   const seg169 = el('button', { type: 'button', class: 'seg mono', text: '16:9', dataset: { value: '16:9' } });
@@ -192,25 +228,224 @@ export async function render(container, ctx) {
   forceWrap.append(forceNote, forceBtn);
   ratioWrap.append(ratioSeg, forceWrap);
 
-  const prevPattern = el('button', { type: 'button', class: 'btn btn-sm btn-icon', 'aria-label': 'Previous pattern', title: 'Previous pattern', text: '‹' });
-  const nextPattern = el('button', { type: 'button', class: 'btn btn-sm btn-icon', 'aria-label': 'Next pattern', title: 'Next pattern', text: '›' });
-  const prevPreset = el('button', { type: 'button', class: 'btn btn-sm btn-icon', 'aria-label': 'Previous preset', title: 'Previous preset', text: '‹' });
-  const nextPreset = el('button', { type: 'button', class: 'btn btn-sm btn-icon', 'aria-label': 'Next preset', title: 'Next preset', text: '›' });
-  prevPattern.addEventListener('click', () => cmd('pattern.prev'));
-  nextPattern.addEventListener('click', () => cmd('pattern.next'));
-  prevPreset.addEventListener('click', () => cmd('preset.prev'));
-  nextPreset.addEventListener('click', () => cmd('preset.next'));
+  /* --- the three look selectors ------------------------------------------------------ */
+
+  // One dropdown per dimension, because that is what the three commands change: `preset.set`
+  // takes the whole look, `look.palette` only the ramp, `look.pattern` only the animation. An
+  // arrow pair said "there is a list, press until you find it"; a dropdown names the list.
+  // A select keeps its own value while the list is open, so the "" option (with its name) is a
+  // real state: the look names something the bank does not hold, and the dropdown says so
+  // instead of silently pointing at the first entry.
+  const presetSelect = el('select', { class: 'input wall-select', id: 'wall-look-preset', 'aria-label': 'Wall preset', title: 'Whole-wall preset' });
+  const paletteSelect = el('select', { class: 'input wall-select', id: 'wall-look-palette', 'aria-label': 'Wall palette', title: 'Palette (ramp only)' });
+  const patternSelect = el('select', { class: 'input wall-select', id: 'wall-look-pattern', 'aria-label': 'Wall pattern', title: 'Pattern (animation only)' });
+
+  const noneOption = (text) => el('option', { value: '', text, disabled: true });
+
+  function fillSelect(sel, names, { unknown = 'not in the bank' } = {}) {
+    const keep = sel.value;
+    clear(sel);
+    sel.appendChild(noneOption(unknown));
+    for (const n of names) sel.appendChild(el('option', { value: n, text: n }));
+    sel.value = keep;
+    sel.dataset.count = String(names.length);
+  }
+
+  function fillPatterns(extra = null) {
+    // A pattern the bank does not list (an engine that grew one, a saved look from a newer
+    // build) still gets a row: the dropdown must be able to show what the wall is running.
+    const names = PATTERNS.slice();
+    if (extra && !names.includes(extra)) names.push(extra);
+    fillSelect(patternSelect, names, { unknown: 'no pattern' });
+  }
+
+  function fillPalettes(extra = null) {
+    const names = PALETTE_NAMES.slice();
+    if (extra && !names.includes(extra)) names.push(extra);
+    fillSelect(paletteSelect, names, { unknown: 'engine default' });
+  }
+
+  function fillPresets(order, saved = {}) {
+    const names = Array.isArray(order) ? order.filter((n) => typeof n === 'string' && n) : [];
+    clear(presetSelect);
+    presetSelect.appendChild(noneOption('— preset —'));
+    for (const n of names) {
+      // the value is the name the server takes; the marker is only what the operator reads
+      const label = saved && Object.prototype.hasOwnProperty.call(saved, n) ? SAVED_PRESET_PREFIX + n : n;
+      presetSelect.appendChild(el('option', { value: n, text: label }));
+    }
+    presetSelect.dataset.count = String(names.length);
+  }
+
+  fillPresets([]);
+  fillPalettes();
+  fillPatterns();
+
+  presetSelect.addEventListener('change', () => {
+    const name = presetSelect.value;
+    if (!name) return;
+    cmd('preset.set', { name }).then((out) => {
+      if (out && out.ok !== false) synth = { ...synth, preset: name };
+      paintQuick();
+      scheduleRefreshLook();
+    });
+  });
+  paletteSelect.addEventListener('change', () => {
+    const name = paletteSelect.value;
+    if (!name) return;
+    // optimism is honest here: the command can only fail on transport or an unknown name, and
+    // both answers land within a beat and repaint the dropdown from the server
+    setLookField('palette', name);
+    paintQuick();
+    cmd('look.palette', { name }).then((out) => onLookCmdAnswer(out, 'palette', name));
+  });
+  patternSelect.addEventListener('change', () => {
+    const name = patternSelect.value;
+    if (!name) return;
+    setLookField('pattern', name);
+    paintQuick();
+    cmd('look.pattern', { name }).then((out) => onLookCmdAnswer(out, 'pattern', name));
+  });
+
+  /* --- save look: an inline name field, never a native prompt ------------------------ */
+
+  // The OBS browser source has no dialog surface and the headless test has no way to answer
+  // one, so the name is typed in the bar itself. Enter and the Save button are the same action.
+  const saveBtn = el('button', { type: 'button', class: 'btn btn-sm wall-save-btn', text: 'Save look…', title: 'Save the look on the wall right now as a preset' });
+  const saveNameInput = el('input', { type: 'text', class: 'input wall-save-input', id: 'wall-look-save-name', maxlength: '64', placeholder: 'preset name', 'aria-label': 'Name for the saved look', autocomplete: 'off', spellcheck: 'false' });
+  const saveOkBtn = el('button', { type: 'button', class: 'btn btn-sm wall-save-ok', text: 'Save' });
+  const saveCancelBtn = el('button', { type: 'button', class: 'btn btn-sm btn-icon wall-save-cancel', text: '×', 'aria-label': 'Cancel saving a look', title: 'Cancel' });
+  const saveNote = el('span', { class: 'wall-save-note mono', role: 'status', 'aria-live': 'polite' });
+  const saveForm = el('div', { class: 'wall-save', hidden: true }, saveNameInput, saveOkBtn, saveCancelBtn, saveNote);
+  let saveNoteTimer = null;
+  timers.push(() => clearTimeout(saveNoteTimer));
+
+  function setSaveNote(text, tone = 'info', hold = 0) {
+    clearTimeout(saveNoteTimer);
+    saveNote.textContent = text || '';
+    saveNote.dataset.tone = tone;
+    // a confirmation fades on its own; a refusal stays until the operator edits the name
+    if (hold > 0) saveNoteTimer = setTimeout(() => setSaveNote(''), hold);
+  }
+
+  function openSave() {
+    saveForm.hidden = false;
+    saveBtn.hidden = true;
+    saveNameInput.value = '';
+    saveNameInput.removeAttribute('data-bad');
+    setSaveNote('');
+    saveNameInput.focus();
+  }
+
+  function closeSave() {
+    saveForm.hidden = true;
+    saveBtn.hidden = false;
+    setSaveNote('');
+    saveNameInput.value = '';
+    saveNameInput.removeAttribute('data-bad');
+  }
+
+  saveBtn.addEventListener('click', openSave);
+  saveCancelBtn.addEventListener('click', closeSave);
+  saveNameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void submitSave();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeSave();
+      saveBtn.focus();
+    }
+  });
+  saveNameInput.addEventListener('input', () => {
+    saveNameInput.removeAttribute('data-bad');
+    if (saveNote.dataset.tone === 'bad') setSaveNote('');
+  });
+  saveOkBtn.addEventListener('click', () => { void submitSave(); });
+
+  let saving = false;
+  async function submitSave() {
+    if (saving || signal.aborted) return;
+    const name = saveNameInput.value.trim();
+    // Refuse here, with the reason in the bar: a request for a name the server cannot take is a
+    // round trip that teaches the operator nothing the regex does not already say.
+    if (!name) {
+      saveNameInput.setAttribute('data-bad', 'true');
+      setSaveNote('a name is required', 'bad');
+      saveNameInput.focus();
+      return;
+    }
+    if (!PRESET_NAME_RE.test(name)) {
+      saveNameInput.setAttribute('data-bad', 'true');
+      setSaveNote('letters, digits, space and . _ : - only (1–64)', 'bad');
+      saveNameInput.focus();
+      return;
+    }
+    saving = true;
+    saveOkBtn.disabled = true;
+    setSaveNote('saving…', 'info');
+    try {
+      const out = await cmd('preset.save', { name });
+      if (!out || out.ok === false) {
+        // cmd() already toasted the server's own words; put the field back on the running name
+        paintQuick();
+        scheduleRefreshLook();
+        scheduleLookPull();
+        return;
+      }
+      // A save makes the saved name the live preset, and the server says which name it took.
+      synth = { ...synth, preset: cleanLookName(out.preset) || name };
+      // the answer carries the whole bank, so the new name is in the list without a reload
+      adoptPresets(out.presets);
+      presetSelect.value = synth.preset;
+      paintQuick();
+      // the field closes, the confirmation stays on the bar for a beat, then the button returns
+      saveForm.hidden = true;
+      saveBtn.hidden = false;
+      setSaveNote(`saved “${synth.preset}”`, 'ok', 2400);
+      scheduleRefreshLook();
+    } catch (err) {
+      setSaveNote(`not saved: ${err.message}`, 'bad');
+    } finally {
+      saving = false;
+      saveOkBtn.disabled = false;
+    }
+  }
+
+  function adoptPresets(presets) {
+    if (!presets || !Array.isArray(presets.order)) return;
+    // a bank that has not changed is not refilled: replacing the options under an open dropdown
+    // closes it, and every snapshot carries the bank
+    const key = presets.order.join('\u0000') + '\u0001' + Object.keys(presets.saved || {}).join('\u0000');
+    if (key === presetBankKey) return;
+    presetBankKey = key;
+    presetBank = presets;
+    fillPresets(presets.order, presets.saved);
+    paintQuick();
+  }
+
   const blackoutBtn = el('button', { type: 'button', class: 'btn btn-sm wall-blackout', title: 'Kill switch: LEDs and background go black' });
   const blackoutLabel = el('span', { class: 'btn-label', text: 'Blackout' });
   blackoutBtn.append(blackoutLabel);
   blackoutBtn.addEventListener('click', () => cmd(blackout ? 'blackout.off' : 'blackout.on'));
 
   const quick = el('div', { class: 'look-bar wall-quick' },
-    el('span', { class: 'look-label', text: 'Pattern' }),
-    prevPattern, patternName, nextPattern,
+    el('label', { class: 'wall-look-field', for: 'wall-look-preset' },
+      el('span', { class: 'look-label', text: 'Preset' }),
+      presetSelect,
+    ),
     el('span', { class: 'look-sep' }),
-    el('span', { class: 'look-label', text: 'Preset' }),
-    prevPreset, presetName, nextPreset,
+    el('label', { class: 'wall-look-field', for: 'wall-look-palette' },
+      el('span', { class: 'look-label', text: 'Palette' }),
+      paletteSelect,
+    ),
+    el('span', { class: 'look-sep' }),
+    el('label', { class: 'wall-look-field', for: 'wall-look-pattern' },
+      el('span', { class: 'look-label', text: 'Pattern' }),
+      patternSelect,
+    ),
+    // the save flow sits beside the Preset field it writes into
+    saveBtn, saveForm,
     el('span', { class: 'look-sep' }),
     blackoutBtn, blackoutBadge,
     el('span', { class: 'control-spacer' }),
@@ -219,41 +454,23 @@ export async function render(container, ctx) {
 
   /* --- preview ------------------------------------------------------------ */
 
-  const stage = el('div', { class: 'wall-stage' });
-  const surface = el('div', {
-    class: 'wall-surface',
-    tabindex: '0',
-    role: 'group',
-    'aria-label': 'Wall preview — drag the window, arrow keys nudge it',
-  });
-  // The whole wall's bounds are 9:16 (the portrait window is 2560 px tall; the 16:9 picture is
-  // 1440 px tall inside it). Everything the engine maps is measured inside `frameEl` — the 16:9
-  // picture — while the 9:16 window is positioned on `surface`, the whole-wall bounds. Without
-  // that split a window 2560 px tall hung 1100 px below a 1440 px-tall box.
-  const frameEl = el('div', { class: 'wall-frame' });
-  const dotsLayer = el('div', { class: 'wall-dots', 'aria-hidden': 'true' });
+  // One preview component for every module pane (public/src/preview.js). It owns the shape:
+  // a 16:9 frame (the wall's real picture) with the 9:16 window inside it, sized from the
+  // frame's width — so this pane can no longer grow a portrait column the height of the screen,
+  // which is what the old `wall-surface` did by making the whole 9:16 bounds the drag plane.
+  // The module keeps everything it knows and the component does not: the fence cells, the
+  // committed rect, the pixel readout and which commands the window moves.
+  const previewHost = el('div', { class: 'wall-preview-host' });
+  let preview = null;
+  let previewLayerPainted = false;
+
+  // The layer drawn inside the 9:16 window: the wall's lattice and its tag. The dotted veil is
+  // NOT here — the preview applies it itself, which is why an unmodified default fence rect can
+  // still be lit (a full-size grid would otherwise read as "the wall is not dimmed at all").
+  const layerEl = el('div', { class: 'wall-layer' });
   const surfaceTag = el('span', { class: 'wall-surface-tag mono' });
-  // The window is a real cut-out: the wall's picture is reset inside it (fence-hole), so the
-  // inside reads as the live surface, and the fence dims everything outside itself. Dimming the
-  // whole surface instead would wash the inside of the window too, which is exactly what the
-  // operator reads as "the 9:16 crop".
-  const windowEl = el('div', { class: 'fence' });
-  const holeEl = dotsLayer.cloneNode(true);
-  holeEl.classList.add('fence-hole');
-  holeEl.id = '';
-  holeEl.removeAttribute('data-shape');
-  // the clone keeps the wall's class too; inside the window it must not paint the base gradient
-  holeEl.classList.remove('wall-dots');
-  // Two zero-height boxes the window can overhang into: without them the surface is exactly the
-  // picture's height, and the window's top/bottom (a 9:16 window is taller than the 16:9
-  // picture) fall outside its bounds — unhittable and untouchable.
-  const fenceName = el('span', { class: 'fence-label mono' });
-  const gripEl = el('div', { class: 'fence-grip', 'aria-hidden': 'true' });
-  windowEl.append(holeEl, fenceName, gripEl);
-  frameEl.append(dotsLayer, surfaceTag);
-  // The surface *is* the wall's outer bounds (9:16); the 16:9 picture is centred inside it by
-  // CSS, so a window may hang above and below the picture and still be inside the drag plane.
-  surface.append(frameEl, windowEl);
+  layerEl.append(surfaceTag);
+
   const readout = el('div', { class: 'wall-readout' });
   const cellsOut = el('div', { class: 'wall-readout-row' },
     el('span', { class: 'wall-readout-k mono dim', text: 'cells' }),
@@ -265,19 +482,13 @@ export async function render(container, ctx) {
   // x ticks on the top edge: the drag is 2-D, so both axes need a frame of reference
   const axis = el('div', { class: 'wall-axis mono', 'aria-hidden': 'true' });
   readout.append(cellsOut, pxOut);
-  stage.append(surface, gutter, axis);
 
-  // the header states which mode the wall is in; the tag on the surface names the rect
-  const previewMode = el('span', { class: 'wall-mode', text: 'whole wall' });
-  const previewPanel = el('section', { class: 'panel wall-preview' },
-    el('div', { class: 'panel-head' },
-      el('span', { class: 'panel-title', text: 'Wall preview' }),
-      previewMode,
-      el('span', { class: 'panel-hint mono dim', text: '2560 × 1440 · drag to move · corner grip to resize' }),
-    ),
-    stage,
-    readout,
-  );
+  // The component's window is the fence. It is appended into the component's stage after mount
+  // so the shared drag handling and the wall's own grip cannot fight over the same element.
+  //
+  // The panel joins the body, so the whole pane lands in one append: a pane that appears in two
+  // steps is a pane the shell's next paint can catch half-built.
+  const previewPanel = el('section', { class: 'wall-preview' }, previewHost, axis, readout, gutter);
 
   /* --- fence controls ----------------------------------------------------- */
 
@@ -397,36 +608,25 @@ export async function render(container, ctx) {
 
   /* --- text quick send ---------------------------------------------------- */
 
-  const textInput = el('input', { type: 'text', class: 'input', id: 'wall-text', placeholder: 'Message to the wall…', maxlength: '240', autocomplete: 'off' });
-  const textSendBtn = actionButton({
-    label: 'Send',
-    variant: 'btn-primary',
-    run: () => {
-      const text = textInput.value.trim();
-      if (!text) throw new Error('type a message first');
-      return api.post('/api/wall/cmd', { cmd: 'text.send', args: { text } });
-    },
-    onDone: () => {
-      textInput.value = '';
-      toast('text sent', 'ok');
-    },
-    onError: (err) => toast(`text: ${err.message}`, 'error'),
-  });
-  textInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      textSendBtn.click();
-    }
-  });
-  let textEnabled = false;
+  // The message pool is reached through the quick-send box at the top of the page: one picker,
+  // searchable and tag-filterable, replacing the old <select> + Send row that duplicated it here.
+  // What stays local is the text layer's own controls (show/hide, clear, reveal).
+  let wallMsgs = [];
+  async function loadWallPool() {
+    const r = await api.get('/api/pool/wall');
+    wallMsgs = (r && r.messages) || [];
+    await quickBox.refresh().catch(() => {});
+  }
+  loadWallPool().catch((err) => toast(`wall pool: ${err.message}`, 'error'));
+
   const textToggle = el('button', { type: 'button', class: 'btn btn-sm', title: 'Show or hide the wall’s text layer' });
   const textToggleLabel = el('span', { class: 'btn-label', text: 'Text layer' });
   textToggle.append(textToggleLabel);
   textToggle.addEventListener('click', async () => {
     textToggle.disabled = true;
     try {
-      await api.post('/api/wall/cmd', { cmd: 'text.enabled', args: { on: !textEnabled } });
-      textEnabled = !textEnabled;
+      await api.post('/api/wall/cmd', { cmd: 'text.enabled', args: { on: !textOn } });
+      textOn = !textOn;
       paintTextToggle();
     } catch (err) {
       toast(`text layer: ${err.message}`, 'error');
@@ -443,15 +643,18 @@ export async function render(container, ctx) {
       el('span', { class: 'panel-hint mono dim' }, 'sends to landscape + portrait'),
     ),
     el('div', { class: 'wall-text-body' },
-      textInput,
-      textSendBtn,
-      el('span', { class: 'look-sep' }),
+      // the message itself comes from the quick-send box above; this row only drives the layer
       textToggle, textClearBtn, textRevealBtn,
     ),
   );
   function paintTextToggle() {
-    textToggle.setAttribute('aria-pressed', String(textEnabled));
-    textToggle.dataset.on = String(textEnabled);
+    // the server owns text visibility; adopt it whenever a document arrives, and leaving the
+    // toggle alone while the operator is mid-click keeps the optimistic flip from fighting it
+    const s = lookValue('text');
+    if (s && typeof s === 'object' && typeof s.enabled === 'boolean') textOn = s.enabled;
+    if (typeof s === 'boolean') textOn = s;
+    textToggle.setAttribute('aria-pressed', String(textOn));
+    textToggle.dataset.on = String(textOn);
   }
 
   /* --- status strip ------------------------------------------------------- */
@@ -498,6 +701,394 @@ export async function render(container, ctx) {
     }
   }
 
+
+  /* --- image -------------------------------------------------------------- */
+
+  /**
+   * The picture on the wall, as six controls: which file, where it sits, how big, how turned,
+   * how it is coloured, how deep.
+   *
+   * Every value comes from the server's settings document (`lookValue`) and every change goes
+   * back through `PATCH /api/wall/settings` with the schema's own key names, so a deck key, a
+   * preset or another client all reach these controls through the same snapshot repaint the
+   * rest of the pane already uses. Nothing here keeps local state that the document does not.
+   *
+   * The surface is a schematic of the wall, not the live preview: the picture's rectangle is
+   * positioned by `imageX`/`imageY`/`imageScale`/`imageRotate` against a box whose aspect is the
+   * picture's own, so a drag maps one-to-one onto the same numbers the engine lights.
+   */
+  const IMG_CAP = 8 * 1024 * 1024; // matches the server's MAX_BYTES; the route refuses above it
+  const IMG_ASPECTS = { '16:9': 16 / 9, '9:16': 9 / 16 };
+
+  const imgStage = el('div', {
+    class: 'wall-img-stage',
+    id: 'wall-img-stage',
+    role: 'application',
+    'aria-label': 'Picture position on the wall',
+    tabindex: '0',
+  });
+  const imgBox = el('div', { class: 'wall-img-box' }, el('div', { class: 'wall-img-thumb' }));
+  const imgHandle = el('div', {
+    class: 'wall-img-handle',
+    id: 'wall-img-handle',
+    role: 'button',
+    tabindex: '0',
+    title: 'drag: resize  ·  shift-drag: rotate',
+  });
+  // the grips hang a few pixels outside the picture so they can be grabbed; the stage keeps them
+  // in view instead of clipping them flush with the rectangle's edge
+  imgBox.append(imgHandle);
+  imgStage.append(imgBox);
+
+  const imgFile = el('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp,image/gif', class: 'wall-img-file', id: 'wall-img-file' });
+  const imgPick = el('button', { type: 'button', class: 'btn btn-sm', id: 'wall-img-pick' }, 'Choose picture');
+  const imgRemove = el('button', { type: 'button', class: 'btn btn-sm', id: 'wall-img-remove', title: 'takes the picture off the wall; the upload is kept' }, 'Remove');
+  const imgStatus = el('span', { class: 'wall-img-status mono dim', id: 'wall-img-status', text: 'no picture' });
+
+  const imgColour = el('select', { class: 'wall-field wall-img-select', id: 'wall-img-colour', 'aria-label': 'Picture colours' },
+    el('option', { value: 'raw', text: 'Image colours' }),
+    el('option', { value: 'match', text: 'Match the palette' }),
+    el('option', { value: 'palette', text: 'Palette only (luminance)' }));
+  const imgBits = el('select', { class: 'wall-field wall-img-select', id: 'wall-img-bits', 'aria-label': 'Colour depth' },
+    el('option', { value: '8', text: '8-bit' }),
+    el('option', { value: '10', text: '10-bit' }),
+    el('option', { value: '12', text: '12-bit' }));
+  const imgDither = el('input', { type: 'checkbox', id: 'wall-img-dither', class: 'wall-switch' });
+  const imgDitherRow = el('label', { class: 'wall-field-row', for: 'wall-img-dither' },
+    imgDither, el('span', { text: 'Dither' }));
+  // A slider, not only the corner handle: on a 9:16 schematic 180px wide the picture already fills
+  // the stage, so a corner drag has almost no travel left and reads as broken. The slider is the
+  // honest control for "how big", and the handle stays for the corner drag it looks like.
+  const imgScale = el('input', {
+    type: 'range', class: 'wall-img-range', id: 'wall-img-scale',
+    min: '0.05', max: '2', step: '0.01', value: '0.6', 'aria-label': 'Picture size',
+  });
+  const imgScaleOut = el('span', { class: 'mono dim', id: 'wall-img-scale-out', text: '0.60' });
+  const imgRotOut = el('span', { class: 'mono dim', id: 'wall-img-rot-out', text: '0°' });
+
+  const imgPanel = el('section', { class: 'panel wall-img', id: 'wall-image' },
+    el('div', { class: 'panel-head' },
+      el('span', { class: 'panel-title', text: 'Image' }),
+      imgStatus),
+    imgStage,
+    el('div', { class: 'wall-img-tools' }, imgPick, imgRemove, imgFile),
+    el('div', { class: 'wall-img-grid' },
+      el('label', { class: 'wall-field-row', for: 'wall-img-colour' }, el('span', { text: 'Colours' }), imgColour),
+      el('label', { class: 'wall-field-row', for: 'wall-img-bits' }, el('span', { text: 'Depth' }), imgBits),
+      imgDitherRow,
+      el('label', { class: 'wall-field-row wall-img-size', for: 'wall-img-scale' },
+        el('span', { text: 'Size' }), imgScale, imgScaleOut),
+      el('div', { class: 'wall-field-row' }, el('span', { text: 'Turn' }), imgRotOut),
+    ),
+  );
+
+  /** Read one picture value out of the live settings document, with the schema's default. */
+  function imgVal(key, fallback) {
+    const v = lookValue(key);
+    return v === undefined || v === null || v === '' ? fallback : v;
+  }
+
+  /** Where the picture sits, in the numbers the shader is given. */
+  function imageState() {
+    const aspect = IMG_ASPECTS[String(lookValue('ratio') ?? '16:9')] || IMG_ASPECTS['16:9'];
+    return {
+      on: Number(imgVal('imageOn', 0)) >= 0.5,
+      x: clamp(Number(imgVal('imageX', 0.5)), 0, 1),
+      y: clamp(Number(imgVal('imageY', 0.5)), 0, 1),
+      scale: clamp(Number(imgVal('imageScale', 0.6)), 0.05, 4),
+      rot: Number(imgVal('imageRotate', 0)) || 0,
+      colour: String(imgVal('imageColour', 'raw')),
+      bits: String(imgVal('imageBits', '8')),
+      dither: Number(imgVal('imageDither', 1)) >= 0.5,
+      cap: Number(imgVal('imageRev', 0)) > 0,
+      aspect,
+    };
+  }
+
+  /** The picture's own w/h, from the server's record of the accepted upload. */
+  function imageMeta() {
+    const doc = (renderDoc && renderDoc.settings) || ctx.settings || null;
+    return (doc && doc.image) || null;
+  }
+
+  /**
+   * Paint the controls from the settings document.
+   *
+   * Assigns `.value` / `.checked` and never dispatches `change`, so adopting a snapshot cannot
+   * echo a command back at the server — the same rule the quick-bar dropdowns follow.
+   */
+  function paintImage() {
+    const st = imageState();
+    const meta = imageMeta();
+
+    imgColour.value = st.colour;
+    imgBits.value = st.bits;
+    imgDither.checked = st.dither;
+    // The picture is quantised to `imageBits` inside the image path, before it becomes a cell
+    // colour. Which depths get steps worth filling is the engine's answer, not a guess here:
+    // 8 bit is 256 levels - finer than the uploaded picture - so dithering it only adds noise,
+    // while 10 and 12 bit band visibly and the 4x4 Bayer pattern is what recovers the in-between
+    // colours. Hence: enabled only from 10-bit up, and only once a picture is stored.
+    const ditherWorks = st.cap && st.bits !== '8';
+    imgDither.disabled = !ditherWorks;
+    imgDitherRow.title = ditherWorks
+      ? `4×4 Bayer pattern: fills the steps between the ${st.bits}-bit levels`
+      : (st.cap ? 'not needed at 8-bit — the picture already has that many levels' : 'needs a stored picture');
+    imgDitherRow.dataset.inert = String(!ditherWorks);
+
+    imgRemove.disabled = !st.on;
+    // Never dispatch `change` here: adopting a snapshot must not echo a command back.
+    imgScale.value = st.scale.toFixed(2);
+    imgScaleOut.textContent = st.scale.toFixed(2);
+    imgRotOut.textContent = `${Math.round(st.rot)}°`;
+    imgStatus.textContent = st.on
+      ? (meta ? `${meta.w || '?'}×${meta.h || '?'} · ${st.colour} · ${st.bits}-bit` : 'picture on')
+      : (st.cap ? 'picture stored, off' : 'no picture');
+
+    imgStage.dataset.ratio = String(lookValue('ratio') ?? '16:9');
+    imgStage.dataset.on = String(st.on && st.cap);
+    imgBox.classList.toggle('is-on', st.on && st.cap);
+
+    // The rectangle: `imageScale` is a fraction of the wall's width, exactly what the engine's
+    // `u_imgXf.z` means; the picture's height follows its own aspect.
+    const stageW = imgStage.clientWidth || 0;
+    const stageH = imgStage.clientHeight || 0;
+    if (!stageW || !stageH) return;
+    const w = Math.max(8, st.scale * stageW);
+    const picAspect = meta && meta.w && meta.h ? meta.h / meta.w : 1;
+    const h = Math.max(8, w * picAspect);
+    const box = imgBox.style;
+    box.width = `${w.toFixed(1)}px`;
+    box.height = `${h.toFixed(1)}px`;
+    box.left = `${(st.x * stageW - w / 2).toFixed(1)}px`;
+    box.top = `${(st.y * stageH - h / 2).toFixed(1)}px`;
+    box.transform = `rotate(${st.rot}deg)`;
+    imgBox.dataset.x = st.x.toFixed(3);
+    imgBox.dataset.y = st.y.toFixed(3);
+    imgBox.dataset.scale = st.scale.toFixed(2);
+    imgBox.dataset.rot = String(Math.round(st.rot));
+    const thumb = imgBox.firstElementChild;
+    if (thumb) {
+      thumb.style.backgroundImage = st.cap && st.on
+        ? `url("/api/wall/image?rev=${Number(imgVal('imageRev', 0))}")`
+        : '';
+    }
+  }
+
+  /* --- the surface: drag to move, drag the handle to resize, shift-drag to turn --- */
+
+  // One gesture, one patch: moves repaint the box locally for feedback and post on release, so a
+  // slow server cannot fill the bus with a hundred intermediate positions.
+  let imgGesture = null;
+
+  function imgStageRect() {
+    const r = imgStage.getBoundingClientRect();
+    return { w: r.width || 1, h: r.height || 1, left: r.left, top: r.top };
+  }
+
+  function beginImageGesture(kind, ev) {
+    const st = imageState();
+    if (!st.cap) return;
+    const box = imgStageRect();
+    imgGesture = {
+      kind,
+      box,
+      ox: ev.clientX,
+      oy: ev.clientY,
+      start: st,
+      pointerId: ev.pointerId,
+      moved: false,
+    };
+    ev.preventDefault();
+    imgStage.classList.add('is-dragging');
+    try { imgStage.setPointerCapture(ev.pointerId); } catch { /* not capturable */ }
+  }
+
+  function moveImageGesture(ev) {
+    const g = imgGesture;
+    if (!g) return;
+    const dx = (ev.clientX - g.ox) / g.box.w;
+    const dy = (ev.clientY - g.oy) / g.box.h;
+    if (Math.abs(ev.clientX - g.ox) > 2 || Math.abs(ev.clientY - g.oy) > 2) g.moved = true;
+    if (g.kind === 'move') {
+      const x = clamp(g.start.x + dx, 0, 1);
+      const y = clamp(g.start.y + dy, 0, 1);
+      imgBox.style.left = `${(x * g.box.w - imgBox.offsetWidth / 2).toFixed(1)}px`;
+      imgBox.style.top = `${(y * g.box.h - imgBox.offsetHeight / 2).toFixed(1)}px`;
+    } else if (g.kind === 'rotate') {
+      const cx = g.box.left + g.start.x * g.box.w;
+      const cy = g.box.top + g.start.y * g.box.h;
+      const a0 = Math.atan2(g.oy - cy, g.ox - cx);
+      const a1 = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+      const deg = wrapDeg(g.start.rot + ((a1 - a0) * 180) / Math.PI);
+      imgBox.style.transform = `rotate(${deg.toFixed(1)}deg)`;
+    } else {
+      // The picture's scale is its width as a fraction of the stage, and the handle IS the far
+      // corner: its distance from the centre is half the width, so doubling that distance doubles
+      // the picture. Measuring from the centre is symmetric — either corner grows it.
+      const halfW = Math.max(4, g.start.scale * g.box.w) / 2;
+      const cx = g.box.left + g.start.x * g.box.w;
+      const cy = g.box.top + g.start.y * g.box.h;
+      const reach = Math.hypot(ev.clientX - cx, ev.clientY - cy);
+      const a0 = Math.hypot(g.ox - cx, g.oy - cy) || halfW;
+      const next = clamp((reach / a0) * g.start.scale, 0.05, 4);
+      const w = Math.max(8, next * g.box.w);
+      const aspect = imgBox.offsetWidth ? imgBox.offsetHeight / imgBox.offsetWidth : 1;
+      imgBox.style.width = `${w.toFixed(1)}px`;
+      imgBox.style.height = `${Math.max(8, w * aspect).toFixed(1)}px`;
+    }
+    ev.preventDefault();
+  }
+
+  async function endImageGesture(ev) {
+    const g = imgGesture;
+    if (!g) return;
+    imgGesture = null;
+    imgStage.classList.remove('is-dragging');
+    try { imgStage.releasePointerCapture(g.pointerId); } catch { /* already released */ }
+    if (!g.moved) return; // a click on the surface is not a move
+    const patch = {};
+    if (g.kind === 'move') {
+      const dx = (ev.clientX - g.ox) / g.box.w;
+      const dy = (ev.clientY - g.oy) / g.box.h;
+      patch.imageX = round3(clamp(g.start.x + dx, 0, 1));
+      patch.imageY = round3(clamp(g.start.y + dy, 0, 1));
+    } else if (g.kind === 'rotate') {
+      const m = /rotate\((-?[\d.]+)deg\)/.exec(imgBox.style.transform || '');
+      patch.imageRotate = Math.round(clamp(Number(m && m[1]) || 0, -180, 180));
+    } else {
+      patch.imageScale = Math.round(clamp(imgBox.offsetWidth / g.box.w, 0.05, 4) * 100) / 100;
+    }
+    const out = await patchSettings(patch);
+    // Always repaint from the document after a gesture: a refused patch must not leave the box
+    // where the pointer left it, and an accepted one must show the rounded values it now holds.
+    paintImage();
+    return out;
+  }
+
+  // The gesture follows the pointer on the window, not on the stage: dragging off the edge of a
+  // 160px schematic is normal, and a capture that is refused (or lost) must not freeze the
+  // rectangle half-way. Press and move stay on the stage, which is what maps to the wall.
+  imgStage.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== undefined && ev.button !== 0) return;
+    if (!imageState().cap) return;
+    const onHandle = ev.target === imgHandle || (ev.target.closest && ev.target.closest('.wall-img-handle'));
+    beginImageGesture(onHandle ? (ev.shiftKey ? 'rotate' : 'size') : 'move', ev);
+  });
+  imgStage.addEventListener('pointermove', (ev) => {
+    if (imgGesture) moveImageGesture(ev);
+  });
+  window.addEventListener('pointermove', (ev) => {
+    if (imgGesture) moveImageGesture(ev);
+  });
+  window.addEventListener('pointerup', (ev) => { void endImageGesture(ev); });
+  window.addEventListener('pointercancel', (ev) => { void endImageGesture(ev); });
+  // keys, for an operator driving the pane without a pointer
+  imgHandle.addEventListener('keydown', (ev) => {
+    const st = imageState();
+    if (!st.cap) return;
+    let patch = null;
+    if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight') {
+      patch = { imageScale: Math.round(clamp(st.scale + (ev.key === 'ArrowRight' ? 0.05 : -0.05), 0.05, 4) * 100) / 100 };
+    } else if (ev.key === 'ArrowUp' || ev.key === 'ArrowDown' || ev.key === '[' || ev.key === ']') {
+      const step = ev.key === 'ArrowUp' || ev.key === ']' ? 5 : -5;
+      patch = { imageRotate: Math.round(clamp(st.rot + step, -180, 180)) };
+    }
+    if (patch) {
+      ev.preventDefault();
+      void patchSettings(patch, { optimistic: () => paintImage() });
+    }
+  });
+
+  /* --- the six controls --------------------------------------------------- */
+
+  imgPick.addEventListener('click', () => imgFile.click());
+  imgFile.addEventListener('change', () => {
+    const f = imgFile.files && imgFile.files[0];
+    imgFile.value = '';
+    if (f) void sendImageFile(f);
+  });
+  imgStage.addEventListener('dragover', (ev) => {
+    ev.preventDefault();
+    imgStage.classList.add('is-over');
+  });
+  imgStage.addEventListener('dragleave', () => imgStage.classList.remove('is-over'));
+  imgStage.addEventListener('drop', (ev) => {
+    ev.preventDefault();
+    imgStage.classList.remove('is-over');
+    const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+    if (f) void sendImageFile(f);
+  });
+
+  imgColour.addEventListener('change', () => {
+    void patchSettings({ imageColour: imgColour.value }, { optimistic: () => paintImage() });
+  });
+  imgBits.addEventListener('change', () => {
+    // changing depth can make the dither meaningful or inert; the paint below follows the answer
+    void patchSettings({ imageBits: imgBits.value }, { optimistic: () => paintImage() });
+  });
+  // `input` only moves the number beside the slider (the wall would get a patch per pixel of
+  // travel otherwise); `change` — pointer released, or a key press on a focused slider — is the
+  // one patch, exactly like the stage's own drag.
+  imgScale.addEventListener('input', () => { imgScaleOut.textContent = Number(imgScale.value).toFixed(2); });
+  imgScale.addEventListener('change', () => {
+    const v = Math.round(clamp(Number(imgScale.value) || 0.6, 0.05, 4) * 100) / 100;
+    void patchSettings({ imageScale: v }, { optimistic: () => paintImage() });
+  });
+  imgDither.addEventListener('change', () => {
+    void patchSettings({ imageDither: imgDither.checked ? 1 : 0 }, { optimistic: () => paintImage() });
+  });
+  imgRemove.addEventListener('click', () => {
+    // off, not gone: the upload stays on disk so the same picture can be brought back
+    void patchSettings({ imageOn: 0 }, { optimistic: () => paintImage() });
+  });
+
+  /**
+   * Upload one file through the server's raw route, then adopt the revision it answers.
+   *
+   * `POST /api/wall/image` reads the bytes raw (core hands the Buffer through untouched), stores
+   * the picture and answers with the record plus the event that switched the layer on.
+   */
+  async function sendImageFile(file) {
+    if (!/^image\//.test(file.type || '')) {
+      toast(`picture: ${file.name || 'that file'} is not an image`, 'error');
+      return;
+    }
+    if (file.size > IMG_CAP) {
+      toast(`picture is ${(file.size / 1048576).toFixed(1)} MB — the limit is 8 MB`, 'error');
+      return;
+    }
+    imgStatus.textContent = 'uploading…';
+    try {
+      const r = await fetch('/api/wall/image', {
+        method: 'POST',
+        headers: { 'content-type': file.type || 'application/octet-stream' },
+        body: file,
+      });
+      const out = await r.json().catch(() => null);
+      if (!r.ok || !out || !out.ok) throw new Error((out && out.error) || `upload failed (${r.status})`);
+      await pull();
+      paintImage();
+      toast(`picture up · ${out.image.w}×${out.image.h}`, 'ok');
+    } catch (err) {
+      paintImage();
+      toast(`picture: ${err.message}`, 'error');
+    }
+  }
+
+  /** Degrees folded into −180..180, so a full turn reads as 0 rather than 360. */
+  function wrapDeg(d) {
+    let v = d % 360;
+    if (v > 180) v -= 360;
+    if (v < -180) v += 360;
+    return Math.round(v * 10) / 10;
+  }
+
+  /** Three decimals: enough to place a picture, short enough to read in the document. */
+  function round3(n) {
+    return Math.round(n * 1000) / 1000;
+  }
+
   /* --- settings slot ------------------------------------------------------ */
 
   const settingsSlot = el('div', { class: 'pane-settings wall-settings' });
@@ -505,6 +1096,7 @@ export async function render(container, ctx) {
   const body = el('div', { class: 'wall-body' },
     el('div', { class: 'wall-main' },
       previewPanel,
+      imgPanel,
       textPanel,
       el('div', { class: 'wall-split' }, fencePanel),
       settingsSlot,
@@ -519,14 +1111,53 @@ export async function render(container, ctx) {
   );
 
   clear(container);
-  container.append(header, quick, body);
+  const quickSlot = el('div', { class: 'qs-slot' });
+  const quickBox = mountQuickSend(quickSlot, {
+    title: 'Quick send',
+    api,
+    poolId: 'wall',
+    kinds: ['wall'],
+    placeholder: 'Message to the wall — text, or pick from the pool…',
+    onSend: (p) => api.post('/api/wall/cmd', {
+      cmd: 'text.send',
+      args: p.text ? { text: p.text, ...(p.title ? { title: p.title } : {}) } : { poolId: p.poolId },
+    }),
+    onSchedule: (p) => api.post('/api/schedules', {
+      module: 'wall',
+      at: p.at,
+      payload: p.text ? { text: p.text } : { poolId: p.poolId },
+    }),
+    onSave: (p) => api.post('/api/pool/wall/messages', { text: p.text, title: p.title || undefined, kind: 'wall' }),
+    signal,
+  });
+
+  const schedSlot = el('div', { class: 'sch-slot' });
+  mountSchedulePanel(schedSlot, { module: 'wall', api, title: 'Scheduled wall text', signal });
+
+  // The pane is appended whole, then its preview goes up before this module returns: the merged
+  // column draws a `.pv-window` of its own from page load, so a caller that grabs the preview
+  // right after mount can otherwise catch this module before it has put its own in the document.
+  container.append(header, quickSlot, schedSlot, quick, body);
 
   /* ---------------------------------------------------------------- state */
 
   let settingsMeta = {}; // key -> describe meta
   let blackout = false;
   let look = {};
-  let ratioSelection = '16:9';
+  // The command answer is the truth for the two split dimensions: `look.palette` and
+  // `look.pattern` are page commands, so the settings document never learns their outcome (it
+  // has no `palette`/`look` key) and a snapshot only lands when the page reports back. Without
+  // this the Palette dropdown snapped back to the old name after every pick.
+  let synth = { palette: null, pattern: null, preset: null };
+  // The preset bank last read from the server (`render.settings.presets`), kept for the
+  // dropdown's fill after a save so the two cannot disagree about what the wall offers.
+  let presetBank = { order: [], saved: {} };
+  let presetBankKey = ''; // what the filled dropdown currently shows, so a snapshot cannot refill it
+  let lookRefreshTimer = null;
+  timers.push(() => clearTimeout(lookRefreshTimer));
+  // until the first live frame arrives there is no wall to describe: leave it empty so the mode
+  // segments are neither checked nor a guess, and the preview keeps its windowed default
+  let ratioSelection = null;
   let ratioState = { lastScene: null, forcing: false, forced: [] };
 
   function metaValue(key) {
@@ -542,7 +1173,7 @@ export async function render(container, ctx) {
     // While the pointer is down the pane owns the rect: a /live poll or a `state.snapshot` frame
     // carries the server's pre-drag document, and adopting it here is what dragged the window
     // back mid-gesture. The commit on release sends the rect the operator actually produced.
-    if (drag) return;
+    if (preview && preview.isDragging && preview.isDragging()) return;
     if (!f) {
       fencePx = null;
       fenceCells = null;
@@ -568,8 +1199,13 @@ export async function render(container, ctx) {
       renderDoc = data.render;
       const s = data.render;
       look = s.look || {};
-      if (!drag) applyFenceDoc(s.fence);
-      ratioSelection = s.ratio === '9:16' ? '9:16' : '16:9';
+      // The bank rides on the render document: a preset saved anywhere shows up on the next
+      // pull. (`renderSettings()` carries `presets`; `/render` also does, through the same call.)
+      if (s.presets) adoptPresets(s.presets);
+      if (!(preview && preview.isDragging && preview.isDragging())) applyFenceDoc(s.fence);
+      // an absent ratio means the server has no opinion yet (fresh state, windowed default);
+      // only an explicit '16:9' should put the pane into whole-wall mode
+      if (s.ratio === '9:16' || s.ratio === '16:9') ratioSelection = s.ratio;
     }
     paintAll();
   }
@@ -583,20 +1219,144 @@ export async function render(container, ctx) {
     paintStrip();
     paintStream();
     paintTextToggle();
+    paintImage();
   }
 
+  /**
+   * The three dropdowns, painted from the live look. Values are only assigned, never dispatched:
+   * `.value = x` fires no `change`, so a paint can never send the command it is describing —
+   * which is what would make a deck press echo back as a second, competing command.
+   */
   function paintQuick() {
-    const pattern = lookValue('pattern');
-    patternName.textContent = pattern ? String(pattern) : '—';
-    const preset = lookValue('preset');
-    presetName.textContent = preset ? String(preset) : '—';
+    const pattern = synth.pattern || cleanLookName(lookValue('pattern'));
+    const palette = liveLook('palette');
+    const preset = presetBankName();
+
+    // keep the list in step with the bank when a paint happens to be the first to see it; the
+    // usual path is `adoptPresets`, which refills only when the bank actually changed
+    if (presetSelect.dataset.count !== String(presetBank.order.length)) {
+      fillPresets(presetBank.order, presetBank.saved);
+    }
+    if (!paletteSelect.querySelector(`option[value="${cssEscape(palette)}"]`)) fillPalettes(palette);
+    if (!patternSelect.querySelector(`option[value="${cssEscape(pattern)}"]`)) fillPatterns(pattern);
+
+    presetSelect.value = preset || '';
+    paletteSelect.value = palette || '';
+    patternSelect.value = pattern || '';
+    // the running name on the control itself: a select shows its text, but a test (and a person
+    // reading the markup) needs the name without asking which option is selected
+    presetSelect.dataset.live = preset || '';
+    paletteSelect.dataset.live = palette || '';
+    patternSelect.dataset.live = pattern || '';
+
     blackout = Number(lookValue('blackout') || 0) > 0;
     blackoutBadge.textContent = blackout ? 'black' : 'live';
     blackoutBadge.dataset.tone = blackout ? 'bad' : 'ok';
     blackoutBtn.dataset.on = String(blackout);
     blackoutLabel.textContent = blackout ? 'Blackout ON' : 'Blackout';
     blackoutBtn.setAttribute('aria-pressed', String(blackout));
+    // Publish what this pane just learned to the shared store: `blackout`/`contrast`/… are the
+    // settings document's, and the palette is the page answer this pane keeps in `synth`. The store
+    // is what the merged column and any other view of the wall read.
+    if (shared) {
+      // `undefined` means "say nothing about this key": the store keeps what it had, so a pane
+      // that only knows the document's half cannot overwrite a palette the column learned
+      shared.set({
+        palette: cleanLookName(synth.palette) || cleanLookName(look.palette) || undefined,
+        pattern: cleanLookName(synth.pattern) || cleanLookName(lookValue('pattern')) || undefined,
+        preset: cleanLookName(synth.preset) || cleanLookName(lookValue('preset')) || undefined,
+        brightness: Number(lookValue('brightness') ?? 1),
+        saturation: Number(lookValue('saturation') ?? 1),
+        speed: Number(lookValue('speed') ?? 1),
+        blackout: Number(lookValue('blackout') ?? 0) > 0,
+      });
+    }
     paintPreviewLook();
+  }
+
+  /* Look names as the four sources spell them:
+   *   · the settings document (`pattern`, `preset`)  — what the wall is told to run
+   *   · a command answer (`look.palette` / `look.pattern` / `preset.set`) — what the page applied
+   *   · a state snapshot (`echo.look`) — what the page reports after acting
+   * The last answer wins, because it is the latest word on a dimension the document cannot hold. */
+  function cleanLookName(v) {
+    return typeof v === 'string' && v && v !== 'default' ? v : '';
+  }
+  function liveLook(key) {
+    if (key === 'pattern') {
+      return cleanLookName(synth.pattern) || cleanLookName(lookValue('pattern')) || '';
+    }
+    if (key === 'palette') {
+      // A palette ABSENT from the document is not "unknown": the engine's default ramp is not a
+      // schema key, so the pane offers `neonwave` (engine/config.js DEFAULT_PALETTE) as the name
+      // of the ramp the wall is running until a page reports something else.
+      return cleanLookName(synth.palette) || cleanLookName(look.palette) || DEFAULT_PALETTE;
+    }
+    return cleanLookName(synth.preset) || cleanLookName(lookValue('preset')) || DEFAULT_PRESET;
+  }
+  // A preset name the bank does not list still belongs in the dropdown (a preset saved on
+  // another rig, or a shipped default): appended rather than left as "— preset —".
+  function presetBankName() {
+    const name = liveLook('preset');
+    const known = name && presetSelect.querySelector(`option[value="${cssEscape(name)}"]`);
+    if (name && !known && presetBank.order.length) {
+      presetBank = { ...presetBank, order: [...presetBank.order, name] };
+      presetBankKey = presetBank.order.join('\u0000') + '\u0001' + Object.keys(presetBank.saved || {}).join('\u0000');
+      fillPresets(presetBank.order, presetBank.saved);
+    }
+    return name;
+  }
+  function cssEscape(v) {
+    return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(String(v)) : String(v);
+  }
+
+  /**
+   * An answer to `look.palette` / `look.pattern`. A refusal puts the dropdown back to what the
+   * wall is running; a delivery is adopted as the live name; and the page is read a beat later,
+   * because a page that refuses the name for its own reason (a live text it will not drop) only
+   * says so on its next report.
+   */
+  function onLookCmdAnswer(out, key, want) {
+    if (!out || out.ok === false) {
+      // nothing was sent to change, so there is nothing to undo; read the wall and paint it
+      scheduleRefreshLook(0);
+      return;
+    }
+    // the answer names each dimension the page now runs, so every dropdown follows, not just
+    // the one that was picked (a deck press of `look.palette.next` lands here too)
+    if (cleanLookName(out.palette)) setLookField('palette', out.palette);
+    if (cleanLookName(out.pattern)) setLookField('pattern', out.pattern);
+    if (!cleanLookName(out[key])) setLookField(key, want);
+    paintQuick();
+    scheduleRefreshLook();
+    scheduleLookPull();
+  }
+  function scheduleRefreshLook(delay = 350) {
+    clearTimeout(lookRefreshTimer);
+    lookRefreshTimer = setTimeout(() => { void refreshLook(); }, delay);
+  }
+
+  /** Read the render document back and adopt its look; `/render` is the page's own truth. */
+  async function refreshLook() {
+    try {
+      const r = await api.get('/api/wall/render', { signal });
+      if (!r || !r.settings) return;
+      renderDoc = r.settings;
+      look = { ...look, ...(r.settings.look || {}) };
+      if (r.settings.presets) adoptPresets(r.settings.presets);
+      paintQuick();
+      paintPreview();
+      paintImage();
+    } catch {
+      /* the answer already painted the change; a failed read is not a failed command */
+    }
+  }
+
+  /** An optimistic single-dimension change: the server's word lands a moment later. */
+  function setLookField(key, value) {
+    if (key === 'pattern') synth = { ...synth, pattern: cleanLookName(value) };
+    else if (key === 'palette') synth = { ...synth, palette: cleanLookName(value) };
+    else if (key === 'preset') synth = { ...synth, preset: cleanLookName(value) };
   }
 
   function paintRatio() {
@@ -619,6 +1379,8 @@ export async function render(container, ctx) {
     header.dataset.forcing = String(forcing);
     ratioWrap.dataset.forcing = String(forcing);
     ratioWrap.dataset.ratio = ratioSelection;
+    // the preview follows the mode: the window (and its dim ring) only exists on a 9:16 wall
+    paintPreview();
   }
 
   // The stream chip is the pane's one "is anything arriving" signal: the SSE connection is
@@ -670,95 +1432,126 @@ export async function render(container, ctx) {
 
   let previewScale = 1;
 
-  function applyDimLocal(v) {
-    if (!surface) return;
-    surface.style.setProperty('--out-dim', String(clamp(v, 0, 1)));
-    // The dim ring is drawn by `.fence::before` (a 9999px border), so it lives on the window.
-    windowEl.style.setProperty('--out-dim', String(clamp(v, 0, 1)));
+  /**
+   * The wall pane's bridge to the shared preview component (public/src/preview.js).
+   *
+   * The component owns the geometry: a 16:9 frame with the 9:16 window inside it, sized from the
+   * frame's width. This bridge owns the wall's meaning: which fence is committed, which cells it
+   * covers, and the commands a drag produces. Fence positions are pushed to the component as
+   * fractions of the frame's WIDTH (x) and of the wall's own height (y), and the window's height
+   * comes from its width through 9:16 — the component refuses to derive it from anything else.
+   */
+  function mountWallPreview() {
+    if (preview) return preview;
+    preview = mountPreview(previewHost, {
+      title: 'Wall preview',
+      hint: `${WALL_W} × ${WALL_H} · drag the window · corner grip · arrows nudge`,
+      interactive: true,
+      dim: Number(lookValue('fenceOutDim') ?? 0.18),
+      look: previewLook(),
+      // set by wirePreviewDrag(); guarded so a resize during boot cannot throw
+      onFence: (f) => {
+        preview?.onFenceChange?.(f);
+      },
+    });
+    preview.setLayer(null);
+    preview.host = previewHost;
+    // the pane's fence is only meaningful on the 9:16 wall; a drag on a whole wall is ignored
+    // there instead of silently creating a window the engine will not honour
+    preview.onFenceChange = (f) => {
+      if (ratioSelection !== '9:16') return;
+      const raw = fenceToRect({ ...f, y: fencePx?.y ?? f.y });
+      fencePx = snapToCells(raw);
+      fenceCells = cellsFor(fencePx);
+      paintPreview();
+      paintFenceFieldsLive();
+      commitFence(fencePx);
+    };
+    // a live push on every pointer move (the component calls this only while dragging), so the
+    // open pages follow the window without waiting for the release to commit
+    preview.onFenceMove = (f) => {
+      if (ratioSelection !== '9:16') return;
+      fencePx = snapToCells(fenceToRect({ ...f, y: fencePx?.y ?? f.y }));
+      fenceCells = cellsFor(fencePx);
+      paintPreview();
+      paintFenceFieldsLive();
+      pushFenceLive();
+    };
+    return preview;
+  }
+
+  function previewLook() {
+    // The ramp the wall is running: the shared store's name when it knows one, else the pane's own
+    // page answer, else the engine default. A store fed from the document (which has no palette
+    // key) reports `neonwave`; a store fed by the column's `loadLook` reports the live name.
+    const palette = (shared && shared.get().palette) || DEFAULT_PALETTE;
+    return {
+      palette: PALETTES[palette] || PALETTES.neonwave,
+      brightness: clamp(Number(lookValue('brightness') ?? 1), 0, 2),
+      saturation: clamp(Number(lookValue('saturation') ?? 1), 0, 2),
+      speed: Number(lookValue('speed') ?? 1),
+      pattern: String(lookValue('pattern') || 'wave'),
+      blackout,
+    };
+  }
+
+  // pixel rect (wall px, 2560×1440 picture) → the component's fence fractions
+  function rectToFence(r) {
+    // The rect is in WALL space: 2560 wide, and 2560·16/9 = 4551 tall (OUTER_H) for the 9:16
+    // window, of which only the top WALL_H = 1440 is the lit 16:9 picture. `y` is consumed by the
+    // component as a fraction of the PICTURE's height, so it divides by WALL_H; a rect whose top
+    // sits below the picture cannot be expressed by the fence at all, and is pinned to 0 rather
+    // than sliding the window out of the frame.
+    const y = r.y <= 0 ? 0 : Math.min(r.y / WALL_H, 1);
+    return { x: r.x / WALL_W, w: r.w / WALL_W, y };
+  }
+
+  // the component's fence fractions → a pixel rect, keeping 9:16 through the cell grid
+  function fenceToRect(f) {
+    const w = clamp(f.w * WALL_W, 0, WALL_W);
+    const h = clamp((w * 16) / 9, 0, OUTER_H);
+    const x = clamp(f.x * WALL_W, 0, WALL_W - w);
+    const y = f.y != null ? clamp(((f.y * WALL_H) - (h - WALL_H) / 2), 0, WALL_H - Math.min(h, WALL_H)) : fencePx?.y ?? 0;
+    return { x, y, w, h };
   }
 
   function paintPreviewLook() {
-    // `palette` is not a schema key (the engine reads `paletteWeight`); the preview still paints
-    // a default palette, but a look key here would read a value the server never stores.
-    const palette = 'neonwave';
-    const stops = PALETTES[palette] || PALETTES.neonwave;
-    const sat = Number(lookValue('saturation') ?? 1);
-    const bright = clamp(Number(lookValue('brightness') ?? 1), 0, 2);
-    const speed = Number(lookValue('speed') ?? 1);
-    const p = String(lookValue('pattern') || 'wave');
-    surface.dataset.pattern = p;
-    surface.dataset.palette = palette;
-    surface.style.setProperty('--w-a', stops[0]);
-    surface.style.setProperty('--w-b', stops[1]);
-    surface.style.setProperty('--w-c', stops[2]);
-    surface.style.setProperty('--w-hue', '0deg');
-    surface.style.setProperty('--w-sat', String(clamp(sat, 0, 2)));
-    surface.style.setProperty('--w-bright', String(bright));
-    surface.style.setProperty('--w-dur', `${clamp(18 / Math.max(0.15, speed), 4, 120)}s`);
-    surface.dataset.blackout = String(blackout);
-    // a different pattern index gives the still a different character (bars vs wave vs dots)
-    surface.dataset.shape = String(['wave', 'bars', 'dots', 'sweep', 'plasma'].indexOf(p) >= 0
-      ? p
-      : ['wave', 'bars', 'dots', 'sweep', 'plasma'][hash(p) % 5]);
-    dotsLayer.style.opacity = String(clamp(0.25 + bright * 0.5, 0.15, 1));
-    // the window's copy shares the palette and grade, and reads the surface's lattices
-    holeEl.style.setProperty('--w-hue', '0deg');
-    holeEl.style.setProperty('--w-sat', String(clamp(sat, 0, 2)));
-    holeEl.style.setProperty('--w-bright', String(bright));
-    holeEl.style.opacity = dotsLayer.style.opacity;
-    holeEl.removeAttribute('data-shape');
-    // keep the lattice near its true cell size when the wall is drawn small
-    const drawnW = surface.getBoundingClientRect().width || 0;
-    if (drawnW > 0) surface.style.setProperty('--w-dot', `${clamp((drawnW / 112) * 1.6, 3, 7).toFixed(1)}px`);
-  }
-
-  function hash(s) {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-    return Math.abs(h);
+    // `palette` is not a schema key (the engine reads `paletteWeight`); the component paints the
+    // default palette the engine uses, so the preview and the stream agree on the look.
+    mountWallPreview().setLook(previewLook());
+    // the layer keeps the wall's own lattice: dots read as cells at the drawn scale
+    const drawnW = previewHost.getBoundingClientRect().width || 0;
+    if (drawnW > 0) layerEl.style.setProperty('--w-dot', `${clamp((drawnW / 112) * 1.6, 3, 7).toFixed(1)}px`);
   }
 
   function paintPreview() {
-    // The drag plane is the wall's outer bounds at ONE scale on both axes: 2560 wall px across
-    // the picture's width, so the 9:16 plane is (16/9)·width tall and a wall px is
-    // width/2560 screen px on either axis. The window's top/height are percentages of that
-    // plane, which is what the pointer→wall mapping in beginDrag assumes.
-    const width = surface.getBoundingClientRect().width || 0;
-    if (width > 0) {
-      const need = (width * 16) / 9;
-      surface.style.setProperty('--wall-surface-h', `${Math.round(need)}px`);
+    const pv = mountWallPreview();
+    // the mode is decided from the wall's RATIO, not from whether a rect happens to be cached:
+    // a 9:16 wall with no rect yet still shows a window (the server supplies the rect on the next
+    // frame), and a 16:9 wall shows the whole picture even if a rect is remembered for later
+    // `null` = no live frame yet: the pane booted and this paint is the first, so keep the
+    // windowed default rather than guessing 'whole wall' and flashing the full picture
+    const shown = ratioSelection === null ? true : ratioSelection === '9:16';
+    pv.setFenceVisible(shown);
+    // the component republishes the frame's own size so a pane-scale fallback is never needed
+    if (pv.frame) frameEl = pv.frame;
+    if (shown && !pv.fenceReady) {
+      // no rect to place yet: the component draws its default window rather than nothing
+      pv.setLook(previewLook());
+      previewPanel.dataset.fence = 'on';
+      surfaceTag.textContent = '9:16 window';
+      return;
     }
-    const frameRect = frameEl.getBoundingClientRect();
-    const surfRect = surface.getBoundingClientRect();
-    previewScale = frameRect.width > 0 ? frameRect.width / WALL_W : 1;
-    const shown = fencePx && ratioSelection === '9:16';
-    surface.dataset.fence = shown ? 'on' : 'off';
-    previewMode.textContent = shown ? '9:16 window' : 'whole wall';
-    previewMode.dataset.mode = shown ? 'window' : 'whole';
-    surface.dataset.blackout = String(blackout);
+    pv.setLook(previewLook());
+    previewPanel.dataset.fence = shown ? 'on' : 'off';
     surfaceTag.textContent = shown ? '9:16 window' : 'whole wall · 16:9';
-    if (shown) {
+    if (shown && fencePx) {
       const r = fencePx;
-      // x/w are fractions of the wall's width; y/h are fractions of the plane's height, which
-      // is the wall's 9:16 outer height at the same scale (planeH = width · 16/9).
-      const plane = surface.getBoundingClientRect();
-      const planeH = plane.height || OUTER_H;
-      const scale = (plane.width || WALL_W) / WALL_W;
-      windowEl.style.left = `${(r.x / WALL_W) * 100}%`;
-      windowEl.style.top = `${((r.y * scale) / planeH) * 100}%`;
-      windowEl.style.width = `${(r.w / WALL_W) * 100}%`;
-      windowEl.style.height = `${((r.h * scale) / planeH) * 100}%`;
+      pv.setFence(rectToFence(r));
       const c = fenceCells || cellsFor(r);
-      // The cell rect is on the element as well as in the readout: a test (and the operator's
-      // own eye) can read the number the pane drew, not the one it began from.
-      windowEl.dataset.fenceCells = `${c.x},${c.y},${c.w},${c.h}`;
-      windowEl.dataset.fencePx = `${r.x},${r.y},${r.w},${r.h}`;
-      fenceName.textContent = `${c.w}×${c.h} cells`;
       cellsOut.lastChild.textContent = `${c.x}, ${c.y} · ${c.w}×${c.h}`;
       pxOut.lastChild.textContent = `${fmtPx(r.x)}, ${fmtPx(r.y)} · ${fmtPx(r.w)}×${fmtPx(r.h)}`;
     } else {
-      delete windowEl.dataset.fenceCells;
-      delete windowEl.dataset.fencePx;
       cellsOut.lastChild.textContent = '—';
       pxOut.lastChild.textContent = ratioSelection === '16:9' ? 'wall is whole' : 'no window';
     }
@@ -773,15 +1566,21 @@ export async function render(container, ctx) {
     for (let i = 0; i <= 8; i++) {
       axis.appendChild(el('span', { class: 'wall-axis-tick mono dim', style: { left: `${(i * stepX / WALL_W) * 100}%` }, text: String(Math.round(i * stepX)) }));
     }
-    if (shown) {
+    if (shown && fencePx) {
       const r = fencePx;
-      const dotL = el('span', { class: 'wall-axis-window', style: { left: `${(r.x / WALL_W) * 100}%`, width: `${(r.w / WALL_W) * 100}%` } });
-      axis.appendChild(dotL);
-      const span = el('span', { class: 'wall-gutter-window', style: { top: `${(r.y / WALL_H) * 100}%`, height: `${(r.h / WALL_H) * 100}%` } });
-      gutter.appendChild(span);
+      axis.appendChild(el('span', { class: 'wall-axis-window', style: { left: `${(r.x / WALL_W) * 100}%`, width: `${(r.w / WALL_W) * 100}%` } }));
+      gutter.appendChild(el('span', { class: 'wall-gutter-window', style: { top: `${(r.y / WALL_H) * 100}%`, height: `${(Math.min(r.h, WALL_H) / WALL_H) * 100}%` } }));
     }
     applyDimLocal(Number(lookValue('fenceOutDim') ?? 0.18));
   }
+
+  function applyDimLocal(v) {
+    if (!preview) return;
+    // the component's own ring dims the picture outside the window; the pane keeps the operator's
+    // saved fenceOutDim as the starting value and lets the slider override it for this session
+    if (!preview.userDimTouched) preview.setDim(clamp(v, 0, 1));
+  }
+
 
   function paintFenceFields() {
     // "on" is the window being the live mode: a 9:16 wall with a rect. A rect kept for later
@@ -849,131 +1648,16 @@ export async function render(container, ctx) {
 
   /* ---------------------------------------------------------------- drag */
 
-  let drag = null;
-  // The rect the pointer last produced. Nothing else writes it: a canvas refresh (a /live poll
-  // or a `state.snapshot` frame) rewrites `fencePx` from the server's old document, and
-  // committing that on release is what made a real drag land back where it started.
-  let dragRect = null;
-
-  function beginDrag(e, mode) {
-    if (!fencePx || ratioSelection !== '9:16' || e.button > 0) return;
-    // The start rect is the operator's own commit, taken as-is: a move slides it, a resize
-    // grows or shrinks it. Nothing here re-derives its size (a cell snap of a 2560-tall window
-    // clamps to the 1440-px picture and halves its width, which made the first pixel of a drag
-    // shrink a full 9:16 window to 800×1440).
-    const start = { ...fencePx };
-    // Pointer → wall in the plane's coordinate system, the one paintPreview places the window
-    // in: x/w are fractions of the plane's width, y/h of its height, and the plane is
-    // width·16/9 tall — so width/2560 is the screen-px-to-wall-px scale on both axes.
-    const planeRect = surface.getBoundingClientRect();
-    if (!planeRect.width) return;
-    drag = {
-      mode,
-      startX: e.clientX,
-      startY: e.clientY,
-      start,
-      sx: WALL_W / planeRect.width,
-      sy: WALL_W / planeRect.width,
-    };
-    dragRect = { ...start };
-    fencePx = { ...start };
-    surface.setPointerCapture?.(e.pointerId);
-    surface.dataset.drag = mode;
-    surface.focus({ preventScroll: true });
-    e.preventDefault();
-    e.stopPropagation();
-  }
-
-  // The surface handler below deliberately ignores presses inside `.fence` (it is the "move the
-  // window here" gesture); the window's own body starts a drag. The event must not reach the
-  // surface afterwards, or it would re-centre the window on the press point.
-  windowEl.addEventListener('pointerdown', (e) => {
-    beginDrag(e, e.target === gripEl || gripEl.contains(e.target) ? 'resize' : 'move');
-    if (!drag) return;
-    e.stopPropagation();
-    // The move/resize listeners live on `surface`, but a pointer captured on the window element
-    // retargets every later pointermove/up to it — which is the bug a real drag hit: the press
-    // landed, nothing moved, and release never committed. Capture on the surface instead.
-    surface.setPointerCapture?.(e.pointerId);
-    window.addEventListener('pointerup', endDrag);
-    window.addEventListener('mouseup', endDrag);
-    window.addEventListener('pointercancel', endDrag);
-  });
-
-  // pressing the dimmed wall outside the window moves the window's centre there
-  surface.addEventListener('pointerdown', (e) => {
-    if (!fencePx || ratioSelection !== '9:16' || e.button > 0 || e.target.closest('.fence') || drag) return;
-    const rect = frameEl.getBoundingClientRect();
-    if (!rect.width) return;
-    const px = ((e.clientX - rect.left) / rect.width) * WALL_W;
-    const py = ((e.clientY - rect.top) / rect.height) * WALL_H;
-    fencePx = snapToCells({ ...fencePx, x: px - fencePx.w / 2, y: py - fencePx.h / 2 });
-    fenceCells = cellsFor(fencePx);
-    paintPreview();
-    paintFenceFieldsLive();
-    commitFence(fencePx);
-    e.preventDefault();
-  });
-
-  // A drag is captured on the surface, but browsers deliver plain mouse input as compatibility
-  // mouse events; listen for both so a real mouse and a synthetic pointer stream both move it.
-  function onDragMove(e) {
-    if (window.__dbg && Math.random() < 0.5) window.__dbg('dragmove', { dragging: Boolean(drag), target: e.target && e.target.className, type: e.type });
-    if (!drag) return;
-    const dx = (e.clientX - drag.startX) * drag.sx;
-    const dy = (e.clientY - drag.startY) * drag.sy;
-    const g = gridInfo();
-    if (drag.mode === 'move') {
-      // A move slides the rect and keeps its size. Never re-derive the size from the pointer:
-      // a 2560-tall window re-snapped from y clamps to the 1440-px picture and loses its width.
-      dragRect = {
-        ...drag.start,
-        x: clamp(round(drag.start.x + dx, g.px), 0, Math.max(0, WALL_W - drag.start.w)),
-        y: clamp(round(drag.start.y + dy, g.py), 0, Math.max(0, WALL_H - drag.start.h)),
-      };
-    } else {
-      // The grip drags BOTH edges: dx and dy are two readings of the same corner, so the
-      // larger one drives growth (dragging up grows the window). Height then sets the width
-      // through the cell grid, which is what keeps the window at 9:16.
-      const grow = Math.max(-dx, -dy);
-      const h = clamp(drag.start.h + grow, 2 * g.py, OUTER_H - drag.start.y);
-      const hCells = clamp(Math.round(h / g.py), 2, g.rows);
-      const wCells = Math.max(2, Math.round((hCells * (9 / 16) * g.py) / g.px));
-      dragRect = { ...drag.start, w: wCells * g.px, h: hCells * g.py };
-    }
-    fencePx = dragRect;
-    fenceCells = cellsFor(fencePx);
-    paintPreview();
-    paintFenceFieldsLive();
-    pushFenceLive();
-  }
-  surface.addEventListener('pointermove', onDragMove);
-  surface.addEventListener('mousemove', onDragMove);
-  window.addEventListener('pointermove', (e) => {
-    if (drag) onDragMove(e);
-  });
-
-  function endDrag(e) {
-    if (!drag) return;
-    const committed = dragRect;
-    drag = null;
-    dragRect = null;
-    window.removeEventListener('pointerup', endDrag);
-    window.removeEventListener('mouseup', endDrag);
-    window.removeEventListener('pointercancel', endDrag);
-    delete surface.dataset.drag;
-    try {
-      surface.releasePointerCapture?.(e.pointerId);
-    } catch {
-      /* capture already gone */
-    }
-    // Commit what the pointer produced, never `fencePx`: a refresh may have replaced it with
-    // the server's old rect while the drag was in flight.
-    if (committed) commitFence(committed);
-  }
-  surface.addEventListener('pointerup', endDrag);
-  surface.addEventListener('pointercancel', endDrag);
-  surface.addEventListener('mouseup', endDrag);
+  /**
+   * The drag itself lives in the preview component now: it owns the 16:9 frame, the 9:16 window
+   * and the pointer→fraction maths for both. The pane subscribes to the component's `onFence`
+   * and turns the resulting fractions back into wall pixels through the same cell grid the
+   * numeric fields use, so a drag and a typed value cannot disagree.
+   *
+   * What stays here is the semantic bit the component must not know: a fence is only meaningful
+   * on the 9:16 wall. On a whole 16:9 wall a drag is ignored rather than silently creating a
+   * window that the engine will not honour.
+   */
 
   function paintFenceFieldsLive() {
     const r = fencePx;
@@ -1010,7 +1694,7 @@ export async function render(container, ctx) {
 
   /* ---- keyboard nudge: the wall is focusable, arrows move one cell */
 
-  surface.addEventListener('keydown', (e) => {
+  previewHost.addEventListener('keydown', (e) => {
     if (ratioSelection !== '9:16' || !fencePx) return;
     const g = gridInfo();
     const page = e.shiftKey ? 8 : 1;
@@ -1059,7 +1743,7 @@ export async function render(container, ctx) {
 
   async function commitFence(rect) {
     if (signal.aborted) return;
-    surface.dataset.busy = 'true';
+    previewPanel.dataset.busy = 'true';
     try {
       // Commit through the fence route: a drag preview never persisted, so this is what makes
       // the rect survive a restart.
@@ -1091,7 +1775,7 @@ export async function render(container, ctx) {
       paintFenceFields();
       paintPreview();
     } finally {
-      delete surface.dataset.busy;
+      delete previewPanel.dataset.busy;
     }
   }
 
@@ -1134,6 +1818,16 @@ export async function render(container, ctx) {
         ratioSelection = out.ratio;
         paintRatio();
         paintPreview();
+      }
+      // `look.palette` / `look.pattern` / `preset.set` are page commands: the answer names what
+      // the page now runs, and that is the only word on a dimension the settings document does
+      // not hold. Adopt it so the dropdowns follow a deck press as well as a pick.
+      if (out && typeof out === 'object') {
+        if (cleanLookName(out.palette)) synth = { ...synth, palette: out.palette };
+        if (cleanLookName(out.pattern)) synth = { ...synth, pattern: out.pattern };
+        if (cleanLookName(out.preset) && name === 'preset.set') synth = { ...synth, preset: out.preset };
+        if (out.presets) adoptPresets(out.presets);
+        if (cleanLookName(out.palette) || cleanLookName(out.pattern) || cleanLookName(out.preset)) paintQuick();
       }
       // the bus answers `delivered`; the frame itself arrives over SSE and refreshes the log.
       // A settings.patch is applied by the store here as well, so it lands with no page open.
@@ -1195,8 +1889,11 @@ export async function render(container, ctx) {
   const formSettings = () => lookRows(settingsMeta);
   let form = null;
 
-  // settings this pane edits with its own controls; the generated form leaves them out
-  const PANE_OWNED_KEYS = new Set(['ratio', 'fence', 'fenceOutDim']);
+  // `pattern` and `preset` were render-only schema keys (the page reads them, nothing wrote them
+  // back), so they do not reach this form today; they are listed anyway so a schema that starts
+  // accepting one cannot grow a second, weaker control (a text box naming a pattern) beside the
+  // dropdown that owns it.
+  const PANE_OWNED_KEYS = new Set(['ratio', 'fence', 'fenceOutDim', 'pattern', 'preset']);
   const LABELS = {
     pattern: 'Pattern',
     preset: 'Preset',
@@ -1232,6 +1929,7 @@ export async function render(container, ctx) {
         if (r && r.settings) {
           look = r.settings.look || look;
           renderDoc = r.settings;
+          if (r.settings.presets) adoptPresets(r.settings.presets);
         }
         paintQuick();
         paintPreview();
@@ -1306,6 +2004,15 @@ export async function render(container, ctx) {
     if (snap.rev === undefined) return;
     // look frame: adopt the look the server just pushed, so the still is the wall's still
     if (snap.look) look = { ...look, ...snap.look };
+    // what the page reports it is running (see `echo` in server.js). The settings document has
+    // no palette and only a guessed pattern, so this is the pane's live word after a deck press:
+    // the page hands back the pattern it settled on and the preset name it is showing.
+    const echo = snap.echo && typeof snap.echo === 'object' ? snap.echo : null;
+    if (echo) {
+      if (cleanLookName(echo.palette)) synth = { ...synth, palette: echo.palette };
+      if (cleanLookName(echo.pattern)) synth = { ...synth, pattern: echo.pattern };
+      if (cleanLookName(echo.preset)) synth = { ...synth, preset: echo.preset };
+    }
     // the pushed document carries the ratio too: a forcing scene (or the fence switch) flips
     // it without a click. Adopt it and re-read /live, which carries the ratio *state* — that
     // is where the forcing lock lives, and the preview needs both to agree
@@ -1314,7 +2021,7 @@ export async function render(container, ctx) {
       refreshQuiet();
     }
     // a state frame never overrides the rect under the operator's pointer
-    if (snap.fence !== undefined && !drag) applyFenceDoc(snap.fence);
+    if (snap.fence !== undefined && !(preview && preview.isDragging && preview.isDragging())) applyFenceDoc(snap.fence);
     paintQuick();
     paintPreview();
     paintFenceFields();
@@ -1328,14 +2035,15 @@ export async function render(container, ctx) {
   // A slow poll is the backstop for the online dots, the scene and the ratio document. It reads
   // /live and not /render: a bus frame can be missed (a park/unpark, a dropped SSE write), and
   // /render carries neither the ratio *state* nor the forcing lock.
-  const poll = setInterval(() => {
+  function runPoll() {
     if (document.hidden || signal.aborted) return;
     paintStream();
     api.get('/api/wall/live', { signal }).then((r) => {
       if (!r) return;
       // While a drag is in flight neither the rect nor the ratio may follow the server: the
       // operator's pointer owns both until the PATCH lands. Keep them, take the rest.
-      const keep = drag ? { ratio: ratioSelection, px: fencePx && { ...fencePx }, cells: fenceCells && { ...fenceCells } } : null;
+      const holding = preview && preview.isDragging && preview.isDragging();
+      const keep = holding ? { ratio: ratioSelection, px: fencePx && { ...fencePx }, cells: fenceCells && { ...fenceCells } } : null;
       applyLive(r);
       if (keep) {
         ratioSelection = keep.ratio;
@@ -1348,7 +2056,8 @@ export async function render(container, ctx) {
         paintFenceFields();
       }
     }).catch(() => {});
-  }, 4000);
+  };
+  const poll = setInterval(runPoll, 4000);
   void (() => {
     api.get('/api/wall/render', { signal }).then((r) => {
       if (!r) return;
@@ -1363,14 +2072,32 @@ export async function render(container, ctx) {
     }).catch(() => {});
   })();
   timers.push(() => clearInterval(poll));
+  // A page command's outcome (`look.palette`, `look.pattern`, `preset.set`) is written back by
+  // the page's own report, and a snapshot does not always follow it; the 4 s `runPoll` already
+  // adopts it, and a pane with no OBS page open must still settle within a beat. So a look
+  // command schedules one extra pull, folded into one timer.
+  let lookPullTimer = null;
+  function scheduleLookPull() {
+    if (lookPullTimer) return;
+    lookPullTimer = setTimeout(() => {
+      lookPullTimer = null;
+      runPoll();
+    }, 900);
+  }
+  timers.push(() => clearTimeout(lookPullTimer));
 
   // the wall's own heartbeat: a resize can change the preview's scale
   const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(() => paintPreview()) : null;
-  ro?.observe(surface);
+  ro?.observe(previewHost);
   timers.push(() => ro?.disconnect());
 
   /* -------------------------------------------------------------- boot */
 
+  // Mount the preview BEFORE the first await: the pane is not the pane until its frame exists, and
+  // the shell paints right after this module returns. It reads `look` and `ratioSelection`, both
+  // declared above, so this is the earliest point it can go up.
+  mountWallPreview();
+  paintPreview();
   await pull();
   mountForm();
 

@@ -191,7 +191,15 @@ async function main() {
   await c.send('Page.enable');
   await c.send('Log.enable');
   await c.send('Page.addScriptToEvaluateOnNewDocument', {
-    source: `window.addEventListener('error', function (e) { window.__err = (e && e.message) || 'error'; });
+    // A ResizeObserver that notices a size change caused by its own callback is reported by Chrome
+    // as an `error` event with this one message, and the browser recovers from it silently. It is a
+    // layout ping-pong at worst, not a broken page, so the gate records the FIRST real exception
+    // and lets this specific, self-healing report through.
+    source: `window.addEventListener('error', function (e) {
+               var m = (e && e.message) || 'error';
+               if (/ResizeObserver loop/.test(m)) return;
+               if (!window.__err) window.__err = m;
+             });
              window.addEventListener('unhandledrejection', function (e) { window.__err = 'promise: ' + ((e.reason && e.reason.message) || e.reason); });`,
   });
   const origPush = c.events.push.bind(c.events);
@@ -421,9 +429,20 @@ async function main() {
 
     const local = Boolean(status.model && status.model.local);
     const modelRes = await fetch(`${srv.url}/api/handfx/model`);
+    // The model URL the overlay is handed is a fallback, not a route the page takes when the
+    // server has the file: a local copy must be what a page loads, and it must be reachable only
+    // from this origin (the overlay is COEP require-corp, so an unlabelled cross-origin fetch of
+    // the model would fail — and a CDN copy would not be offline at all).
+    const modelCorp = modelRes.headers.get('cross-origin-resource-policy');
+    const modelSourceHdr = modelRes.headers.get('x-handfx-model-source');
     if (local) {
       const buf = await modelRes.arrayBuffer();
       ok('local model serves', modelRes.ok && buf.byteLength > 1_000_000, `${modelRes.status} ${buf.byteLength}B`);
+      // The bytes are the MediaPipe bundle the overlay expects: a .task is a zip whose first entry
+      // is the model graph, so a PK header at offset 0 is the cheap, honest check.
+      const head = Array.from(new Uint8Array(buf.slice(0, 4))).map((b) => b.toString(16).padStart(2, '0')).join(' ');
+      ok('local model is the MediaPipe .task bundle', head === '00 00 50 4b' && buf.byteLength === 7819105, `head=${head} bytes=${buf.byteLength}`);
+      ok('local model is served same-origin (CORP) and says so', modelCorp === 'same-origin' && modelSourceHdr === 'local', `corp=${modelCorp} source=${modelSourceHdr}`);
     } else {
       // No model on disk: the page would fetch the CDN URL. Report that as a real finding only if
       // the CDN answers; fail if the page's fallback cannot be reached either.
@@ -519,7 +538,45 @@ async function main() {
     ok('camera path does not throw', cam && cam.state !== 'error', JSON.stringify(cam));
     const tracking = await waitFor(c, `window.__handfx.tracker.state === 'running'`, 15000);
     // Two honest outcomes: a tracked camera (model loaded) or a named model failure. Both are real.
-    const snap = await evaluate(c, '({ state: window.__handfx.tracker.state, model: window.__handfx.tracker.model, error: window.__handfx.tracker.error, runtime: window.__handfx.tracker.runtime })');
+    const snap = await evaluate(c, '({ state: window.__handfx.tracker.state, model: window.__handfx.tracker.model, error: window.__handfx.tracker.error, runtime: window.__handfx.tracker.runtime, modelSource: window.__handfx.tracker.modelSource })');
+    // Which copy of the model the page used is not visible in the picture: `model: 'ready'` is
+    // the same whether the bytes came from the module's file or storage.googleapis.com, and Cache
+    // Storage made an old CDN copy indistinguishable from a local one. So the assertion is the
+    // page's own account (tracker.modelSource, set by fetchModel) AND the browser's resource
+    // timing: a same-origin /api/handfx/model entry, and no CDN entry at all.
+    const usedModel = await evaluate(
+      c,
+      `(async () => {
+        const h = window.__handfx;
+        const res = performance.getEntriesByType('resource').map((e) => ({ name: e.name, initiator: e.initiatorType, transfer: e.transferSize }));
+        // The page may have served the bytes from Cache Storage, which leaves no resource entry:
+        // ask the cache what it holds for the model keys, and the tracker what it used.
+        let cacheKeys = [];
+        try {
+          const cache = await caches.open('handfx:models-v1');
+          cacheKeys = (await cache.keys()).map((r) => new URL(r.url).pathname + new URL(r.url).search);
+        } catch { cacheKeys = []; }
+        return {
+          modelSource: h.tracker.modelSource,
+          cdnEntries: res.filter((e) => /storage\\.googleapis|googleapis\\.com/.test(e.name)).map((e) => e.name),
+          modelEntries: res.filter((e) => /\\/api\\/handfx\\/model/.test(e.name)).map((e) => e.name),
+          taskEntries: res.filter((e) => /\\.task(\\?|$)/.test(e.name)).map((e) => e.name),
+          cacheKeys,
+        };
+      })()`,
+      true,
+    );
+    const src = usedModel.modelSource || {};
+    ok(
+      'overlay loads the LOCAL model file, not the CDN',
+      src.from === 'local' && src.source === '/api/handfx/model' && usedModel.cdnEntries.length === 0 && usedModel.cacheKeys.every((k) => !/from=cdn/.test(k)),
+      JSON.stringify({ from: src.from, source: src.source, cached: src.cached, bytes: src.bytes, cdn: usedModel.cdnEntries, cacheKeys: usedModel.cacheKeys, task: usedModel.taskEntries }),
+    );
+    ok(
+      'the model request is same-origin (resource timing has no storage.googleapis.com entry)',
+      usedModel.cdnEntries.length === 0 && (usedModel.modelEntries.length > 0 || src.cached === true),
+      `model=${JSON.stringify(usedModel.modelEntries)} cdn=${JSON.stringify(usedModel.cdnEntries)} cached=${src.cached}`,
+    );
     if (snap.model === 'ready' && snap.state === 'running') {
       ok('tracker runs on the camera frames', Boolean(tracking), `runtime=${snap.runtime} model=${snap.model}`);
       const handsOnTestPattern = await evaluate(c, 'window.__handfx.state.hands');
@@ -585,17 +642,75 @@ async function main() {
     await ackPost.arrayBuffer();
 
     // ── 7. the pane ────────────────────────────────────────────────────────
+    // The shell is where the pane mounts, so isolation has to hold on the shell's own document and
+    // files: COOP/COEP on index.html alone is not enough — the module graph it boots
+    // (`/src/shell.js` and its imports) is fetched inside the same isolated document, and an
+    // isolated document that loads a non-isolated module graph does not boot at all.
+    const shellDocs = {};
+    for (const p of ['/', '/src/shell.js', '/src/ui.js', '/src/shell.css']) {
+      const r = await fetch(`${srv.url}${p}`);
+      shellDocs[p] = { ok: r.ok, coop: r.headers.get('cross-origin-opener-policy'), coep: r.headers.get('cross-origin-embedder-policy') };
+      await r.arrayBuffer();
+    }
+    ok(
+      'the shell document and its module graph are served cross-origin isolated',
+      shellDocs['/'].ok && shellDocs['/'].coop === 'same-origin' && shellDocs['/'].coep === 'require-corp' &&
+        shellDocs['/src/shell.js'].ok && shellDocs['/src/shell.js'].coop === 'same-origin' && shellDocs['/src/shell.js'].coep === 'require-corp',
+      JSON.stringify(shellDocs),
+    );
+
     await c.send('Page.navigate', { url: `${srv.url}/#/handfx` });
     const paneReady = await waitFor(c, `Boolean(document.querySelector('.hfx') && document.querySelectorAll('.hfx-effect').length)`, 12000);
     if (!paneReady) {
       const slot = await evaluate(c, `document.querySelector('.pane-slot') ? document.querySelector('.pane-slot').innerHTML.slice(0, 600) : 'no .pane-slot'`);
       console.log(`     pane console:\n       ${consoleLines.slice(-15).join('\n       ')}\n     slot: ${slot}`);
     }
+    // The pane route, measured in the document the pane actually mounts in: it must report
+    // crossOriginIsolated === true (a false there is what told the operator the pane's own tab was
+    // not isolated), and it must have mounted with no isolation banner.
+    const paneIso = await evaluate(c, `({ coi: self.crossOriginIsolated, secure: self.isSecureContext, banners: [...document.querySelectorAll('.hfx-banner')].map((b) => b.textContent) })`);
+    ok('pane route reports crossOriginIsolated === true', paneIso.coi === true, `crossOriginIsolated=${paneIso.coi} banners=${JSON.stringify(paneIso.banners)}`);
+    ok('pane mounts with no isolation banner', Boolean(paneReady) && paneIso.banners.every((t) => !/cross-origin isolated/i.test(t)), paneIso.banners.join(' | ') || 'no banners');
     const tiles = await evaluate(c, `[...document.querySelectorAll('.hfx-effect')].map((t) => t.querySelector('.hfx-effect-id').textContent)`);
     ok('pane renders the effect registry', Boolean(paneReady) && Array.isArray(tiles) && tiles.length >= 5, (tiles || []).join(','));
     const controls = await evaluate(c, `({ switches: document.querySelectorAll('.hfx-effect input[type=checkbox]').length, sliders: document.querySelectorAll('.hfx-effect input[type=range]').length, pills: [...document.querySelectorAll('.hfx-pill')].map((p) => p.textContent).join(' | ') })`);
     ok('pane has per-effect enable + intensity', controls.switches >= 5 && controls.sliders >= 5, `switches=${controls.switches} sliders=${controls.sliders}`);
-    ok('pane states the secure-context and isolation facts', /secure context/.test(controls.pills) && /isolat/.test(controls.pills), controls.pills);
+    ok('pane states the secure-context and isolation facts', /secure context/.test(controls.pills) && /cross-origin isolated/.test(controls.pills), controls.pills);
+
+    // ── 7a. the effect rows carry the engine's own names, never a rendered `undefined` ──
+    // The registry the pane reads is `[{ id, title, gesture, from }]`. A row built from a bare id
+    // list (what `Object.keys(FX)` is) renders the literal "nullnull" after every effect. This
+    // checks the live browser: every rendered row has a real name, that name is the one the engine
+    // declares, and nothing on the page says null/undefined.
+    const rowText = await evaluate(c, `(() => {
+      const tiles = [...document.querySelectorAll('.hfx-effect')];
+      return {
+        names: [...document.querySelectorAll('.hfx-effect-name')].map((n) => n.textContent),
+        nullish: [...tiles].filter((t) => /^(null|undefined)+$|nullnull/.test(t.querySelector('.hfx-effect-top').textContent)).length,
+        bodyHasNullnull: document.body.innerHTML.includes('nullnull'),
+      };
+    })()`);
+    const servedReg = await (await fetch(`${srv.url}/api/handfx/status`)).json();
+    const servedTitles = new Map((servedReg.effects || []).map((e) => [e.id, e.title]));
+    const namesRight = rowText.names.length === CANON.length && rowText.names.every((n) => typeof n === 'string' && n.trim() && !/null|undefined/i.test(n));
+    const titlesMatch = (servedReg.effects || []).every((e) => rowText.names.includes(e.title));
+    ok(
+      'pane effect rows show the engine names (no nullnull)',
+      namesRight && titlesMatch && rowText.nullish === 0 && !rowText.bodyHasNullnull,
+      `${rowText.names.length} names: ${rowText.names.slice(0, 4).join(' | ')}… nullish=${rowText.nullish} nullnull=${rowText.bodyHasNullnull}`,
+    );
+    // Where the names come from: `/effects` is a bare id list (strings, renderer order) and
+    // `/status` carries the same ids with the engine's title. Both are pinned as served, so a pane
+    // that started inventing labels would still fail here even with the rows looking right.
+    const bareRes = await fetch(`${srv.url}/api/handfx/effects`);
+    const bareList = await bareRes.json();
+    ok(
+      'the bare effect list is strings in renderer order',
+      bareRes.status === 200 && Array.isArray(bareList) && bareList.length === CANON.length && bareList.every((id, i) => id === CANON[i]),
+      `${Array.isArray(bareList) ? bareList.length : typeof bareList} ids: ${(bareList || []).slice(0, 4).join(',')}…`,
+    );
+    const servedShape = (servedReg.effects || []).every((e) => e && typeof e.id === 'string' && typeof e.title === 'string' && e.title.trim() && e.title !== e.id);
+    ok('status carries the engine title for every effect', servedShape && servedTitles.size === CANON.length, `${servedTitles.size} titles, fireball → ${servedTitles.get('fireball')}`);
 
     // Toggling an effect in the pane writes the document (the operator's list, not a page's).
     const listed = await (await fetch(`${srv.url}/api/handfx/status`)).json();
@@ -686,10 +801,57 @@ async function main() {
       fx.render(t0, view);
       fx.render(t0 + 260, view);
       const gl = fx.gl;
-      const px = (x, y) => { const b = new Uint8Array(4); gl.readPixels(Math.floor(fx.w * x), Math.floor(fx.h * y), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b); return b[3]; };
-      return { live: fx.live.has('electroshock'), gl: gl.getError(), snap: Boolean(fx.snapTex), centre: px(0.5, 0.5), edge: px(0.82, 0.5) };
+      // The shockwave is a band on the shader's own front, and the renderer feeds
+      // u_radius = 0.02 + age * 1.6 (fx.js, electroshock branch). By the second render (t0 + 260 ms)
+      // that front is at ~0.44 field units from the anchor — near the frame edge, so probing the
+      // centre or one fixed x can only ever read the hole. Read the whole frame instead, in field
+      // units (x scaled by the aspect, as the shader does), and report where its alpha is.
+      const age = fx.live.get('electroshock').age;
+      const radius = 0.02 + age * 1.6;
+      const aspect = fx.w / fx.h;
+      const all = new Uint8Array(fx.w * fx.h * 4);
+      gl.readPixels(0, 0, fx.w, fx.h, gl.RGBA, gl.UNSIGNED_BYTE, all);
+      let lit = 0;
+      let minFront = Infinity;
+      let brightest = 0;
+      const anchor = 0.5;
+      for (let y = 0; y < fx.h; y++) {
+        for (let x = 0; x < fx.w; x++) {
+          const a = all[(y * fx.w + x) * 4 + 3];
+          if (!a) continue;
+          lit++;
+          if (a > brightest) brightest = a;
+          const dx = ((x + 0.5) / fx.w - anchor) * aspect;
+          const dy = (y + 0.5) / fx.h - anchor;
+          const r = Math.hypot(dx, dy);
+          if (r < minFront) minFront = r;
+        }
+      }
+      return {
+        live: fx.live.has('electroshock'),
+        gl: gl.getError(),
+        snap: Boolean(fx.snapTex),
+        radius: Math.round(radius * 1000) / 1000,
+        lit,
+        brightest,
+        innerEdge: minFront === Infinity ? null : Math.round(minFront * 1000) / 1000,
+      };
     })()`);
-    ok('electroshock draws from the scene snapshot', shock.live && shock.gl === 0 && shock.snap && (shock.centre > 0 || shock.edge > 0), JSON.stringify(shock));
+    // Live + snapshot + clean context are the *binding* claims. The art claim is "the shockwave is
+    // sampled from the scene and drawn on — never inside — its front": pixels exist, the brightest
+    // is real, and nothing is lit inside u_radius (a shockwave starts at its front; a filled disc
+    // would light the centre too).
+    ok(
+      'electroshock draws from the scene snapshot',
+      shock.live &&
+        shock.gl === 0 &&
+        shock.snap &&
+        shock.lit > 0 &&
+        shock.brightest > 0 &&
+        shock.innerEdge !== null &&
+        shock.innerEdge >= shock.radius - 0.05,
+      JSON.stringify(shock),
+    );
 
     // Particles: a burst increments the store, and one render integrates + draws them.
     const parts = await evaluate(c, `(() => {
@@ -818,6 +980,11 @@ async function main() {
 
     const pageErr = await evaluate(c, 'window.__err || null');
     ok('no uncaught page exceptions', !pageErr, pageErr || '');
+    // The pane is the last document this session looked at, and the console lines were collected
+    // from it throughout: a pane that mounts isolated but logs an isolation, CORP or module error
+    // is a broken pane with a passing header. Only errors count — warnings and GL info are noise.
+    const paneConsoleErrors = consoleLines.filter((l) => /^(error|log error|log severe):/.test(l) && !/favicon/.test(l));
+    ok('pane mounts with no console errors', paneConsoleErrors.length === 0, paneConsoleErrors.slice(-3).join(' | ') || 'none');
   } finally {
     stopChrome();
     await new Promise((r) => setTimeout(r, 150));

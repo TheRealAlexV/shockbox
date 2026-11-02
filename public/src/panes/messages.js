@@ -21,12 +21,14 @@ const TABS = [
   { id: 'all', label: 'All' },
   { id: 'dialogs', label: 'Alerts' },
   { id: 'notifications', label: 'Notifications' },
+  { id: 'wall', label: 'Wall' },
   { id: 'random', label: 'Random' },
 ];
 
 const KINDS = [
   { id: 'dialog', label: 'Alert' },
   { id: 'notification', label: 'Notification' },
+  { id: 'wall', label: 'Wall' },
 ];
 const ACTIONS = [
   { id: 'close', label: 'close' },
@@ -285,7 +287,7 @@ export async function render(container, ctx) {
     const body = el('div', { class: 'msg-body' });
     const meta = el('div', { class: 'msg-meta' });
     meta.append(
-      el('span', { class: 'msg-kind', dataset: { kind: m.kind || 'notification' }, text: m.kind === 'dialog' ? 'alert' : m.kind === 'notification' ? 'toast' : m.kind || '?' }),
+      el('span', { class: 'msg-kind', dataset: { kind: m.kind || 'notification' }, text: m.kind === 'dialog' ? 'alert' : m.kind === 'notification' ? 'toast' : m.kind === 'wall' ? 'wall' : m.kind || '?' }),
       m.type ? el('span', { class: 'msg-type', text: m.type }) : '',
       el('span', { class: 'mono dim msg-id', text: m.id }),
       m.random ? el('span', { class: 'badge badge-light', text: 'random' }) : '',

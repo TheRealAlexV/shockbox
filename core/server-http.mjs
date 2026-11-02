@@ -170,6 +170,26 @@ export function serveFile(res, file, { cache = 'no-store', method = 'GET', heade
   return true;
 }
 
+// The shared shell's own files under public/: the entry document and the module graph it boots.
+// The shell used to be served with no header helper at all (a module page gets its module.json
+// `headers`, the shell has none), so a pane mounted in it reported crossOriginIsolated === false
+// while the overlay page reported true — the pane then told the operator its own tab was not
+// isolated. COOP/COEP on these two documents is what makes the pane route an isolated document.
+// `require-corp` rather than `credentialless`: everything the shell loads is same-origin (its
+// stylesheets, its module graph, the panes' own imports), so nothing needs a CORS-free pass and the
+// stricter policy costs nothing. A third-party embed added to the shell later needs CORP and will
+// fail loudly here instead of silently widening the policy.
+const SHELL_ISOLATION = {
+  'cross-origin-opener-policy': 'same-origin',
+  'cross-origin-embedder-policy': 'require-corp',
+};
+const SHELL_FILES = [/^\/$/, /^\/control\/?$/, /^\/index\.html$/, /^\/src\/.*\.(?:m?js|css)$/];
+
+/** Headers for a request that lands in public/: the shell and its module graph are isolated. */
+export function shellHeaders(p) {
+  return SHELL_FILES.some((re) => re.test(p)) ? SHELL_ISOLATION : null;
+}
+
 /**
  * Serve a file through a prefix a module declared (`mountPrefix` + `mountFile` on its API). The
  * module resolves and validates the path itself — core only knows the prefix and that the module
@@ -306,10 +326,19 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
             params = [];
           }
           if (params === null) continue;
-          const body = req.method === 'GET' || req.method === 'HEAD' ? null : await readJson(req).catch((e) => {
-            if (e instanceof HttpError) throw e;
-            throw new HttpError(400, e.message);
-          });
+          // A raw route takes the body as bytes: a picture upload is not JSON, and parsing it as
+          // JSON is how a module with an upload endpoint used to have only a 400 for an answer.
+          // `rawBody: true` is the declaration; the size ceiling stays the module's own.
+          const body = req.method === 'GET' || req.method === 'HEAD' ? null
+            : r.rawBody
+              ? await readBody(req, r.rawLimit || BODY_LIMIT).catch((e) => {
+                if (e instanceof HttpError) throw e;
+                throw new HttpError(400, e.message);
+              })
+              : await readJson(req).catch((e) => {
+                if (e instanceof HttpError) throw e;
+                throw new HttpError(400, e.message);
+              });
           const out = await r.handler(req, res, url, body, params);
           if (out !== undefined && !res.headersSent) sendJson(res, 200, out);
           return undefined;
@@ -385,7 +414,7 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
       if (req.method === 'GET' || req.method === 'HEAD') {
         if (p === '/' || p === '/control' || p === '/control/') {
           const shell = path.join(publicDir, 'index.html');
-          if (serveFile(res, shell, { method: req.method })) return undefined;
+          if (serveFile(res, shell, { method: req.method, headers: shellHeaders('/') })) return undefined;
           // The entry document is source, served straight from public/. If it is missing the
           // checkout is incomplete — say which file and where we looked, not "run a build".
           log.error(`shell missing: ${shell} — serving 503 (incomplete checkout?)`);
@@ -398,7 +427,7 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
           );
         }
         const file = safeJoin(publicDir, p);
-        if (file && serveFile(res, file, { method: req.method })) return undefined;
+        if (file && serveFile(res, file, { method: req.method, headers: shellHeaders(p) })) return undefined;
         // module-relative static fallback: /mod/<id>/<path> serves inside that module's dir
         const mm = /^\/mod\/([a-z0-9-]+)\/(.+)$/.exec(p);
         if (mm) {
@@ -441,6 +470,66 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
     },
     close() {
       return new Promise((resolve) => server.close(() => resolve()));
+    },
+    /**
+     * Drive the server's own routes from inside the process, so a background worker (the
+     * scheduler) reuses the exact handler a click would reach instead of a parallel send path.
+     * Resolves `{status, body}`; handlers that write framing themselves are refused rather than
+     * fed a fake response, because silently returning `{}` would look like a delivered send.
+     */
+    async request(method, pathname, body) {
+      const u = new URL(pathname, 'http://core.local');
+      const p = u.pathname;
+      // In-process callers get the answer back as a return value, so a handler that answers with
+      // `writeHead`/`end` itself (rather than returning a value) must not crash: give the fake the
+      // same shape a real ServerResponse has and capture what it wrote instead of sending it.
+      const fakeRes = {
+        headersSent: false,
+        ended: false,
+        statusCode: 200,
+        headers: {},
+        setHeader(k, v) { this.headers[String(k).toLowerCase()] = v; },
+        getHeader(k) { return this.headers[String(k).toLowerCase()]; },
+        writeHead(status, hdrs) {
+          this.statusCode = status;
+          if (hdrs && typeof hdrs === 'object') {
+            for (const [k, v] of Object.entries(hdrs)) this.setHeader(k, v);
+          }
+          this.headersSent = true;
+          return this;
+        },
+        write(chunk) { this.chunks.push(chunk); return true; },
+        end(chunk) {
+          if (chunk !== undefined) this.chunks.push(chunk);
+          this.headersSent = true;
+          this.ended = true;
+          return this;
+        },
+        chunks: [],
+      };
+      const asBody = (x) => (x === undefined ? {} : x);
+      const parseBody = (res) => {
+        if (!res.chunks.length) return undefined;
+        const text = Buffer.concat(res.chunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(String(c))))).toString('utf8');
+        try { return JSON.parse(text); } catch { return text; }
+      };
+      if (Array.isArray(core.extraRoutes)) {
+        for (const r of core.extraRoutes) {
+          if (r.method !== method) continue;
+          let params = null;
+          if (r.path instanceof RegExp) {
+            const m = r.path.exec(p);
+            if (m) params = m.slice(1);
+          } else if (r.path === p) params = [];
+          if (params === null) continue;
+          const out = await r.handler({ method, url: p }, fakeRes, u, body ?? null, params);
+          return { status: fakeRes.statusCode || 200, body: asBody(out !== undefined ? out : parseBody(fakeRes)) };
+        }
+      }
+      const hit = registry.match(method, p);
+      if (!hit) throw new Error(`no route for ${method} ${p}`);
+      const out = await hit.route.handler({ method, url: p }, fakeRes, u, body ?? null, hit.params);
+      return { status: fakeRes.statusCode || 200, body: asBody(out !== undefined ? out : parseBody(fakeRes)) };
     },
   };
 }

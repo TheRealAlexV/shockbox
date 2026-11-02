@@ -48,20 +48,74 @@
 
 .wall-quick { gap: 8px; }
 
-.wall-chip-name {
+/* ---- the three look dropdowns --------------------------------------------------------
+   A field is the label stacked over its select, so the name sits above the value instead of
+   eating a column of the bar. Every width is capped: three selects plus a save field plus the
+   blackout pair plus the ratio seg share one row at 1024px, and an uncapped select would push
+   the ratio seg off the edge (the pane test measures scrollWidth there). */
+.wall-look-field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.wall-look-field .look-label { line-height: 1; }
+
+.wall-select {
+  width: auto;
+  min-width: 0;
+  max-width: 150px;
+  height: 24px;
+  padding: 0 6px;
+  font-size: 11.5px;
+  /* the name is right-padded so the platform's chevron never sits on top of it; the select is
+     capped by `.wall-select`'s max-width, and a long name ellipsises rather than widening */
+  padding-right: 4px;
+  text-overflow: ellipsis;
+}
+/* a value the bank does not hold: its option says so in its own words, and the select paints
+   every option in the normal foreground (the browser greys the empty one on its own) */
+.wall-select option[value=''] { font-style: italic; }
+.wall-select:disabled { opacity: 0.6; }
+
+/* ---- save look: the button, then the field it opens ---------------------------------- */
+.wall-save-btn { flex: 0 0 auto; white-space: nowrap; }
+
+.wall-save {
   display: inline-flex;
   align-items: center;
-  min-width: 84px;
-  max-width: 168px;
+  gap: 6px;
+  min-width: 0;
+}
+.wall-save-input {
+  width: 132px;
   height: 24px;
-  padding: 0 8px;
-  border: var(--hair) solid var(--line-2);
-  background: var(--bg);
-  color: var(--fg);
-  font-size: 11px;
+  font-size: 11.5px;
+}
+.wall-save-input[data-bad='true'] { border-color: var(--bad); box-shadow: 0 0 0 1px rgba(255, 93, 106, 0.25); }
+.wall-save-ok, .wall-save-cancel { flex: 0 0 auto; }
+.wall-save-cancel { line-height: 1; font-size: 13px; padding: 0 6px; }
+
+/* the answer to a save: a refusal stays until the name is edited, a confirmation fades */
+.wall-save-note {
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-4);
+  white-space: nowrap;
+  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+.wall-save-note[data-tone='ok'] { color: var(--ok); }
+.wall-save-note[data-tone='bad'] { color: var(--bad); text-transform: none; letter-spacing: 0; }
+.wall-save-note:empty { display: none; }
+
+@media (max-width: 1180px) {
+  /* two rows beat a squeezed select at this width: the ratio seg is the first thing a crowded
+     row pushes off the edge, so the bar wraps on its own terms rather than at the last pixel */
+  .wall-select { max-width: 132px; }
+  .wall-save-input { width: 112px; }
 }
 
 .wall-blackout { color: var(--fg-2); }
@@ -127,76 +181,58 @@
 
 /* ---------------------------------------------------------------- preview */
 
+/* The pane no longer draws its own preview box. It hands a host element to the shared component
+   (public/src/preview.js), which owns the 16:9 frame + 9:16 window geometry for every module.
+   What stays here is the wall's own layer — the lattice drawn inside the window — and the
+   rulers/readout under the frame. */
 .wall-preview { margin: 0 0 12px; }
-
 
 .wall-preview .panel-hint { text-transform: none; letter-spacing: 0.02em; }
 
-.wall-stage {
-  position: relative;
-  /* the wall's stage is the 9:16 outer bounds' worth of height; the 16:9 picture is centred in
-     it and the 9:16 window may hang above/below the picture but never leaves the stage */
-  container-type: normal;
-  /* the preview is the wall's 16:9 picture; the window overhangs it above and below, so the
-     stage must not clip (the old layout cut the window's foot off) */
-  padding: 64px 12px 64px 42px;
-  overflow: visible;
-  background:
-    linear-gradient(var(--bg-1), var(--bg-1)) padding-box,
-    repeating-linear-gradient(90deg, transparent 0 15px, rgba(255, 255, 255, 0.014) 15px 16px);
-  min-width: 0;
+.wall-preview-host { min-width: 0; }
+
+/* the layer's lattice: same dot language the component uses, at the wall's own cell scale */
+
+/* the readout under the frame: two labelled rows, right-aligned values, tabular figures */
+.wall-readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  padding: 4px 0 0;
+  font-size: 10px;
 }
 
-.wall-frame {
-  /* the 16:9 picture, centred inside the surface's 9:16 outer bounds (the window overhangs it
-     above and below); the pane measures this box for pointer mapping and scale */
+.wall-readout-row { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.wall-readout-k { letter-spacing: 0.1em; text-transform: uppercase; font-size: 9px; }
+.wall-readout-v { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+/* rulers: y ticks down the left of the frame, x ticks across its top */
+.wall-gutter,
+.wall-axis {
   position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  overflow: hidden;
-  /* the 16:9 picture, with the 9:16 window overhanging above and below it */
-  outline: var(--hair) solid var(--line-3);
+  pointer-events: none;
 }
-.wall-frame > .wall-surface-tag {
+.wall-gutter { left: 0; top: 0; bottom: 0; width: 0; }
+.wall-axis { left: 0; right: 0; top: 0; height: 0; }
+.wall-gutter-tick,
+.wall-axis-tick { position: absolute; font-size: 8px; white-space: nowrap; }
+.wall-gutter-tick { left: -34px; translate: 0 -50%; }
+.wall-axis-tick { top: -12px; translate: -50% 0; }
+.wall-gutter-window,
+.wall-axis-window {
   position: absolute;
-  bottom: 6px;
-  left: 8px;
-  z-index: 5;
+  background: var(--accent);
+  opacity: 0.35;
+  border-radius: 1px;
 }
+.wall-gutter-window { left: -3px; width: 3px; }
+.wall-axis-window { top: -3px; height: 3px; }
 
-.wall-surface {
-  position: relative;
-  /* The drag plane is the wall's outer bounds: 9:16, i.e. a 2560 px-tall portrait window over a
-     1440 px-tall 16:9 picture. The pane sets the pixel height from the measured width (one
-     scale on both axes); the 16:9 picture is absolutely centred inside it, and the window is
-     positioned in this plane's percentages. */
-  display: block;
-  width: 100%;
-  max-width: 100%;
-  margin-inline: auto;
-  overflow: visible;
-  height: var(--wall-surface-h, 62vh);
-  min-height: 0;
-  border: var(--hair) solid var(--line-3);
-  background: #000;
-  touch-action: none;
-  cursor: default;
-  outline: none;
-}
+.wall-preview[data-busy='true'] .wall-preview-host { opacity: 0.85; }
 
-.wall-surface[data-fence='on'] { cursor: grab; }
-.wall-surface[data-drag] { cursor: grabbing; }
-.wall-surface:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 3px;
-  box-shadow: 0 0 0 5px rgba(177, 140, 255, 0.16);
-}
 
-/* the pattern still: palette gradient + lattice, graded down when the wall is dimming */
+
+
 .wall-dots {
   position: absolute;
   inset: 0;
@@ -220,14 +256,6 @@
   opacity: 0.9;
 }
 
-.wall-surface[data-shape='bars'] .wall-dots {
-  background-image:
-    repeating-linear-gradient(90deg, var(--w-a) 0 14px, transparent 14px 22px),
-    radial-gradient(120% 100% at 50% 50%, var(--w-c) 0%, var(--w-b) 60%, var(--w-a) 100%);
-  background-size: auto, 180% 180%;
-}
-.wall-surface[data-shape='plasma'] .wall-dots { background-size: 240% 240%, 200% 200%, 200% 200%; }
-.wall-surface[data-shape='sweep'] .wall-dots { animation-duration: calc(var(--w-dur, 24s) * 0.6); }
 
 @keyframes wall-drift {
   from { background-position: 0% 30%; }
@@ -239,233 +267,12 @@
 }
 
 /* blackout: the wall really is dark */
-.wall-surface[data-blackout='true'] .wall-dots {
-  filter: grayscale(1) brightness(0.08);
-  opacity: 0.35;
-}
-.wall-surface[data-blackout='true']::after {
-  content: 'BLACKOUT';
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  z-index: 4;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.4em;
-  color: rgba(255, 93, 106, 0.75);
-  border: 1px solid rgba(255, 93, 106, 0.25);
-  pointer-events: none;
-}
 
 /* the window: everything outside it dims to fenceOutDim */
-.wall-surface::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  background: #000;
-  opacity: var(--out-dim, 0.18);
-  pointer-events: none;
-  transition: opacity 120ms linear;
-}
 /* with a window on, the fence carries the dim: one veil, not two stacked on top of each other */
-.wall-surface[data-fence='on']::before { opacity: 0; }
-.wall-surface[data-fence='off']::before { opacity: 0.06; }
 /* Fence state not yet known (the pane has not read /api/wall/live): nothing dims. A cold or failed
    first pull must not paint an unexplained black wall. */
-.wall-surface:not([data-fence])::before { opacity: 0; }
 
-.wall-surface-tag {
-  display: block;
-  position: absolute;
-  left: 8px;
-  bottom: 6px;
-  z-index: 3;
-  padding: 1px 5px;
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: rgba(233, 233, 240, 0.72);
-  background: rgba(8, 8, 10, 0.72);
-  border: 1px solid rgba(233, 233, 240, 0.14);
-  pointer-events: none;
-}
-
-.fence {
-  position: absolute;
-  left: 0;
-  top: 0;
-  width: 0;
-  height: 0;
-  z-index: 2;
-  display: none;
-  box-shadow: 0 0 0 1px var(--accent), 0 0 14px rgba(177, 140, 255, 0.18);
-  cursor: grab;
-  touch-action: none;
-  /* percentages position the window against the plane, never against the 16:9 picture */
-}
-.wall-surface > .fence { position: absolute; }
-.wall-surface[data-fence='on'] .fence { display: block; }
-/* the window lives in the plane's coordinate space; `%` top/height are of the plane, so a
-   window taller than the 16:9 picture hangs above/below it inside the plane */
-.wall-surface[data-drag='move'] .fence,
-.fence:active { cursor: grabbing; }
-
-.fence::before {
-  content: '';
-  position: absolute;
-  inset: -9999px;
-  /* the outer 9999px ring lives above the wall's dim/hue layers (z 1/3) and under the
-     window's own picture (z 4) */
-  z-index: 2;
-  border: 9999px solid #000;
-  opacity: calc(var(--out-dim, 0.18) * 0.92);
-  pointer-events: none;
-}
-/* Inside the window the wall is shown as painted — no wash at all. Opaque, because the
-   wall's own picture is the topmost layer in the frame. */
-/* the picture, back at full strength inside the window (its gradient is set at the foot of
-   this sheet, where it can win over the wall's own) */
-.wall-surface .fence-hole {
-  position: absolute;
-  inset: 0;
-  z-index: 4;
-  filter: hue-rotate(var(--w-hue, 0deg)) saturate(var(--w-sat, 1)) brightness(calc(var(--w-bright, 1) * 0.72));
-  pointer-events: none;
-}
-
-.fence::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: transparent;
-  transition: background 140ms var(--ease);
-}
-.wall-surface[data-drag] .fence::after,
-.fence:hover::after { background: rgba(177, 140, 255, 0.06); }
-
-.fence-label {
-  z-index: 2;
-  display: block;
-  position: absolute;
-  top: 4px;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 1px 5px;
-  font-size: 9px;
-  font-variant-numeric: tabular-nums;
-  color: var(--accent-ink);
-  background: var(--accent);
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0.92;
-}
-
-.fence-grip {
-  position: absolute;
-  right: -1px;
-  bottom: -1px;
-  width: 16px;
-  height: 16px;
-  z-index: 2;
-  cursor: nwse-resize;
-  background:
-    linear-gradient(135deg, transparent 45%, var(--accent) 45% 55%, transparent 55%),
-    linear-gradient(135deg, transparent 70%, var(--accent-2) 70% 80%, transparent 80%),
-    var(--bg);
-  border-left: var(--hair) solid var(--accent);
-  border-top: var(--hair) solid var(--accent);
-}
-.fence-grip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-.wall-surface[data-busy='true'] .fence { box-shadow: 0 0 0 1px var(--accent), 0 0 0 3px rgba(177, 140, 255, 0.14); }
-
-/* the rulers beside the wall: y down the left edge, x along the top, both in wall px.
-   A soft bar marks the window's extent on each ruler, so the drag has a 2-D frame */
-.wall-gutter {
-  position: absolute;
-  left: 12px;
-  top: 28px;
-  bottom: 28px;
-  width: 26px;
-  pointer-events: none;
-}
-.wall-gutter-window,
-.wall-axis-window {
-  position: absolute;
-  background: var(--accent);
-  opacity: 0.5;
-}
-.wall-gutter-window { left: 22px; width: 2px; }
-.wall-axis-window { top: 15px; height: 2px; }
-.wall-axis {
-  position: absolute;
-  left: 42px;
-  right: 12px;
-  top: 0;
-  height: 12px;
-  pointer-events: none;
-}
-.wall-axis-tick {
-  position: absolute;
-  top: 1px;
-  transform: translateX(-50%);
-  font-size: 8.5px;
-  line-height: 1;
-}
-.wall-axis-tick:first-child { transform: translateX(-2px); }
-.wall-axis-tick:last-child { transform: translateX(-100%); }
-.wall-axis-tick::before {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 10px;
-  width: 1px;
-  height: 4px;
-  background: var(--line-3);
-}
-.wall-gutter-tick {
-  position: absolute;
-  left: 0;
-  transform: translateY(-50%);
-  font-size: 8.5px;
-  padding-right: 3px;
-  border-right: 1px solid var(--line-2);
-  line-height: 1;
-}
-.wall-gutter-tick::after {
-  content: '';
-  position: absolute;
-  right: -5px;
-  top: 50%;
-  width: 4px;
-  height: 1px;
-  background: var(--line-3);
-}
-
-.wall-readout {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 6px 12px;
-  border-top: var(--hair) solid var(--line);
-  background: var(--bg-2);
-  flex-wrap: wrap;
-}
-/* both rows share one baseline grid, so the bar keeps its height when the window is off */
-.wall-readout-row {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-  min-height: 14px;
-  min-width: 0;
-  flex: 0 1 auto;
-  font-size: 10.5px;
-}
-.wall-readout-v { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wall-readout-k { font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em; }
-.wall-readout-v { color: var(--fg); }
 
 /* ---------------------------------------------------------------- fence panel */
 
@@ -521,6 +328,19 @@
   padding: 8px 12px;
 }
 .wall-text-body .input { flex: 1 1 220px; min-width: 140px; height: 28px; }
+
+/* The pool picker is its own row: a long message must not squeeze the free-text input. */
+.wall-pool-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 100%;
+  min-width: 0;
+  padding-bottom: 8px;
+  border-bottom: var(--hair) solid var(--line);
+  margin-bottom: 2px;
+}
+.wall-pool-row .wall-pool-select { flex: 1 1 260px; min-width: 0; height: 28px; }
 
 .btn[data-on='true'] {
   border-color: var(--accent-dim);
@@ -615,10 +435,8 @@
 .wall-log-empty { padding: 6px 12px; font-size: 10.5px; }
 
 @media (max-width: 900px) {
-  .wall-stage { padding-left: 12px; }
   .wall-gutter { display: none; }
   .wall-quick { align-items: flex-start; }
-  .wall-chip-name { min-width: 64px; }
 }
 
 /* ---------------------------------------------------------------- stream chip */
@@ -680,20 +498,101 @@
    A copy of the wall's gradient inside the fence. These rules sit after the base layer on
    purpose: `.fence-hole` is worn together with `.wall-dots` (the clone keeps its class), and
    an equal-specificity rule earlier in the sheet would lose the background to the wall's. */
-.wall-surface .fence-hole {
-  background-image:
-    radial-gradient(120% 90% at 22% 28%, var(--w-c) 0%, transparent 55%),
-    radial-gradient(110% 120% at 78% 70%, var(--w-b) 0%, transparent 60%),
-    linear-gradient(112deg, var(--w-a) 0%, var(--w-b) 46%, var(--w-c) 100%);
-  background-size: 180% 180%;
-  background-position: 30% 30%;
-  animation: wall-drift var(--w-dur, 18s) ease-in-out infinite alternate;
+
+/* ---- image -------------------------------------------------------------------------------
+   A schematic of the wall, not a copy of it: the rectangle is the region `imageX`/`imageY`/
+   `imageScale`/`imageRotate` describe, so what the operator drags is exactly what the engine
+   lights. The live render is one panel up, in the preview. */
+.wall-img { display: flex; flex-direction: column; gap: 10px; }
+.wall-img .panel-head { align-items: baseline; }
+.wall-img-status { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.wall-img-stage {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  width: 100%;
+  max-height: 260px;
+  border: 1px solid var(--line, rgb(255 255 255 / 14%));
+  border-radius: 6px;
+  background:
+    linear-gradient(90deg, rgb(255 255 255 / 6%) 1px, transparent 1px) 0 0 / 10% 100%,
+    rgb(0 0 0 / 45%);
+  overflow: hidden;
+  touch-action: none;
+  cursor: move;
+  user-select: none;
 }
-.wall-surface[data-shape='bars'] .fence-hole {
-  background-image:
-    repeating-linear-gradient(90deg, var(--w-a) 0 14px, transparent 14px 22px),
-    radial-gradient(120% 100% at 50% 50%, var(--w-c) 0%, var(--w-b) 60%, var(--w-a) 100%);
-  background-size: auto, 180% 180%;
-  animation: none;
+.wall-img-stage[data-ratio='9:16'] { aspect-ratio: 9 / 16; max-height: 320px; max-width: 180px; align-self: center; }
+.wall-img-stage.is-dragging { cursor: grabbing; }
+.wall-img-stage.is-over { border-color: var(--accent, #7cd); box-shadow: inset 0 0 0 1px var(--accent, #7cd); }
+
+.wall-img-box {
+  position: absolute;
+  display: none;
+  transform-origin: 50% 50%;
+  border: 1px solid var(--accent, #7cd);
+  box-sizing: border-box;
 }
-.wall-surface[data-shape='plasma'] .fence-hole { background-size: 240% 240%, 200% 200%, 200% 200%; }
+.wall-img-box.is-on { display: block; }
+.wall-img-thumb {
+  position: absolute;
+  inset: 0;
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+  opacity: 0.9;
+  pointer-events: none;
+}
+.wall-img-handle {
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--accent, #7cd);
+  border: 1px solid rgb(0 0 0 / 60%);
+  cursor: nwse-resize;
+  touch-action: none;
+}
+.wall-img-stage:not([data-on='true']) .wall-img-handle { display: none; }
+
+.wall-img-tools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.wall-img-file { display: none; }
+
+/* Size: the slider takes the row's free width and the number keeps a fixed column, so the thumb
+   does not jump when the value's digit count changes. */
+.wall-img-size span:first-child { flex: 0 0 auto; }
+.wall-img-range {
+  flex: 1 1 auto;
+  min-width: 60px;
+  accent-color: var(--accent, #7cd);
+  height: 16px;
+}
+#wall-img-scale-out { flex: 0 0 3.2em; text-align: right; }
+
+.wall-img-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 6px 12px; }
+.wall-field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+.wall-field-row[data-inert='true'] { opacity: 0.55; }
+.wall-img-select, .wall-field {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 160px;
+  background: rgb(0 0 0 / 35%);
+  color: inherit;
+  border: 1px solid var(--line, rgb(255 255 255 / 18%));
+  border-radius: 4px;
+  padding: 3px 6px;
+  font: inherit;
+}
+
+/* The picture panel is a section of the pane body; the wall-main column is a flex row of such
+   sections, so give this one the same line the preview and text panels get rather than letting
+   it size itself from the grid inside. */
+.wall-img { flex: 0 0 auto; min-width: 240px; max-width: 340px; }
+.wall-img-stage { max-height: 190px; }

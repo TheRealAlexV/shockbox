@@ -77,6 +77,7 @@
     'uniform float u_textScroll;  // horizontal offset in grid cells',
     'uniform float u_reveal;      // 0..1 type-on progress; 1 = fully revealed',
     'uniform float u_textHex;     // 1 = per-cell palette coord is -1 (hex colour)',
+    'uniform float u_textScrollRate; // palette-scroll rate from the live pattern (text mode)',
     'uniform float u_cdScale;     // cooldown storage scale (1 float CB, .25 RGBA8)',
     'uniform int   u_pattern;',
     'uniform float u_bright;      // intensity for the eyecandy patterns (ctl: waveFreq)',
@@ -151,7 +152,10 @@
     '// a hard 0.31 cut-off would make those samples vanish entirely.  Keep a low',
     '// gate and lift the gain so a thin stroke still reads as a lit cell.',
     '    if (a > 0.04) {',
-    '      float shimmer = sin(t * 4.0 + col * 0.5 + row * 0.3) * 0.08;',
+    '// The cell is a LIT LED, not a pixel: it is drawn with the same bloom, flare, streak and',
+    '// grade as a pattern cell, and its colour comes out of the live palette LUT.  What the',
+    '// *pattern* selector controls here is only the motion of the palette scroll, so a new',
+    '// pattern re-animates live text instead of being masked by the send\'s look.',
     '      br = clamp(a * 2.2 + 0.10, 0.22, 1.0);',
     '// Per-run colour.  cm is the run\'s colour mode from the bitmap\'s alpha',
     '// channel: 0 = inherit (the block\'s own treatment, byte-for-byte the old',
@@ -161,9 +165,12 @@
     '// the palette LUT), so a run colour is expressed in that same space — see',
     '// ENGINE-API §TEXT.',
     '      float cb = floor(tx.b * 255.0 + 0.5);',
-    '      if (cb > 254.5) ph = fract(nx + t * 0.04);',                        // 'palette' run
+    '// u_textScrollRate is the live pattern scroll: wave sweeps slowly, chase kicks across,',
+    '// static holds still. The palette *ramp* is whatever is selected now, because ph is read',
+    '// through the LUT below, so `look.palette` recolours live text with no re-send.',
+    '      if (cb > 254.5) ph = fract(nx + t * u_textScrollRate);',            // 'palette' run
     '      else if (cb > 0.5) ph = (cb - 1.0 + 0.5) / 256.0;',                 // run colour sample
-    '      else ph = u_textHex > 0.5 ? -1.0 : fract(nx + t * 0.04);',          // inherit block
+    '      else ph = u_textHex > 0.5 ? -1.0 : fract(nx + t * u_textScrollRate);', // inherit block
     '    } else {',
     '      br = 0.0;',
     '    }',

@@ -181,27 +181,56 @@
   // then follows `state.snapshot` frames over the wall SSE channel — the same frames the
   // control pane publishes when the operator changes anything. A failed pull is not fatal: the
   // URL/preset look keeps rendering and the next snapshot applies.
+  // `setSettings` merges over the engine defaults, so a look is applied as the *whole* look: a
+  // key the operator set back to its default must land too, or the page keeps the old one.
+  var applyLook = function (d) {
+    if (!d) return false;
+    var applied = false;
+    // Saved presets arrive with every snapshot: the page must know a preset by name before a
+    // `preset.set` for it can land, and a missed frame must not leave the wall unable to
+    // resolve one the pane is showing.
+    if (d.presets && d.presets.saved && window.LEDWall && window.LEDWall.applySavedPresets) {
+      inst.savedPresets = window.LEDWall.applySavedPresets(d.presets.saved);
+      applied = true;
+    }
+    // A frame is the document's word on the look, but the page writes a preset to that document
+    // as it applies it. Applying a frame that was in flight while that write landed would put the
+    // pre-load values straight back, so a load marks the window and the look is skipped until it
+    // closes — by then the document carries the preset and its own frame is the one applied.
+    var loadingPreset = inst.presetLoadingUntil && Date.now() < inst.presetLoadingUntil;
+    // The picture's geometry is the server's (it read the file's real dimensions): the engine
+    // needs it to draw the picture at its own proportions, and it arrives on every state frame,
+    // so a placement restored from a preset has the same aspect as a fresh upload. Assigned
+    // outside the `look` branch: a frame that carries geometry but no look (an upload that only
+    // moved the revision) still has to reach the shader, or the picture is drawn at the wall's
+    // aspect until the next settings change.
+    if (d.imageGeometry && typeof d.imageGeometry === 'object') inst.imageGeometry = d.imageGeometry;
+    if (d.look && typeof d.look === 'object' && !loadingPreset) {
+      inst.setSettings(d.look, { source: 'server' });
+      applied = true;
+    }
+    // `fence` is a whole-cell window from the server, or null when the wall is whole. Both
+    // cases are handed over: a null is how the pane turns the window off.
+    if (inst.setFence && Object.prototype.hasOwnProperty.call(d, 'fence')) {
+      inst.setFence(d.fence || null);
+      applied = true;
+    }
+    return applied;
+  };
   if (window.LEDWALL_SERVER_MODE) {
-    // `setSettings` merges over the engine defaults, so a look is applied as the *whole* look:
-    // a key the operator set back to its default must land too, or the page keeps the old one.
-    var applyLook = function (d) {
-      if (!d) return false;
-      var applied = false;
-      if (d.look && typeof d.look === 'object') { inst.setSettings(d.look, { source: 'server' }); applied = true; }
-      // `fence` is a whole-cell window from the server, or null when the wall is whole. Both
-      // cases are handed over: a null is how the pane turns the window off.
-      if (inst.setFence && Object.prototype.hasOwnProperty.call(d, 'fence')) {
-        inst.setFence(d.fence || null);
-        applied = true;
-      }
-      return applied;
-    };
     fetch('/api/wall/render', { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (body) { applyLook(body && body.settings); })
       .catch(function () { /* keep rendering the URL look */ });
     window.addEventListener('ledwall:server-settings', function (ev) { applyLook(ev && ev.detail); });
   }
+  // Re-apply the server's look on demand: the same path a `state.snapshot` frame takes. The
+  // picture probe steps frames by hand, so the SSE handler cannot run between two writes.
+  inst.reapplyServerLook = function () {
+    return fetch('/api/wall/render', { headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (body) { applyLook(body && body.settings); return true; });
+  };
   // A duration timer must not outlive the page: cancel it before the reload
   // from the admin UI's `reload` command tears the document down.
   if (window.addEventListener) {

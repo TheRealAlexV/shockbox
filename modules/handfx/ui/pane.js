@@ -17,7 +17,7 @@
 //
 // The pane lives off the shell's own tokens (public/src/shell.css) and a small pane.css.
 
-import { el, clear, actionButton } from '/src/ui.js';
+import { el, frag, clear, actionButton } from '/src/ui.js';
 import { syntheticHands } from '../pages/js/engine/tracker.js';
 import { classify as classifyPose, Motion } from '../pages/js/engine/gestures.js';
 import { EFFECTS as ENGINE_EFFECTS } from '../pages/js/engine/fx.js';
@@ -172,7 +172,35 @@ export async function render(container, ctx) {
 
   function registry() {
     const served = (s.status && s.status.effects) || [];
-    return served.map((e) => ({ ...e, known: KNOWN.has(e.id), skin: e.id === 'shoot' }));
+    return served.map((e) => {
+      const id = effectId(e);
+      return { ...e, id, known: KNOWN.has(id), skin: id === 'shoot' };
+    });
+  }
+
+  /**
+   * One registry entry's id. `/status` serves objects (`{ id, title, gesture, from }`); the
+   * `Object.keys(FX)` shape a bare engine would give is a plain string, so read both and never
+   * render `undefined` into a row. An entry with neither is not an effect and is dropped.
+   */
+  function effectId(e) {
+    if (typeof e === 'string') return e;
+    return (e && (e.id || e.name)) || null;
+  }
+
+  /**
+   * What a row is called. The pane never invents a name: the registry's `title` is the engine's
+   * own (`EFFECTS[id].title` in pages/js/engine/fx.js — the same module the overlay imports). Only
+   * when a build serves ids alone does the row fall back to the id in words, and then the id
+   * itself is not repeated beside it.
+   */
+  function effectTitle(e, effect) {
+    if (e.title) return { text: String(e.title), derived: false };
+    // The engine this build carries may still know the id — ask it before spelling the id out.
+    const own = effect && ENGINE_EFFECTS[effect];
+    if (own && own.title) return { text: String(own.title), derived: false };
+    const words = String(effect).replace(/[_-]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2');
+    return { text: words.replace(/^./, (ch) => ch.toUpperCase()), derived: true };
   }
 
   /** Shoot's skin: `skins.shoot` is optional, absent means the default projectile orb. */
@@ -207,8 +235,9 @@ export async function render(container, ctx) {
   }
 
   async function toggleEffect(id) {
+    if (!id) return;
     const on = effectEnabled(id);
-    const all = registry().map((e) => e.id);
+    const all = registry().map((e) => e.id).filter(Boolean);
     let next;
     if (on) next = (s.settings.effects || []).filter((x) => x !== id);
     else next = all.filter((x) => effectEnabled(x) || x === id);
@@ -270,7 +299,6 @@ export async function render(container, ctx) {
     root.append(header(status, reg, page, enabled));
 
     if (insecure) root.append(banner(insecure, 'bad'));
-    else if (!window.crossOriginIsolated) root.append(banner('This tab is not cross-origin isolated (COOP/COEP). The overlay page is served isolated; the pane only reads status.', 'warn'));
     if (status && (!status.runtime || !status.runtime.vendored)) {
       root.append(banner('The MediaPipe runtime is not vendored. The overlay will report “model failed”; see modules/handfx/vendor/README.md.', 'bad'));
     }
@@ -455,16 +483,24 @@ export async function render(container, ctx) {
     card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Effect registry' }), el('span', { class: 'panel-hint', text: `${(s.settings.effects || []).length} in the list of ${reg.length}` })));
     const grid = el('div', { class: 'hfx-effect-grid' });
     for (const e of reg) {
+      if (!e.id) continue;
       const on = effectEnabled(e.id);
       const intensity = Number((s.settings.intensity || {})[e.id] ?? 1);
       const live = s.live.get(e.id);
+      const title = effectTitle(e, e.id);
       const tile = el('div', { class: 'hfx-effect', 'data-on': on ? 'true' : 'false', 'data-known': e.known ? 'true' : 'false' });
       const top = el('div', { class: 'hfx-effect-top' });
+      // `frag` drops the absent children; a raw `.append` is the browser's, and this browser's
+      // `Node.append` stringifies `null` into a text node — "nullnull" was exactly that: two
+      // absent pills next to every effect's name. Anything that may be absent goes through `frag`.
       top.append(
-        el('span', { class: 'hfx-effect-name', text: e.title || e.id }),
-        el('span', { class: 'hfx-effect-id mono', text: e.id }),
-        live ? el('span', { class: 'hfx-pill', 'data-tone': 'ok', text: 'live' }) : null,
-        e.known ? null : el('span', { class: 'hfx-pill', 'data-tone': 'bad', text: 'not in this build' }),
+        frag(
+          el('span', { class: 'hfx-effect-name', text: title.text }),
+          // A derived title is the id in words, so the id next to it would only repeat it.
+          title.derived ? null : el('span', { class: 'hfx-effect-id mono', text: e.id }),
+          live ? el('span', { class: 'hfx-pill', 'data-tone': 'ok', text: 'live' }) : null,
+          e.known ? null : el('span', { class: 'hfx-pill', 'data-tone': 'bad', text: 'not in this build' }),
+        ),
       );
       const mid = el('div', { class: 'hfx-effect-meta' },
         el('span', { class: 'hfx-note', text: e.gesture ? `gesture: ${e.gesture}` : '' }),

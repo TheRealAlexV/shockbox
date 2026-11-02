@@ -45,6 +45,23 @@ export function createEvents({ log }) {
     return `event: message\ndata: ${data}\n\nevent: ${typed}\ndata: ${data}\n\n`;
   }
 
+  /**
+   * The same frame for a single connection. A command is scoped to a view
+   * (`text.send` resolves to `landscape`), and that scope rides in the record — so relaying
+   * the record itself would tell a `view=landscape` client about a portrait send, and the
+   * engine keys its replay guard on `seq`, which would then skip the same command once it
+   * legitimately reached that view. The scope is transport, not content: it is stripped here.
+   */
+  function frameFor(c, ch, rec) {
+    // Downstream (the URL/query path, the overlay) reads `rec.view`; it is kept on the wire and
+    // the consumer is expected to honour it. Only a record that would otherwise be dropped is
+    // rewritten, so nothing already working changes shape.
+    if (rec.view === null || rec.view === undefined || !c.view || c.view === rec.view) return frame(ch, rec);
+    const out = { ...rec };
+    delete out.view;
+    return frame(ch, out);
+  }
+
   function write(c, text) {
     if (c.dead) return false;
     try {
@@ -74,19 +91,41 @@ export function createEvents({ log }) {
 
   /** Publish a command frame to one channel. view scopes delivery (wall has landscape|portrait). */
   function publish(channel, cmd, args = {}, view = null) {
-    // A caller that passes a pre-built frame (`{seq, cmd, args}`) is asking for that seq to be
-    // kept — the wall's own ring already numbered it. Otherwise the hub numbers it.
-    const rec = args && typeof args === 'object' && args.seq !== undefined && args.cmd !== undefined
-      ? { ...args, channel, view: args.view === undefined ? view : args.view }
-      : { seq: nextSeq(channel), channel, cmd, args, view };
+    // A caller that passes a pre-built frame is asking for that frame to be kept — the wall's
+    // own ring already numbered it. That is decided by what it passed THROUGH `args`, never by
+    // keys on the payload itself: a `text.send` whose item happened to carry `cmd`/`seq` would
+    // otherwise be mistaken for a frame and dropped into the ring with no seq at all, so it was
+    // never written to any client (2026-11-01: every payload command vanished from the SSE bus
+    // while bare commands like `pattern.next` still arrived).
+    const isFrame = cmd === null || cmd === undefined ||
+      (args && typeof args === 'object' && 'cmd' in args && 'seq' in args);
+    // `view` is a DELIVERY SCOPE on the transport, never a field of the payload: the wall's own
+    // ring already put `view: 'both'` inside `args`, and copying that back onto the record made
+    // every client with a concrete view drop the frame (2026-11-01 — every `text.send`,
+    // including a portraited one, vanished between the wall and both render pages).
+    const hasViewArg = args && typeof args === 'object' && 'view' in args;
+    let scopedArgs = args;
+    if (hasViewArg && args.view === 'both') {
+      scopedArgs = { ...args };
+      delete scopedArgs.view;
+    }
+    const rec = isFrame && args && typeof args === 'object'
+      ? { ...args, channel, view: view || null }
+      : { seq: nextSeq(channel), channel, cmd, args: scopedArgs, view: view || null };
+    // One assignment, logged so a frame that never reaches a client can be traced from the
+    // server log rather than inferred from a blank bus.
+    if (process.env.SHOCKBOX_DEBUG_EVENTS) log.info(`publish ${channel} ${JSON.stringify(rec).slice(0, 200)}`);
     if (rec.seq === undefined || rec.seq === null) rec.seq = nextSeq(channel);
     const r = ring(channel);
     r.push(rec);
     if (r.length > RING_MAX) r.shift();
+    // `both` is not a page view: a record scoped to both must reach the landscape page and
+    // the portrait page, or a deck press that means "everywhere" reaches nowhere.
+    const scope = view && view !== 'both' ? view : null;
     for (const c of clients.values()) {
       if (!c.channels.has(channel)) continue;
-      if (view && c.view && c.view !== view) continue;
-      write(c, frame(channel, rec));
+      if (scope && c.view && c.view !== scope) continue;
+      write(c, frameFor(c, channel, rec));
     }
     for (const fn of subs.get(`${channel}|${view || ''}`) || []) {
       try {
@@ -138,10 +177,13 @@ export function createEvents({ log }) {
    */
   function latest(channel, cmd, args = {}, view = null) {
     const rec = { seq: seqByChannel.get(channel) || 0, channel, cmd, args, view, latest: true };
+    // `both` is not a page view: a record scoped to both must reach the landscape page and
+    // the portrait page, or a deck press that means "everywhere" reaches nowhere.
+    const scope = view && view !== 'both' ? view : null;
     for (const c of clients.values()) {
       if (!c.channels.has(channel)) continue;
-      if (view && c.view && c.view !== view) continue;
-      write(c, frame(channel, rec));
+      if (scope && c.view && c.view !== scope) continue;
+      write(c, frameFor(c, channel, rec));
     }
     for (const fn of subs.get(`${channel}|${view || ''}`) || []) {
       try {
@@ -207,7 +249,7 @@ export function createEvents({ log }) {
         if (from !== null && rec.seq <= from) continue;
         if (from === null && i < start) continue;
         if (rec.view && view && rec.view !== view) continue;
-        if (!write(c, frame(ch, rec))) break;
+        if (!write(c, frameFor(c, ch, rec))) break;
       }
     }
     log.info(`sse client #${c.id} ${[...c.channels]} view=${view || '*'} from ${c.remote}`);

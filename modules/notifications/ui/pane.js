@@ -22,11 +22,14 @@
 import { el, clear, dot, actionButton, fmtAgo, every } from '/src/ui.js';
 import { toast } from '/src/toast.js';
 import { renderSettingsForm } from '/src/settings-form.js';
+import { mountQuickSend } from '/src/quicksend.js';
+import { mountSchedulePanel } from '/src/schedule-panel.js';
+import { mountPreview } from '/src/preview.js';
 
 /* The canvas the module lays out in (modules/notifications/state.mjs CANVAS_W/H). */
 const CANVAS_W = 405;
 const CANVAS_H = 720;
-const MAX_STACK = 7; // the module's capacity; the preview's own ruler is drawn to it
+const MAX_STACK = 7; // the module's capacity; a full stack is reported at capacity
 
 const LOOKS = {
   ios: 'iOS',
@@ -158,66 +161,66 @@ export async function render(container, ctx) {
     stormBtn.title = stormModeId === 'fill' ? 'Spawn one of every storm-eligible message' : `Spawn ${stormCount} random toasts`;
   }
 
-  /* --- pool picker: send one exact message ------------------------------- */
-
-  const poolSelect = el('select', { class: 'input nt-select', 'aria-label': 'Message' });
-  const poolSendBtn = actionButton({
-    label: 'Send',
-    run: () => {
-      const id = poolSelect.value;
-      if (!id) throw new Error('pick a message first');
-      return api.post('/api/notifications/live', { poolId: id });
-    },
-    onDone: () => toast('message sent', 'ok'),
-    onError: (err) => toast(`send failed: ${err.message}`, 'error'),
-  });
-  const poolPanel = el('section', { class: 'panel nt-send' },
-    el('div', { class: 'panel-head' },
-      el('span', { class: 'panel-title', text: 'Send a message' }),
-      el('span', { class: 'panel-hint mono dim', text: 'from the notifications pool' }),
-    ),
-    el('div', { class: 'nt-send-body' }, poolSelect, poolSendBtn),
-  );
+  /* --- pool ---- The message pool is reached through the quick-send box at the top of the page:
+     one picker, searchable and tag-filterable, instead of a second <select> here. ------------- */
 
   function paintPool() {
-    const current = poolSelect.value;
-    clear(poolSelect);
-    poolSelect.appendChild(el('option', { value: '', text: pool.length ? 'Pick a message…' : 'pool is empty' }));
-    for (const m of pool) {
-      const label = m.title ? `${m.title} — ${m.text}` : m.text;
-      poolSelect.appendChild(el('option', { value: m.id, text: label.length > 90 ? `${label.slice(0, 89)}…` : label }));
-    }
-    // keep the operator's pick across a refresh when the message still exists
-    if (current && pool.some((m) => m.id === current)) poolSelect.value = current;
-    poolSendBtn.disabled = !pool.length;
+    // the pool list still feeds the box (it renders its own copy); nothing local to repaint
+    quickBox.refresh().catch(() => {});
   }
 
-  /* --- preview: the phone strip ------------------------------------------ */
+  /* --- preview: the shared preview component ------------------------------
+     One 16:9 stage with the module's own 9:16 window inside it, the same shape every
+     other module's preview has. The live toasts are drawn on the layer, which is a
+     405×720 canvas in the overlay's real coordinate space, scaled into the window. */
 
   const stackOut = el('span', { class: 'nt-stack-count mono', text: '0 / 0' });
-  const stage = el('div', { class: 'nt-stage' });
-  const strip = el('div', { class: 'nt-strip' }); // the 405×720 canvas, scaled by CSS
-  const ruler = el('div', { class: 'nt-ruler', 'aria-hidden': 'true' });
-  const emptyNote = el('div', { class: 'nt-empty' },
-    el('span', { class: 'nt-empty-mark' }),
-    el('span', { text: 'no toasts on the strip' }),
-  );
-  strip.append(ruler, emptyNote);
-  stage.append(strip);
+  const previewHost = el('div', { class: 'nt-preview-host' });
+  const pv = mountPreview(previewHost, { title: 'Notification overlay', hint: '9:16 · live', windowed: true });
+
+  // the layer: the overlay canvas at its own px size, scaled to the window's lit width
+  const layerIn = el('div', { class: 'nt-layer' });
+  layerIn.style.width = `${CANVAS_W}px`;
+  layerIn.style.height = `${CANVAS_H}px`;
+  const strip = layerIn; // the 405×720 canvas the toasts are absolutely placed in
+  pv.setLayer(layerIn);
+  const emptyNote = el('div', { class: 'nt-empty' }, el('span', { text: 'no toasts on the strip' }));
+  strip.appendChild(emptyNote);
+
+  // A flat dark stage, not the LED wall's gradient: this is a phone strip, not a wall.
+  // setLook(null) would fall back to the wall palette, so a one-colour palette is passed.
+  try { pv.setLook?.({ palette: ['#101014', '#101014', '#101014'], brightness: 0, saturation: 0, speed: 1 }); } catch { /* the look is optional */ }
+  pv.setFenceVisible?.(true);
+  pv.setFence?.({ x: (2560 - 405) / 2 / 2560, y: 0, w: 405 / 2560 });
+
+  // The component sizes the window to the wall crop and publishes its lit width on the window;
+  // the layer keeps 405×720 stage px and is scaled down into it, so every number inside the
+  // layer is a real strip px.
+  function fitLayer() {
+    const rect = pv.window?.getBoundingClientRect?.();
+    const published = parseFloat(pv.window?.style?.getPropertyValue('--pv-lit-w')) || 0;
+    const w = published || rect?.width || 0;
+    const k = w > 0 ? w / CANVAS_W : 1;
+    layerIn.style.transform = k === 1 ? 'none' : `scale(${k})`;
+    return k;
+  }
+  fitLayer();
+  try {
+    const ro = new ResizeObserver(() => fitLayer());
+    ro.observe(pv.window);
+    timers.push(() => ro.disconnect());
+  } catch { /* older engines: the one-shot fit above is enough */ }
 
   const previewMode = el('span', { class: 'nt-mode' });
   const previewPanel = el('section', { class: 'panel nt-preview' },
     el('div', { class: 'panel-head' },
-      el('span', { class: 'panel-title', text: 'Phone strip' }),
+      el('span', { class: 'panel-title', text: 'Notification window' }),
       stackOut,
       previewMode,
-      el('span', { class: 'panel-hint mono dim', text: '405 × 720 · live' }),
+      el('span', { class: 'panel-hint mono dim', text: `${CANVAS_W} × ${CANVAS_H} · live` }),
     ),
-    stage,
+    previewHost,
   );
-
-  // ruler: one tick per stack slot, so "used / capacity" has a shape, not just a number
-  for (let i = 0; i < MAX_STACK; i++) ruler.appendChild(el('span', { class: 'nt-ruler-tick', dataset: { i } }));
 
   function lookClass(style) {
     const key = String(style || 'ios').toLowerCase();
@@ -264,18 +267,14 @@ export async function render(container, ctx) {
   function paintPreview() {
     const styleKey = String(settingsMeta.style?.value || 'ios');
     const height = Number(settingsMeta.height?.value) || 76;
-    // One class on the strip repaints every toast's look; the module also does this per row.
-    strip.className = `nt-strip ${lookClass(styleKey)}`;
+    // One class on the layer repaints every toast's look; the module also does this per row.
+    strip.className = `nt-layer ${lookClass(styleKey)}`;
     strip.style.setProperty('--nt-h', `${height}px`);
     strip.dataset.style = styleKey;
     previewMode.textContent = LOOKS[styleKey] || styleKey;
     previewMode.dataset.look = styleKey;
-    // the ruler is the server's capacity, not a guess
+    // the server's capacity, not a guess
     const capacity = Math.max(1, Number(stack?.capacity) || MAX_STACK);
-    for (const tick of ruler.children) {
-      const on = Number(tick.dataset.i) < capacity;
-      tick.hidden = !on;
-    }
     const rev = seqRev;
     const shown = [...live].sort((a, b) => (a.born || 0) - (b.born || 0));
     for (const node of [...strip.querySelectorAll('.toast')]) node.remove();
@@ -287,6 +286,7 @@ export async function render(container, ctx) {
     stackOut.textContent = `${stack?.used ?? shown.length} / ${capacity}`;
     stackOut.dataset.state = (stack?.used ?? shown.length) >= capacity ? 'full' : 'ok';
     strip.dataset.rev = String(rev);
+    fitLayer();
   }
 
   function cssId(id) {
@@ -356,7 +356,6 @@ export async function render(container, ctx) {
     el('div', { class: 'nt-main' },
       previewPanel,
       stormPanel,
-      poolPanel,
       settingsSlot,
     ),
     el('aside', { class: 'nt-side' },
@@ -368,8 +367,28 @@ export async function render(container, ctx) {
     ),
   );
 
+  // Quick send sits above everything: the common action on this page is "make a toast happen",
+  // and the old pool panel buried it below the preview.
+  const quickSlot = el('div', { class: 'qs-slot' });
+  const quickBox = mountQuickSend(quickSlot, {
+    title: 'Quick send',
+    api,
+    poolId: 'notifications',
+    kinds: ['notification'],
+    placeholder: 'Show a notification on the strip…',
+    allowEmpty: true,
+    allowRandom: true,
+    onSend: (p) => api.post('/api/notifications/live', p.text ? { text: p.text, title: p.title || undefined } : { poolId: p.poolId }),
+    onSchedule: (p) => api.post('/api/schedules', { module: 'notifications', at: p.at, payload: p.text ? { text: p.text, title: p.title || undefined } : { poolId: p.poolId } }),
+    onSave: (p) => api.post('/api/pool/notifications/messages', { text: p.text, title: p.title || undefined, kind: 'notification' }),
+    signal: ctx.signal,
+  });
+
   clear(container);
-  container.append(header, controlBar, body);
+  const schedSlot = el('div', { class: 'sch-slot' });
+  mountSchedulePanel(schedSlot, { module: 'notifications', api, title: 'Scheduled notifications', signal: ctx.signal });
+
+  container.append(header, quickSlot, schedSlot, controlBar, body);
 
   /* ---------------------------------------------------------------- data */
 

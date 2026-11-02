@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "ShockBox — one served app, plugin modules for OBS stream features (LED wall, notifications, alerts, hand FX).",
+  "description": "ShockBox \u2014 one served app, plugin modules for OBS stream features (LED wall, notifications, alerts, hand FX).",
   "license": "PolyForm-Noncommercial-1.0.0",
   "engines": {
     "node": ">=22"
@@ -11,12 +11,16 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "node server.mjs --port 8973 --state ./state-dev",
-    "test": "node test/log-rotation.mjs && node test/ratio.mjs && node test/ratio-commands.mjs && node test/api-smoke.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs && node test/wall-browser.mjs && node test/handfx-browser.mjs && node test/panes-notify-dialogs.mjs && node test/sound.mjs",
+    "test": "node test/log-rotation.mjs && node test/ratio.mjs && node test/ratio-commands.mjs && node test/schedule.mjs && node test/schedule-delivery.mjs && node test/api-smoke.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs && node test/wall-browser.mjs && node test/handfx-browser.mjs && node test/panes-notify-dialogs.mjs && node test/sound.mjs && node test/merged-preview.mjs && node test/schedule-ui-browser.mjs",
     "test:ci": "npm test && node test/handfx-visual.mjs",
     "test:wall": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs",
     "test:handfx": "node test/handfx-browser.mjs",
     "test:handfx-visual": "node test/handfx-visual.mjs",
     "test:handfx-visual:strict": "node test/handfx-visual.mjs --strict",
-    "test:sound": "node test/sound.mjs"
+    "test:sound": "node test/sound.mjs",
+    "test:schedule": "node test/schedule.mjs",
+    "test:schedule-delivery": "node test/schedule-delivery.mjs",
+    "test:schedule-ui": "node test/schedule-ui-browser.mjs",
+    "test:merged": "node test/merged-preview.mjs"
   }
 }
