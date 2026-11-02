@@ -271,28 +271,35 @@ function isPicture(c) {
   return hi > 90 && hi - lo > 55;
 }
 
-/** Bounding box of the picture on the wall, as plain numbers (or null when nothing lit). */
 /**
- * The lit rectangle on a dedressed wall (pattern off). On/off differencing is not usable here —
- * the pattern itself is animated, so two frames differ everywhere — so the picture is measured as
- * "cells that carry colour at all" with the blackout pattern in force. Returns
- * `{minC,minR,maxC,maxR,w,h,mass}` so callers can compare boxes, not just stringify them.
+ * The picture's footprint: the cells that move when the layer is toggled, in cells.
+ *
+ * A brightness floor cannot find it. The neonwave pattern's own emitter gradient clears any
+ * sensible floor nearly everywhere, so "box of the bright cells" is the box of the whole wall and
+ * can never show a resize. `blackout` cannot find it either: grade.js applies it to the composited
+ * frame and the picture is already baked into that frame (engine.js:355), so blacking out darkens
+ * the picture with everything else.
+ *
+ * Differencing is the one measurement the pattern cannot fake. Inside the box the picture replaces
+ * the cell content outright, so those cells move by a whole colour step; outside it they only
+ * drift with the pattern, which the caller holds on a slow ramp. The tolerance is wide enough to
+ * ignore that drift and narrow enough to keep a full colour swap.
  */
-function litBox(grid) {
-  if (!grid) return null;
-  const { cols, rows, cells } = grid;
-  let minC = cols, minR = rows, maxC = -1, maxR = -1, mass = 0;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const q = cells[r * cols + c];
-      if (q[0] + q[1] + q[2] < 24) continue;
-      mass++;
-      if (c < minC) minC = c;
-      if (c > maxC) maxC = c;
-      if (r < minR) minR = r;
-      if (r > maxR) maxR = r;
-    }
-  }
+function changedBox(on, off, tol = 60) {
+  if (!on || !off || on.cells.length !== off.cells.length) return null;
+  const cols = on.cols;
+  let minC = cols, maxC = -1, minR = on.rows, maxR = -1, mass = 0;
+  on.cells.forEach((a, k) => {
+    const b = off.cells[k];
+    if (Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]) <= tol) return;
+    const r = Math.floor(k / cols);
+    const c = k % cols;
+    mass++;
+    if (c < minC) minC = c;
+    if (c > maxC) maxC = c;
+    if (r < minR) minR = r;
+    if (r > maxR) maxR = r;
+  });
   if (maxC < 0) return null;
   return { minC, minR, maxC, maxR, w: maxC - minC + 1, h: maxR - minR + 1, mass };
 }
@@ -402,10 +409,27 @@ async function main() {
   };
   const render = () => fetch(`${srv.url}/api/wall/render`).then((r) => r.json());
 
+  /**
+   * The frame now, and the same frame with the picture layer off, at the current placement. The
+   * pair is what `changedBox` needs: only the picture's own cells move between the two, and the
+   * layer is left on so the caller's next measurement sees the wall it expects.
+   */
+  const picturePair = async () => {
+    const on = await readGrid(c);
+    await patch({ imageOn: 0 });
+    await sleep(600);
+    const off = await readGrid(c);
+    await patch({ imageOn: 1 });
+    await sleep(600);
+    return { on, off };
+  };
+
   try {
-    // Start from a known wall: whole 16:9, no pattern motion that would fight the picture, a
-    // slow ramp so a cell does not change colour between two reads.
-    await patch({ ratio: '16:9', speed: 0.1, persistence: 0, streakOpacity: 0, bloom: 0, imageOn: 0, imageRev: 0 });
+    // Start from a known wall: whole 16:9, a SMOOTH pattern (the default `random` re-fires cells
+    // every frame, and that flicker is larger than the picture's own step, which swamps the
+    // on/off differencing below), no motion that would fight the picture, a slow ramp so a cell
+    // does not change colour between two reads.
+    await patch({ ratio: '16:9', pattern: 'wave', speed: 0.1, persistence: 0, streakOpacity: 0, bloom: 0, imageOn: 0, imageRev: 0 });
 
     await c.send('Page.navigate', { url: `${srv.url}/wall/render` });
     const mounted = await waitFor(c, 'Boolean(window.LEDWALL_INSTANCE && window.LEDWALL_INSTANCE.gl)');
@@ -471,13 +495,15 @@ async function main() {
       changed > 300 && changed / (gridOn.cols * gridOn.rows) > 0.2,
       `${changed} of ${gridOn.cols * gridOn.rows} cells changed when the layer went off ` +
       `(${onRed} -> ${offCount} hot, ${litCells(gridOn)} lit vs ${litCells(gridOff)} lit)`);
-    await patch({ imageOn: 1 });
+    await patch({ imageOn: 1, imageScale: 0.6 });
     await sleep(700);
     const grid2 = await readGrid(c);
     ok('display: it comes back when the layer is switched on again', Boolean(grid2) && count(grid2, isPicture) > 300,
       `${grid2 ? count(grid2, isPicture) : -1} hot picture cells`);
-    // this is the frame every later measurement compares against
-    const base = await readGrid(c);
+    // This is the frame every later measurement compares against. `imageScale` is pinned so the
+    // box has a known, checkable size, and the pair gives the footprint the floor cannot.
+    const { on: base, off: baseOff } = await picturePair();
+    const bigBox = changedBox(base, baseOff);
 
     // ── 3. transform: move, resize, rotate each move the pixels ──────────
     // The picture box on the preview writes these same keys through settings.patch, so proving
@@ -486,23 +512,21 @@ async function main() {
     await sleep(700);
     const gridMoved = await readGrid(c);
     ok('transform: a position patch moves the lit rectangle', diffCells(base, gridMoved) > 50,
-      `${diffCells(base, gridMoved)} of ${base.cells.length} cells changed; box now ${boxText(litBox(gridMoved))} (was ${boxText(litBox(base))})`);
+      `${diffCells(base, gridMoved)} of ${base.cells.length} cells changed`);
 
-    const zoomed = await patch({ imageX: 0.5, imageY: 0.5, imageScale: 0.3 });
+    await patch({ imageX: 0.5, imageY: 0.5, imageScale: 0.3 });
     await sleep(700);
-    const gridZoomed = await readGrid(c);
-    const smallBox = litBox(gridZoomed);
-    const bigBox = litBox(base);
+    const { on: gridZoomed, off: zoomedOff } = await picturePair();
+    const smallBox = changedBox(gridZoomed, zoomedOff);
     ok('transform: a scale patch resizes the lit rectangle',
       Boolean(smallBox && bigBox && smallBox.w < bigBox.w * 0.8 && smallBox.h < bigBox.h * 0.9),
-      `scale 0.6 → ${bigBox ? bigBox.w + '×' + bigBox.h : 'none'} cells, ` +
-      `scale 0.3 → ${smallBox ? smallBox.w + '×' + smallBox.h : 'none'} cells`);
+      `scale 0.6 → ${boxText(bigBox)}, scale 0.3 → ${boxText(smallBox)}`);
 
     await patch({ imageScale: 0.6 });
     await sleep(700);
     const gridRot = await patch({ imageRotate: 45 }).then(() => sleep(800)).then(() => readGrid(c));
     ok('transform: a rotation patch turns the rectangle', diffCells(grid2, gridRot) > 50,
-      `${diffCells(grid2, gridRot)} cells changed at 45°, box ${boxText(litBox(gridRot))}`);
+      `${diffCells(grid2, gridRot)} cells changed at 45°`);
     await patch({ imageRotate: 0 });
     await sleep(700);
 
@@ -614,7 +638,7 @@ async function main() {
     await sleep(900);
     const gridReload = await readGrid(c);
     ok('preset: a reload draws the restored placement on the wall', Boolean(remounted) && diffCells(gridRot, gridReload) > 20,
-      `${diffCells(gridRot, gridReload)} cells differ from the 45° frame; box ${boxText(litBox(gridReload))}`);
+      `${diffCells(gridRot, gridReload)} cells differ from the 45° frame`);
   } finally {
     c.close();
     stopChrome();
