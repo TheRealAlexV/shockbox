@@ -381,21 +381,21 @@ export function mountMergedColumn(host, opts = {}) {
     const slot = el('div', { class: 'pv-slot mp-slot', 'data-module': m.id, tabindex: '0', role: 'group' }, label, body);
     slot.style.setProperty('--mp-id', String(['--accent', '--ok', '--warn', '--info'].indexOf('') || 0));
 
-    // Clicking the slot selects the module: its chip presses, its controls show, and it becomes
-    // the one a keyboard Enter acts on. A second click on the selected slot is the module's own
-    // primary action (send / fire), so watching and driving are one gesture apart.
+    // Clicking the slot selects the module: its chip presses and its controls show. The action
+    // itself comes only from those controls — a click anywhere in the selected slot used to
+    // spawn(), so tapping an alert to dismiss it created another one.
     slot.addEventListener('click', (e) => {
       if (e.target.closest('.mp-controls')) return; // the controls act for themselves
-      if (selected === m.id) slotAction(m.id);
-      else select(m.id);
+      select(m.id);
     });
-    slot.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        if (e.target !== slot) return;
-        e.preventDefault();
-        if (selected === m.id) slotAction(m.id);
-        else select(m.id);
-      }
+    // Enter/Space selects too, from the label the keyboard can focus. It never fires an action,
+    // and never repeats: holding the key must not spawn anything twice.
+    label.tabIndex = 0;
+    label.addEventListener('keydown', (e) => {
+      if (e.repeat) return;
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      select(m.id);
     });
 
     // The per-module controls: reusing what each module already exposes means sending the same
@@ -498,9 +498,13 @@ export function mountMergedColumn(host, opts = {}) {
 
   /**
    * The module's primary action from the merged view: exactly the request its own pane makes.
-   * `slotAction` is the "click the selected slot again" gesture; `act` is the button's.
+   * Called by the slot's controls and by nothing else, one at a time.
    */
+  let busy = false;
+
   async function act(id, what) {
+    if (busy) return;
+    busy = true;
     try {
       if (id === 'wall') {
         if (what === 'pattern-next') await post('/api/wall/cmd', { cmd: 'look.pattern', args: { delta: 1 } });
@@ -514,10 +518,10 @@ export function mountMergedColumn(host, opts = {}) {
           await post('/api/wall/cmd', { cmd: on ? 'blackout.off' : 'blackout.on' });
         }
       } else if (id === 'dialogs') {
-        if (what === 'send') await post('/api/dialogs/live', {});
+        if (what === 'send') await post('/api/dialogs/live', { origin: 'merged' });
         else if (what === 'clear') await del('/api/dialogs/live');
       } else if (id === 'notifications') {
-        if (what === 'send') await post('/api/notifications/live', {});
+        if (what === 'send') await post('/api/notifications/live', { origin: 'merged' });
         else if (what === 'clear') await del('/api/notifications/live');
       } else if (id === 'handfx') {
         if (what === 'effect-next') await post('/api/handfx/cmd', { cmd: 'effect.next' });
@@ -527,12 +531,9 @@ export function mountMergedColumn(host, opts = {}) {
       await load(id);
     } catch (err) {
       if (!dead()) setState(id, err.message || 'failed', 'bad');
+    } finally {
+      busy = false;
     }
-  }
-
-  async function slotAction(id) {
-    const primary = id === 'wall' ? 'pattern-next' : id === 'handfx' ? 'effect-next' : 'send';
-    await act(id, primary);
   }
 
   /** One command round trip. Returns the answer, or throws with the server's own words. */

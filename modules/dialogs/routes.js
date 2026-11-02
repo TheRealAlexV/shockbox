@@ -31,6 +31,20 @@ export default {
         ctx.log.warn(`sounds: tone "${this.settings.get('tone')}" is not in ${audio.dir.root || '(no directory)'} — it will not play`);
       }
     }
+    // Auto-close is a visual timer, so it is swept here and never persisted.
+    this.timer = setInterval(() => {
+      try {
+        const closed = this.state.sweep();
+        if (closed.length) this.push('server');
+      } catch (err) {
+        ctx.log.error(`auto-close sweep: ${err.message}`);
+      }
+    }, 400);
+    this.timer.unref?.();
+  },
+
+  dispose() {
+    clearInterval(this.timer);
   },
 
   /** The notifications module's sound store, resolved at call time (module order is mutable). */
@@ -104,6 +118,7 @@ export default {
               if (!spec) throw new HttpError(409, 'no alert message is checked for random');
             }
           }
+          if (body && body.autoCloseMs !== undefined) spec = { ...spec, autoCloseMs: body.autoCloseMs };
           const out = mod.state.spawn(spec, origin);
           if (out.error) throw new HttpError(out.code || 409, out.error);
           if (S().get('sound')) mod.events.emit('dialogs', 'sound', { sound: 'dialog', volume: S().get('volume') });

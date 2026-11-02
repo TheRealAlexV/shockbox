@@ -17,6 +17,9 @@ const MAX_W = 385;
 const CASCADE_DX = 26;
 const CASCADE_DY = 22;
 export const MAX_DIALOGS = 80;
+// A dialog nobody dismisses must not live until the cap. The request may override this, and
+// `autoCloseMs: 0` is the deliberate permanent alert.
+export const DEFAULT_AUTO_CLOSE_MS = 8000;
 
 export const TYPE_ICON = { Error: 'error', Alert: 'warning', Warning: 'warning', System: 'info', Question: 'question' };
 export const ICONS = ['error', 'warning', 'info', 'question', 'none'];
@@ -55,6 +58,7 @@ export function createDialogState({ settings, log }) {
     const h = clamp(num(spec.h, DEFAULT_H), 60, CANVAS_H);
     const { x, y } = place(w, h);
     const id = `d${++spawned}`;
+    const autoCloseMs = Math.max(0, num(spec.autoCloseMs, DEFAULT_AUTO_CLOSE_MS));
     const entity = {
       id,
       kind: 'dialog',
@@ -70,6 +74,7 @@ export function createDialogState({ settings, log }) {
       w,
       h,
       born: Date.now(),
+      autoCloseMs,
       origin,
     };
     live.set(id, entity);
@@ -106,6 +111,16 @@ export function createDialogState({ settings, log }) {
     return ids;
   }
 
+  /** Close every dialog past its lifetime; `autoCloseMs: 0` stays until it is dismissed. */
+  function sweep(now = Date.now()) {
+    const out = [];
+    for (const e of live.values()) {
+      if (e.autoCloseMs > 0 && now - e.born >= e.autoCloseMs) out.push(e.id);
+    }
+    for (const id of out) close(id, 'auto-close');
+    return out;
+  }
+
   function snapshot(origin = 'server') {
     return {
       rev,
@@ -116,5 +131,5 @@ export function createDialogState({ settings, log }) {
     };
   }
 
-  return { live, spawn, measure, close, closeAll, snapshot, get rev() { return rev; } };
+  return { live, spawn, measure, close, closeAll, sweep, snapshot, get rev() { return rev; } };
 }

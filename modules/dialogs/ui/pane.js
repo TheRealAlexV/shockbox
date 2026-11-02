@@ -71,7 +71,7 @@ export async function render(container, ctx) {
     label: 'Spawn alert',
     variant: 'btn-primary',
     title: 'Draw a random alert message from the pool',
-    run: () => api.post('/api/dialogs/live', {}),
+    run: () => api.post('/api/dialogs/live', { origin: 'pane' }),
     onDone: () => toast('alert spawned', 'ok'),
     onError: (err) => toast(`spawn failed: ${err.message}`, 'error'),
   });
@@ -79,7 +79,6 @@ export async function render(container, ctx) {
     label: 'Close all',
     variant: 'btn-danger',
     title: 'Close every live alert',
-    confirm: 'Confirm close',
     run: () => api.del('/api/dialogs/live'),
     onDone: (out) => toast(`closed ${out?.closed ?? out?.count ?? 0}`, 'ok'),
     onError: (err) => toast(`close failed: ${err.message}`, 'error'),
@@ -125,7 +124,7 @@ export async function render(container, ctx) {
   const stormBtn = actionButton({
     label: 'Storm',
     title: 'Spawn a burst',
-    run: () => api.post('/api/dialogs/live/storm', { mode: stormModeId, count: stormCount, interval: stormInterval }),
+    run: () => api.post('/api/dialogs/live/storm', { mode: stormModeId, count: stormCount, interval: stormInterval, origin: 'pane' }),
     onDone: (out) => toast(`storm: ${out?.spawned ?? 0} alert${out?.spawned === 1 ? '' : 's'}`, 'ok'),
     onError: (err) => toast(`storm failed: ${err.message}`, 'error'),
   });
@@ -160,7 +159,7 @@ export async function render(container, ctx) {
     run: () => {
       const id = poolSelect.value;
       if (!id) throw new Error('pick a message first');
-      return api.post('/api/dialogs/live', { poolId: id });
+      return api.post('/api/dialogs/live', { poolId: id, origin: 'pane' });
     },
     onDone: () => toast('alert sent', 'ok'),
     onError: (err) => toast(`send failed: ${err.message}`, 'error'),
@@ -446,8 +445,8 @@ export async function render(container, ctx) {
     placeholder: 'Pop a dialog — text, or pick from the pool…',
     allowRandom: true,
     onSend: (p) => api.post('/api/dialogs/live', p.text
-      ? { text: p.text, ...(p.title ? { title: p.title } : {}) }
-      : { poolId: p.poolId }),
+      ? { text: p.text, ...(p.title ? { title: p.title } : {}), origin: 'pane' }
+      : { poolId: p.poolId, origin: 'pane' }),
     onSchedule: (p) => api.post('/api/schedules', {
       module: 'dialogs',
       at: p.at,
