@@ -59,6 +59,9 @@ export function mountQuickSend(container, opts) {
   const NEW_POOL = '__new';
 
   const kinds = opts.kinds || ['wall'];
+  // The pane's module owns the kind: kinds[0] is its own kind (`dialog`, `notification`, `wall`);
+  // poolId is the fallback for older mounts that pass only a pool name.
+  const paneKind = kinds[0] || String(opts.poolId || '').replace(/s$/, '') || 'dialog';
   const allowEmpty = opts.allowEmpty === true;
   const allowRandom = opts.allowRandom === true;
 
@@ -264,8 +267,8 @@ export function mountQuickSend(container, opts) {
       poolSelect.value = activePool;
       return;
     }
-    // The pool takes the kind of the message on screen, so its records are grouped where they belong.
-    const kind = (selected && selected.kind) || 'dialog';
+    // The pool takes the kind of the message on screen, or the kind of the pane it was made in.
+    const kind = (selected && selected.kind) || paneKind;
     opts.api.post('/api/pools', { label, kind })
       .then((res) => {
         activePool = (res && res.pool && res.pool.id) || 'all';
