@@ -171,6 +171,20 @@ export default {
       },
       {
         method: 'PATCH',
+        path: '/live',
+        handler(req, res, url, body) {
+          // Where the alert sits on the phone strip. The show preview drags it, and the position
+          // is this state — no second store, and the OBS overlay draws the same numbers.
+          const id = (body && body.id) || url.searchParams.get('id');
+          if (!id) throw new HttpError(400, 'move: id required');
+          const moved = mod.state.move(id, body && body.x, body && body.y);
+          if (!moved) throw new HttpError(404, `unknown dialog ${id}`);
+          mod.push('control');
+          return { ok: true, dialog: moved };
+        },
+      },
+      {
+        method: 'PATCH',
         path: '/settings',
         handler(req, res, url, body) {
           // `tone` is validated against the files on disk, not a manifest enum.

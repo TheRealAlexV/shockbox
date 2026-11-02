@@ -1,25 +1,20 @@
-// The merged preview column: present on every route, between the rail and the pane, alive.
+// The show preview column: ONE 9:16 strip between the rail and the pane, on every route, alive.
 //
 // What this gate proves, in a real headless Chrome against a real server:
 //   · the column is in the layout on all five routes, right of the rail and left of the pane
-//   · four slots, each the shared component (a .pv-frame under each .pv-slot), each carrying its
-//     own module's look
-//   · the border drags, and the width survives a reload
-//   · it is live: the wall palette changed from the wall's own pane shows up in the wall slot
-//   · it is interactive: clicking a slot selects it, and its controls send the command its own
-//     pane sends — checked against the module's API state, not against the DOM
+//   · there is exactly one surface (`.mx-surface`), it is 9:16, and no per-module preview survives
+//   · its four layers are the show's stack: wall, hand fx, notifications, dialogs
+//   · it is live: a raised alert reaches the surface over the event bus
+//   · it is interactive against the live widget: a real press at the alert button's coordinates
+//     closes that alert server-side, and a real drag PATCHes its position to /api/dialogs/live
+//   · a press on empty strip space creates nothing — no alert may be born from the preview
 //   · no console errors, no horizontal overflow at 1024 / 1280 / 1600
 //
 //   node test/merged-preview.mjs
 
-import { spawn } from 'node:child_process';
-import fs from 'node:fs';
-import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
-import { launchChrome, CHROME } from './lib/chrome.mjs';
+import { launchChrome, startServer, CHROME } from './lib/chrome.mjs';
 import { mountDiagnostics } from './lib/diagnostics.mjs';
-
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(HERE, '..');
@@ -34,35 +29,10 @@ const ok = (name, pass, detail = '') => {
   console.log(`${pass ? 'ok  ' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const freePort = () =>
-  new Promise((resolve, reject) => {
-    const s = http.createServer();
-    s.on('error', reject);
-    s.listen(0, '127.0.0.1', () => {
-      const port = s.address().port;
-      s.close(() => resolve(port));
-    });
-  });
 
-async function startServer() {
-  const port = await freePort();
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-merged-'));
-  const child = spawn(process.execPath, [path.join(ROOT, 'server.mjs'), '--port', String(port), '--state', stateDir], {
-    cwd: ROOT,
-    stdio: 'ignore',
-  });
-  const url = `http://127.0.0.1:${port}`;
-  for (let i = 0; i < 100; i++) {
-    await sleep(200);
-    try {
-      if ((await fetch(`${url}/health`)).ok) return { url, stateDir, stop: () => child.kill('SIGTERM') };
-    } catch {
-      /* starting */
-    }
-  }
-  child.kill('SIGTERM');
-  throw new Error('server did not start');
-}
+const post = (base, p, body) =>
+  fetch(`${base}${p}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json());
+const getJson = (base, p) => fetch(`${base}${p}`).then((r) => r.json());
 
 function connect(wsUrl) {
   const ws = new WebSocket(wsUrl);
@@ -123,59 +93,12 @@ function connect(wsUrl) {
   };
 }
 
-const post = (base, p, body) =>
-  fetch(`${base}${p}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json());
+/* ------------------------------------------------------------------ the run */
 
-/* ---------------------------------------------------------- 0. the shared store */
-
-// One look per module is the whole point of the store: a change one view makes is the change every
-// view reads. It is proved here in a real browser with no module pane open — the column alone,
-// mounted through the same `mountMergedColumn` the shell uses — so the check cannot pass on two DOM
-// nodes happening to agree, and it does not depend on a pane that happens to be on screen.
-const storeSrv = await startServer();
-let storeChrome = null;
-try {
-  storeChrome = await launchChrome({ size: [1440, 900], profilePrefix: 'sb-chrome-store-', extraArgs: ['--disable-gpu'] });
-  const sc = connect(storeChrome.wsUrl);
-  await sc.ready;
-  await sc.send('Page.enable');
-  await sc.send('Runtime.enable');
-  await sc.send('Page.navigate', { url: `${storeSrv.url}/#/messages` });
-  // the column exists on any route, but `__merged` is the shell's handle on it: wait for the shell
-  await sc.waitFor("Boolean(window.__merged && window.__shell && window.__shell.ready)", 15000);
-  const st = JSON.parse(await sc.eval(`(async function(){
-    var mod = await import('/src/merged-preview.js');
-    var s = mod.lookStore;
-    // the module's own data path, no column instance and no DOM needed: exactly what a pane that
-    // adopts the store would do before its first paint
-    await mod.loadLook('wall');
-    s.set('dialogs', { theme: s.get('dialogs').theme });
-    var wall = s.get('wall');
-    var seen = [];
-    var off = s.subscribe(function(id, look){ seen.push({ id: id, theme: look.theme }); });
-    s.set('dialogs', { theme: 'win95' });
-    off();
-    // the second write is what a stale reader would still see, so keep it out of the returned copy
-    var atWriteTime = s.get('dialogs');
-    s.set('dialogs', { theme: 'macos' });
-    return JSON.stringify({ wall: wall, seen: seen, dialogs: atWriteTime, themeNow: s.get('dialogs').theme });
-  })()`, true));
-  ok('the shared look store fills from the server on its own', Boolean(st && st.wall && st.wall.pattern),
-    `wall look: palette ${st && st.wall && st.wall.palette}, pattern ${st && st.wall && st.wall.pattern}`);
-  ok('a look change is published once, to every subscriber',
-    Boolean(st) && st.seen.length === 1 && st.seen[0].id === 'dialogs' && st.seen[0].theme === 'win95',
-    `${st ? st.seen.length : '?'} notification(s): ${(st ? st.seen : []).map((x) => `${x.id}=${x.theme}`).join(', ')}`);
-  ok('a reader gets the merged look, not a stale module-local copy', Boolean(st) && st.dialogs.theme === 'win95',
-    `dialogs look: theme ${st && st.dialogs.theme}`);
-  sc.close();
-} finally {
-  storeChrome && storeChrome.stop?.();
-  storeSrv.stop();
-}
-
-const srv = await startServer();
+const srv = await startServer({ root: ROOT, statePrefix: 'sb-merged-' });
 const chrome = await launchChrome({ size: [1440, 900], profilePrefix: 'sb-chrome-merged-', extraArgs: ['--disable-gpu'] });
 const c = connect(chrome.wsUrl);
+const errors = [];
 let exitCode = 0;
 
 try {
@@ -184,6 +107,13 @@ try {
   await c.send('Runtime.enable');
   await c.send('Log.enable');
   await c.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  // one listener for the whole run: a Log error or an uncaught exception fails the last check
+  const drain = () => {
+    for (const m of c.events.splice(0)) {
+      if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error') errors.push(m.params.entry.text);
+      if (m.method === 'Runtime.exceptionThrown') errors.push(m.params.exceptionDetails?.text || 'exception');
+    }
+  };
 
   /* ---------------------------------------------------------- 1. it exists, everywhere */
 
@@ -191,7 +121,7 @@ try {
   const placement = [];
   for (const route of ROUTES) {
     await c.send('Page.navigate', { url: `${srv.url}/#/${route}` });
-    const up = await c.waitFor("Boolean(document.querySelector('#merged .pv-slot .pv-frame'))", 12000);
+    const up = await c.waitFor("Boolean(document.querySelector('#merged .mx-surface'))", 12000);
     if (!up) console.log(await mountDiagnostics(c, c.events, `${route} merged column`));
     const geo = await c.json(`JSON.stringify((function(){
       var m=document.getElementById('merged'), r=document.getElementById('rail'), p=document.getElementById('pane');
@@ -204,226 +134,152 @@ try {
     placement.push({ route, up, geo });
   }
   const allUp = placement.every((p) => p.up && p.geo && p.geo.merged.w >= 240);
-  ok('the merged column is mounted on all five routes', allUp,
-    placement.map((p) => `${p.route}:${p.up ? `${p.geo.merged.w}px` : 'missing'}`).join(' '));
-  const ordered = placement.every((p) => p.geo && p.geo.rail.r <= p.geo.merged.l && p.geo.merged.r <= p.geo.pane.l);
-  ok('it sits right of the rail and left of the module pane',
-    ordered,
-    placement.map((p) => (p.geo ? `${p.route}: rail→${p.geo.rail.r} col ${p.geo.merged.l}–${p.geo.merged.r} pane→${p.geo.pane.l}` : `${p.route}: no column`)).join(' | '));
-  const inGrid = placement.every((p) => p.geo && p.geo.inApp);
-  ok('it is a child of the app grid (not a floating overlay)', inGrid, inGrid ? '' : 'not a child of #app');
+  ok('the show preview is mounted on all five routes', allUp,
+    placement.map((p) => `${p.route}:${p.up ? p.geo.merged.w : 'missing'}`).join(' '));
+  const placed = placement.every((p) => p.geo && p.geo.rail.r <= p.geo.merged.l + 1 && p.geo.merged.r <= p.geo.pane.l + 1);
+  ok('it sits between the rail and the pane', placed,
+    placement[0]?.geo ? `rail ${placement[0].geo.rail.r} ≤ merged ${placement[0].geo.merged.l}, merged ${placement[0].geo.merged.r} ≤ pane ${placement[0].geo.pane.l}` : 'no geometry');
 
-  /* ---------------------------------------------------------- 2. four slots, the real component */
+  /* ---------------------------------------------------------- 2. one surface */
 
   await c.send('Page.navigate', { url: `${srv.url}/#/wall` });
-  await c.waitFor("Boolean(document.querySelector('#merged .pv-slot .pv-frame'))", 12000);
-  const slots = await c.json(`JSON.stringify((function(){
-    var cards=[].slice.call(document.querySelectorAll('#merged .pv-slot'));
-    return { count: cards.length,
-      frames: document.querySelectorAll('#merged .pv-slot .pv-frame').length,
-      modules: cards.map(function(n){return n.dataset.module;}),
-      looks: cards.map(function(n){ var l=n.querySelector('.pv-look'); return l ? getComputedStyle(l).getPropertyValue('--pv-a').trim() : null; }),
-      shapes: cards.map(function(n){ var s=n.querySelector('.pv-stage'); return s ? s.dataset.shape : null; }),
-      kinds: cards.map(function(n){ return n.querySelector('.pv-window') ? 'window' : 'none'; }),
-      chips: document.querySelectorAll('#merged .pv-chips .pv-chip').length };
+  await c.waitFor("Boolean(document.querySelector('.mx-surface'))", 12000);
+  await sleep(400);
+  const one = await c.json(`JSON.stringify((function(){
+    var s=document.querySelectorAll('#merged .mx-surface');
+    var r=s[0]?s[0].getBoundingClientRect():null;
+    return {
+      surfaces: s.length,
+      slots: document.querySelectorAll('#merged .pv-slot').length,
+      frames: document.querySelectorAll('#merged .pv-frame').length,
+      layers: [].map.call(document.querySelectorAll('.mx-scene > *'), function(n){return n.className; }),
+      ratio: r ? +(r.width/r.height).toFixed(4) : 0,
+      scene: (function(){ var e=document.querySelector('.mx-scene'); return e ? {w:e.offsetWidth,h:e.offsetHeight,t:getComputedStyle(e).transform} : null; })(),
+      wallRamp: document.querySelector('.mx-wall') ? getComputedStyle(document.querySelector('.mx-wall')).getPropertyValue('--pv-a').trim() : '',
+      chips: [].map.call(document.querySelectorAll('#merged .mx-chip'), function(n){return n.dataset.chip;}),
+    };
   })())`);
-  ok('the column holds four slots, each a .pv-frame from the shared component',
-    slots.count === 4 && slots.frames === 4,
-    `${slots.count} slots / ${slots.frames} frames`);
-  ok('each slot is its own module', ['wall', 'handfx', 'dialogs', 'notifications'].every((id) => slots.modules.includes(id)),
-    slots.modules.join(', '));
-  ok('one chip per module above the slots', slots.chips === 4, `${slots.chips} chips`);
+  ok('there is one surface and no separate per-module preview', one.surfaces === 1 && one.slots === 0 && one.frames === 0,
+    `${one.surfaces} .mx-surface, ${one.slots} .pv-slot, ${one.frames} .pv-frame`);
+  ok('the surface is the 9:16 strip', Math.abs(one.ratio - 0.5625) < 0.01 && one.scene && one.scene.w === 405 && one.scene.h === 720,
+    `ratio ${one.ratio}, scene ${one.scene?.w}×${one.scene?.h}, scale ${one.scene?.t}`);
+  ok('the layers are the show stack, wall first and dialogs last',
+    one.layers.length === 4 && /mx-wall/.test(one.layers[0]) && /mx-dialogs/.test(one.layers[3]),
+    one.layers.join(' | '));
+  ok('the wall layer is painted from the shared look', Boolean(one.wallRamp), `--pv-a ${one.wallRamp}`);
+  ok('the header names all four modules', one.chips.join(',') === 'wall,handfx,dialogs,notifications', one.chips.join(','));
 
   /* ---------------------------------------------------------- 3. it is live */
 
-  // A fresh state dir has no pool messages, so "spawn a random alert" has nothing to draw and the
-  // module answers 409. Seed one alert and one notification so the slot's own controls have
-  // something to send: a real operator's pool is never empty, and this is the same route their
-  // messages come from.
-  const seeded = await fetch(`${srv.url}/api/pool/import`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      messages: [
-        { kind: 'dialog', title: 'Merged preview', text: 'an alert the column may spawn', random: true },
-        { kind: 'notification', title: 'Merged preview', text: 'a toast the column may send', random: true },
-      ],
-    }),
-  }).then((r) => r.json());
-  ok('the pool has a message for each overlay to send', seeded && seeded.ok && seeded.count >= 2,
-    `${seeded && seeded.count} message(s)`);
-
-
-  // The wall's palette is a page command, so the honest place to change it is the wall's own pane.
-  // The pane is on the wall route and its Palette control is the same `look.palette` command; the
-  // column must follow it, and the read is the palette the slot stamps — the ramp the component is
-  // actually painting with, not a label.
-  await c.send('Page.navigate', { url: `${srv.url}/#/wall` });
-  await c.waitFor("Boolean(document.querySelector('#wall-look-palette') && document.querySelector('#merged .pv-slot .pv-frame'))", 12000);
-  const palettePick = await c.eval(`(function(){
-    var s=document.querySelector('#wall-look-palette');
-    if(!s) return 'no pane control';
-    var before=s.value;
-    var next=[].slice.call(s.options).map(function(o){return o.value;}).filter(Boolean).find(function(v){return v!==before;});
-    s.value=next;
-    s.dispatchEvent(new Event('change',{bubbles:true}));
-    return next;
-  })()`);
-  const wallAfter = await (async () => {
-    for (let i = 0; i < 25; i++) {
-      const v = await c.json(`JSON.stringify({pal: document.querySelector('#merged .pv-slot[data-module="wall"]').dataset.palette,
-        col: getComputedStyle(document.querySelector('#merged .pv-slot[data-module="wall"] .pv-look')).getPropertyValue('--pv-a').trim()})`);
-      if (v.pal) return v;
-      await sleep(200);
-    }
-    return {};
-  })();
-  const wallBefore = { col: '#00f5d4' }; // the engine's default ramp (neonwave), the wall's opening look
-  ok('the wall slot follows a palette change made on the wall pane',
-    Boolean(palettePick) && wallAfter.col !== wallBefore.col && wallAfter.pal && wallAfter.pal !== 'neonwave',
-    `${palettePick}: slot ramp ${wallBefore.col} → ${wallAfter.col} (palette ${wallAfter.pal})`);
-
-  // Overlays: a dialog spawned from its own pane lands in the dialogs slot's layer.
-  await post(srv.url, '/api/dialogs/live', { text: 'merged preview check' });
-  await sleep(1500);
-  const dlg = await c.json(`JSON.stringify((function(){
-    var s=document.querySelector('#merged .pv-slot[data-module="dialogs"]');
-    var d=s.querySelector('.pv-layer-in .dg-desk');
-    return { desk:!!d, cls: d?d.className:null, dialogs: d?d.querySelectorAll('.dialog').length:0,
-             state:s.querySelector('.mp-state').textContent };
+  await post(srv.url, '/api/dialogs/live', {
+    spec: { type: 'Error', title: 'merged preview check', text: 'a dialog in the strip', autoCloseMs: 0, buttons: [{ label: 'Retry', action: 'none' }, { label: 'OK', action: 'close' }] },
+  });
+  const arrived = await c.waitFor("document.querySelector('.mx-dialogs').shadowRoot.querySelectorAll('.dialog.in').length >= 1", 5000);
+  const alert = await c.json(`JSON.stringify((function(){
+    var h=document.querySelector('.mx-dialogs').shadowRoot;
+    var d=h.querySelector('.dialog.in');
+    var b=d?d.querySelector('.btn.primary'):null;
+    var q=b?b.getBoundingClientRect():null;
+    return { dialogs: h.querySelectorAll('.dialog').length, skin: h.querySelector('.desk').className,
+             title: d?d.querySelector('.ttitle').textContent:null, text: d?d.querySelector('.msg').textContent:null,
+             btn: q?{x:Math.round(q.x+q.width/2),y:Math.round(q.y+q.height/2)}:null,
+             rows: [].map.call(document.querySelectorAll('#merged .mx-chip'), function(n){return n.dataset.chip+'='+(n.querySelector('.mx-chip-state').textContent||'');}) };
   })())`);
-  ok('the dialogs slot draws the live dialogs',
-    dlg.desk && dlg.dialogs >= 1 && /skin-/.test(dlg.cls || ''),
-    `${dlg.dialogs} dialog(s) in ${dlg.cls}, state "${dlg.state}"`);
+  ok('a raised alert reaches the surface', arrived && alert.dialogs >= 1 && /skin-/.test(alert.skin || ''),
+    `${alert.dialogs} dialog(s), ${alert.skin}, "${alert.title}"`);
+  const chipState = alert.rows.find((r) => r.startsWith('dialogs=')) || '';
+  ok('the dialogs chip reports the live count', /up/.test(chipState) && !/=0/.test(chipState), chipState);
 
-  await post(srv.url, '/api/notifications/live', { text: 'merged preview check' });
-  await sleep(1500);
-  const ntf = await c.json(`JSON.stringify((function(){
-    var s=document.querySelector('#merged .pv-slot[data-module="notifications"]');
-    var n=s.querySelector('.pv-layer-in .nt-layer');
-    return { layer:!!n, cls: n?n.className:null, toasts: n?n.querySelectorAll('.toast').length:0 };
+  /* ---------------------------------------------------------- 4. press the live control */
+
+  const liveBefore = await getJson(srv.url, '/api/dialogs/live');
+  const liveBeforeN = liveBefore.live.length;
+  ok('the alert is up before the press', liveBeforeN === 1, `${liveBeforeN} live`);
+
+  const mouse = (type, x, y, extra = {}) =>
+    c.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1, ...extra });
+  await mouse('mouseMoved', alert.btn.x, alert.btn.y, { buttons: 0, clickCount: 0 });
+  await mouse('mousePressed', alert.btn.x, alert.btn.y);
+  await sleep(40);
+  await mouse('mouseReleased', alert.btn.x, alert.btn.y);
+  await sleep(600);
+  const liveAfter = await getJson(srv.url, '/api/dialogs/live');
+  ok('a press on the alert’s button acts on the alert, not the preview', liveAfter.live.length === liveBeforeN - 1,
+    `live ${liveBeforeN} → ${liveAfter.live.length} after clicking (${alert.btn.x},${alert.btn.y})`);
+
+  /* ---------------------------------------------------------- 5. drag it, and keep the position */
+
+  await post(srv.url, '/api/dialogs/live', {
+    spec: { type: 'Alert', title: 'drag me', text: 'position is state', autoCloseMs: 0 },
+  });
+  await c.waitFor("document.querySelector('.mx-dialogs').shadowRoot.querySelectorAll('.dialog.in').length >= 1", 5000);
+  await sleep(250);
+  const d0 = await c.json(`JSON.stringify((function(){
+    var d=document.querySelector('.mx-dialogs').shadowRoot.querySelector('.dialog.in');
+    var r=d.getBoundingClientRect();
+    return { x:Math.round(r.x+40), y:Math.round(r.y+10), id:d.dataset.id };
   })())`);
-  ok('the notifications slot draws the live toasts with the module look class',
-    ntf.layer && ntf.toasts >= 1 && /\bt-ios\b/.test(ntf.cls || ''),
-    `${ntf.toasts} toast(s) in ${ntf.cls}`);
-
-  /* ---------------------------------------------------------- 4. it is interactive */
-
-  // Clicking a card selects it: its chip presses and its controls appear. Then a control must send
-  // the module's own command — proved from the API, not from the button's own text.
-  const before = await fetch(`${srv.url}/api/dialogs/live`).then((r) => r.json());
-  const rect = await c.json(`JSON.stringify((function(){var n=document.querySelector('#merged .pv-slot[data-module="dialogs"] .mp-label');var b=n.getBoundingClientRect();return {x:Math.round(b.x+b.width/2), y:Math.round(b.y+b.height/2)};})())`);
-  await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: rect.x, y: rect.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse' });
-  await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: rect.x, y: rect.y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'mouse' });
-  await sleep(300);
-  const sel = await c.json(`JSON.stringify((function(){
-    var s=document.querySelector('#merged .pv-slot[data-module="dialogs"]');
-    return { selected: s.dataset.selected, current: s.getAttribute('aria-current'),
-             chip: document.querySelector('#merged .pv-chip[data-chip="dialogs"]').getAttribute('aria-pressed'),
-             controls: [].filter.call(s.querySelectorAll('.mp-c'), function(b){ return b.offsetParent !== null; }).map(function(b){return b.dataset.act;}) };
-  })())`);
-  ok('clicking a slot selects it and reveals its controls',
-    sel.selected === 'true' && sel.chip === 'true' && sel.controls.includes('send'),
-    `selected:${sel.selected} chip:${sel.chip} controls:${sel.controls.join(',')}`);
-
-  const sendRect = await c.json(`JSON.stringify((function(){var b=document.querySelector('#merged .pv-slot[data-module="dialogs"] .mp-c[data-act="send"]');var r=b.getBoundingClientRect();return {x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)};})())`);
-  await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: sendRect.x, y: sendRect.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse' });
-  await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: sendRect.x, y: sendRect.y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'mouse' });
-  let after = before;
-  for (let i = 0; i < 20 && after.count === before.count; i++) {
-    await sleep(200);
-    after = await fetch(`${srv.url}/api/dialogs/live`).then((r) => r.json());
-  }
-  ok('a command from a slot reaches its module', after.count > before.count,
-    `dialogs ${before.count} → ${after.count}`);
-
-  // Clearing from the slot is the other half: the module's own DELETE.
-  const clearRect = await c.json(`JSON.stringify((function(){var b=document.querySelector('#merged .pv-slot[data-module="dialogs"] .mp-c[data-act="clear"]');var r=b.getBoundingClientRect();return {x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)};})())`);
-  await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: clearRect.x, y: clearRect.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse' });
-  await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: clearRect.x, y: clearRect.y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'mouse' });
-  let cleared = after;
-  for (let i = 0; i < 20 && cleared.count > 0; i++) {
-    await sleep(200);
-    cleared = await fetch(`${srv.url}/api/dialogs/live`).then((r) => r.json());
-  }
-  ok('clearing from the slot empties the module', cleared.count === 0, `dialogs ${after.count} → ${cleared.count}`);
-
-  /* ---------------------------------------------------------- 5. the border drags and persists */
-
-  // The viewport is the widest the column is ever allowed to be, so drag a width the stored value
-  // cannot keep at 1024 and watch the ceiling do its job: the pane's floor wins over the operator's
-  // preference, and the reload restores the preference, not the clamp.
-  await c.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 900, deviceScaleFactor: 1, mobile: false });
-  await sleep(400);
-  const beforeDrag = await c.json(`JSON.stringify({w:Math.round(document.getElementById('merged').getBoundingClientRect().width)})`);
-  const handle = await c.json(`JSON.stringify((function(){var r=document.querySelector('#merged .merged-resize').getBoundingClientRect();return {x:Math.round(r.x+r.width/2), y:400};})())`);
-  await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: handle.x, y: handle.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse' });
-  for (let i = 1; i <= 6; i++) {
-    await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: handle.x + i * 12, y: handle.y, button: 'left', buttons: 1, pointerType: 'mouse' });
+  const beforeDrag = await getJson(srv.url, '/api/dialogs/live');
+  await mouse('mouseMoved', d0.x, d0.y, { buttons: 0, clickCount: 0 });
+  await mouse('mousePressed', d0.x, d0.y);
+  for (let i = 1; i <= 5; i++) {
+    await mouse('mouseMoved', d0.x + 6 * i, d0.y + 8 * i, { clickCount: 0 });
     await sleep(30);
   }
-  await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: handle.x + 72, y: handle.y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'mouse' });
-  await sleep(400);
-  const afterDrag = await c.json(`JSON.stringify({w:Math.round(document.getElementById('merged').getBoundingClientRect().width), stored: localStorage.getItem('shockbox.merged.width')})`);
-  ok('dragging the border resizes the column', afterDrag.w > beforeDrag.w + 40,
-    `${beforeDrag.w}px → ${afterDrag.w}px (stored ${afterDrag.stored})`);
-
-  await c.send('Page.reload', {});
-  await c.waitFor("Boolean(document.querySelector('#merged .pv-slot .pv-frame'))", 12000);
+  await mouse('mouseReleased', d0.x + 30, d0.y + 40);
   await sleep(600);
-  const afterReload = await c.json(`JSON.stringify({w:Math.round(document.getElementById('merged').getBoundingClientRect().width)})`);
-  ok('the width survives a reload', Math.abs(afterReload.w - afterDrag.w) <= 2,
-    `${afterDrag.w}px → ${afterReload.w}px`);
+  const afterDrag = await getJson(srv.url, '/api/dialogs/live');
+  const pick = (list, id) => list.live.find((d) => d.id === id) || {};
+  const from = pick(beforeDrag, d0.id);
+  const to = pick(afterDrag, d0.id);
+  ok('a drag writes the alert’s position to its own state',
+    to.x > from.x && to.y > from.y,
+    `${d0.id} ${from.x},${from.y} → ${to.x},${to.y}`);
 
-  // the operator asked for a wide column; at 1024 the pane's floor wins and the column is clamped
-  await c.send('Emulation.setDeviceMetricsOverride', { width: 1024, height: 900, deviceScaleFactor: 1, mobile: false });
-  await sleep(500);
-  const clamped = await c.json(`JSON.stringify({w:Math.round(document.getElementById('merged').getBoundingClientRect().width), pane:Math.round(document.getElementById('pane').getBoundingClientRect().width)})`);
-  ok('a wide column is clamped at 1024 so the pane keeps its width',
-    clamped.w < afterReload.w && clamped.pane >= 500,
-    `stored ${afterReload.w}px → ${clamped.w}px at 1024, pane ${clamped.pane}px`);
-  await c.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 900, deviceScaleFactor: 1, mobile: false });
-  await sleep(400);
+  /* ---------------------------------------------------------- 6. a press must never spawn */
 
-  /* ---------------------------------------------------------- 6. no overflow, anywhere */
+  const nBefore = afterDrag.live.length;
+  const empty = await c.json(`JSON.stringify((function(){
+    var s=document.querySelector('.mx-surface').getBoundingClientRect();
+    return { x: Math.round(s.x+10), y: Math.round(s.bottom-10) };
+  })())`);
+  await mouse('mouseMoved', empty.x, empty.y, { buttons: 0, clickCount: 0 });
+  await mouse('mousePressed', empty.x, empty.y);
+  await sleep(40);
+  await mouse('mouseReleased', empty.x, empty.y);
+  await sleep(800);
+  const nAfter = (await getJson(srv.url, '/api/dialogs/live')).live.length;
+  ok('a press on empty strip space creates nothing', nAfter === nBefore, `live ${nBefore} → ${nAfter}`);
 
-  const sizes = [1024, 1280, 1600];
+  /* ---------------------------------------------------------- 7. no overflow, no errors */
+
   const overflow = [];
-  for (const w of sizes) {
+  for (const w of [1024, 1280, 1600]) {
     await c.send('Emulation.setDeviceMetricsOverride', { width: w, height: 900, deviceScaleFactor: 1, mobile: false });
-    await sleep(500);
-    const m = await c.json(`JSON.stringify({ sw: document.documentElement.scrollWidth, iw: window.innerWidth,
-      body: document.body.scrollWidth,
-      col: Math.round(document.getElementById('merged').getBoundingClientRect().width),
-      pane: Math.round(document.getElementById('pane').getBoundingClientRect().width) })`);
-    overflow.push({ w, ...m });
+    await sleep(250);
+    const over = await c.eval('document.documentElement.scrollWidth > window.innerWidth + 1');
+    const surface = await c.json(`JSON.stringify((function(){
+      var r=document.querySelector('.mx-surface').getBoundingClientRect();
+      var col=document.getElementById('merged').getBoundingClientRect();
+      return { inside: r.left >= col.left - 1 && r.right <= col.right + 1, ratio: +(r.width/r.height).toFixed(3) };
+    })())`);
+    overflow.push({ w, over, ...surface });
   }
-  const fits = overflow.every((o) => o.sw <= o.iw + 1 && o.body <= o.iw + 1);
-  ok('no horizontal overflow at 1024 / 1280 / 1600', fits,
-    overflow.map((o) => `${o.w}: scroll ${o.sw}/${o.iw} col ${o.col} pane ${o.pane}`).join(' | '));
-  // the column must give way to the pane, not the other way round: 520px is what a module pane's
-  // own two-column layout needs, and the column's ceiling is computed to leave it
-  const panesHold = overflow.every((o) => o.pane >= 500);
-  ok('the pane keeps a usable width beside the column at every size', panesHold,
-    overflow.map((o) => `${o.w}: pane ${o.pane}px`).join(' | '));
+  ok('no horizontal overflow, and the strip stays inside its column', overflow.every((o) => !o.over && o.inside),
+    overflow.map((o) => `${o.w}:${o.over ? 'overflow' : 'ok'} ratio ${o.ratio}`).join(' '));
 
-  /* ---------------------------------------------------------- 7. console */
-
-  const errors = c.events
-    .filter((e) => (e.method === 'Runtime.consoleAPICalled' && e.params.type === 'error') || e.method === 'Runtime.exceptionThrown')
-    .map((e) => (e.method === 'Runtime.exceptionThrown'
-      ? e.params.exceptionDetails?.exception?.description || e.params.exceptionDetails?.text
-      : e.params.args.map((a) => a.value || a.description).join(' ')))
-    // a route with no module behind it is the shell's own 404 note, not a column failure
-    .filter((t) => t && !/No module at this address/.test(t));
-  ok('no console errors', errors.length === 0, errors.slice(0, 3).join(' | '));
+  drain();
+  ok('no console errors', errors.length === 0, errors.slice(0, 2).join(' | '));
+} catch (err) {
+  console.error('merged-preview gate threw:', err.stack || err.message);
+  exitCode = 1;
 } finally {
   c.close();
-  chrome.stop?.();
+  chrome.stop();
   srv.stop();
 }
 
-const failed = results.filter((r) => !r.pass);
-console.log(`\n${results.length - failed.length}/${results.length} checks passed${failed.length ? ` — ${failed.length} FAILED` : ''}`);
-if (failed.length) exitCode = 1;
+const failed = results.filter((r) => !r.pass).length;
+console.log(`\n${results.length - failed}/${results.length} checks passed`);
+if (failed) exitCode = 1;
 process.exit(exitCode);

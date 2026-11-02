@@ -97,6 +97,22 @@ export function createDialogState({ settings, log }) {
     return e;
   }
 
+  /**
+   * Where the operator put it: an alert drags in the show preview, and the position it lands on
+   * is this state. Clamped to the desk so a drag cannot put an alert off the phone strip.
+   */
+  function move(id, x, y) {
+    const e = live.get(id);
+    if (!e) return null;
+    const nx = clamp(Math.round(num(x, e.x)), 0, Math.max(0, CANVAS_W - e.w));
+    const ny = clamp(Math.round(num(y, e.y)), 0, Math.max(0, CANVAS_H - e.h));
+    if (nx === e.x && ny === e.y) return e;
+    e.x = nx;
+    e.y = ny;
+    rev++;
+    return e;
+  }
+
   function close(id, reason = 'closed') {
     if (!live.has(id)) return null;
     live.delete(id);
@@ -131,5 +147,5 @@ export function createDialogState({ settings, log }) {
     };
   }
 
-  return { live, spawn, measure, close, closeAll, sweep, snapshot, get rev() { return rev; } };
+  return { live, spawn, measure, move, close, closeAll, sweep, snapshot, get rev() { return rev; } };
 }

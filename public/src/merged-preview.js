@@ -1,13 +1,22 @@
-// The merged preview column: every module's effect side by side, in one column, on every route.
+// The show preview: ONE 9:16 strip between the rail and the pane, on every route.
 //
-// Why a column and not a second screen: the operator works one module at a time and still has to
-// see what the other three would draw right now. A tab would hide three of them; this column is
-// always there, between the rail and the pane, and its right border drags.
+// Why one surface and not four previews: the operator does not watch four modules, the operator
+// watches the show. OBS cuts a 405×720 window out of the centre of the 1280×720 wall and stacks
+// the overlays inside it; four separate previews cannot show whether an alert covers the wall's
+// focal point, and they are four places to read instead of one picture.
 //
-// What a slot is: the SAME component each module pane uses (`mountPreview`), fed by the same
-// numbers. Nothing here reimplements a module's effect. Where one module's own preview is a
-// canvas (hand fx) the canvas is moved into the slot rather than drawn a second time: the module
-// owns the pixels, this column owns the place to put them.
+// A layer is the module's own thing, not a reimplementation:
+//   wall          the shared `.pv-look` paint from preview.css, plus the wall's picture at
+//                 imageX/imageY/imageScale (the transform the engine applies), clipped to the crop
+//   hand fx       the pane's own camera canvas, mirrored — the module keeps drawing its pixels
+//   notifications the module's own markup and stylesheet inside a shadow root (405×720 native)
+//   dialogs       the same, on its 810×1440 desk shown at half scale
+// Shadow roots are what let both overlays render with the module's real chrome: their sheets style
+// `.body`, `.btn` and `.title`, which the control page also uses.
+//
+// Interaction is on the live widget: a press on a dialog's button sends the request that dialog's
+// own overlay sends, and a drag moves the dialog on the server (PATCH /api/dialogs/live). The
+// preview may close or decide an alert and may never make one — a `spawn` control renders inert.
 //
 // Data, per module, from the server (never from a module pane, which may not be mounted at all):
 //   GET /api/wall/live                  settings.look, render.look, render.presets, ratio, fence
@@ -20,8 +29,8 @@
 // module's own pane paints from when it happens to be open. That is the smallest shared-state
 // change that stops the divergence, and it leaves every module pane's own code alone.
 
-import { el, clear } from '/src/ui.js';
-import { mountPreview } from '/src/preview.js';
+import { el } from '/src/ui.js';
+import { shapeFor } from '/src/preview.js';
 
 /** The four modules, in the order the wall's own stack draws them (wall first, overlays on top). */
 export const MODULES = [
@@ -222,12 +231,76 @@ export function setLookApi(api) {
 /* ---------------------------------------------------------------- the column */
 
 /**
- * Mount the column into `host` (the shell's body, right after the rail).
+ * The strip OBS shows, in the wall's own pixels.
  *
- * @param {HTMLElement} host
- * @param {object} opts { api, bus, onSelect }
- * @returns {{ el: HTMLElement, select(id), width, destroy() }}
+ * OBS cuts a 405×720 window out of the centre of the 1280×720 wall (`V: Main Live`), and both
+ * overlays are authored against that window: notifications at 405×720, alerts on an 810×1440
+ * desk, which is the same box at 2×. The surface below IS that window — one frame, every module
+ * painted into it in the order the show stacks them — so a thing sits here where OBS draws it.
  */
+export const STRIP = { w: 405, h: 720, left: 437.5, frameW: 1280, frameH: 720 };
+
+/**
+ * The base rules for a module's layer. The module's own stylesheet is linked next to them inside
+ * a shadow root, so the layer renders with the module's real chrome and cannot leak into the
+ * control page (both modules style `.body`, `.btn`, `.title` …). The only things added are the
+ * host box and the pointer contract: the layer is click-through except on the element itself.
+ */
+const LAYER_BASE = {
+  dialogs: `
+    :host { position: absolute; inset: 0; display: block; pointer-events: none;
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            -webkit-font-smoothing: antialiased; }
+    .desk { position: absolute; inset: 0; }
+    .dialog { pointer-events: auto; cursor: grab; touch-action: none; }
+    .dialog[data-drag='true'] { transition: none; cursor: grabbing; }
+    .dialog .btn[disabled] { opacity: 0.45; }
+  `,
+  notifications: `
+    :host { position: absolute; inset: 0; display: block; pointer-events: none;
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            -webkit-font-smoothing: antialiased; }
+    .stage { position: absolute; inset: 0; overflow: hidden; }
+    .toast { pointer-events: auto; }
+    .toast .acts .btn { pointer-events: auto; }
+  `,
+};
+
+/** `el` gives a described setting either as `{value}` or raw; read both. */
+function setting(doc, key, fallback) {
+  const m = doc && doc[key];
+  if (m && typeof m === 'object' && 'value' in m) return m.value;
+  return m === undefined || m === null ? fallback : m;
+}
+
+/* The alert icons, mirrored from modules/dialogs/overlay/app.js: the module names an icon and the
+ * overlay owns the drawing, so the strip draws the same glyph it will see in OBS. */
+const ICON_PATHS = {
+  error:
+    '<circle cx="12" cy="12" r="10.4" fill="#e01b1b" stroke="#8a0000" stroke-width="1.2"/>' +
+    '<path d="M6.95 6.95 17.05 17.05 M17.05 6.95 6.95 17.05" stroke="#fff" stroke-width="3.2"/>',
+  warning:
+    '<path d="M12 2.1 22.7 21.3H1.3Z" fill="#ffd21e" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/>' +
+    '<rect x="10.9" y="7.9" width="2.2" height="7.4" fill="#111"/>' +
+    '<rect x="10.9" y="17.1" width="2.2" height="2.2" fill="#111"/>',
+  info:
+    '<circle cx="12" cy="12" r="10.4" fill="#0b57c9" stroke="#00318f" stroke-width="1.2"/>' +
+    '<rect x="10.75" y="10.3" width="2.5" height="7.6" fill="#fff"/>' +
+    '<circle cx="12" cy="6.85" r="1.75" fill="#fff"/>',
+  question:
+    '<circle cx="12" cy="12" r="10.3" fill="#fff" stroke="#0b57c9" stroke-width="2.1"/>' +
+    '<path d="M8.7 9.1a3.5 3.5 0 1 1 4.45 3.4c-.8.28-1.05.85-1.05 1.55v.75" fill="none" stroke="#0b57c9" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '<circle cx="12.05" cy="17.7" r="1.45" fill="#0b57c9"/>',
+};
+
+function iconNode(name) {
+  if (!name || name === 'none') return null;
+  const wrap = el('div', { class: 'icon' });
+  wrap.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICON_PATHS[name] || ICON_PATHS.error}</svg>`;
+  return wrap;
+}
+
+
 export function mountMergedColumn(host, opts = {}) {
   const { api, bus } = opts;
   const signal = opts.signal || new AbortController().signal;
@@ -247,8 +320,8 @@ export function mountMergedColumn(host, opts = {}) {
     }
   })();
   // The ceiling is a share of the viewport AND a floor on what the pane keeps: the pane's own
-  // two-column layout needs ~520px, so the column gives way before it does. At 1024 that is 324px,
-  // which is still two slots wide; below `NARROW_VP` the column goes to a strip and the pane wins.
+  // two-column layout needs ~520px, so the column gives way before it does. Below `NARROW_VP`
+  // the column goes to a strip and the pane wins.
   const maxW = () => {
     const vw = (typeof window !== 'undefined' && window.innerWidth) || 1440;
     const share = Math.round(vw * MAX_SHARE);
@@ -258,7 +331,7 @@ export function mountMergedColumn(host, opts = {}) {
   let width = clamp(storedW || DEFAULT_W, MIN_W, maxW());
 
   // A gate imports this module in Node to read `lookStore` and its fetch path. No DOM means no
-  // column, no slots and no painting — the store is the whole product there.
+  // column and no painting — the store is the whole product there.
   if (!hasDom()) return headlessColumn();
 
   function headlessColumn() {
@@ -298,7 +371,7 @@ export function mountMergedColumn(host, opts = {}) {
   const column = el('aside', {
     class: 'merged',
     id: 'merged',
-    'aria-label': 'Merged preview',
+    'aria-label': 'Show preview',
     'data-compact': 'false',
     // The column is a shell layout element, and it must own its width on frame one: a stylesheet
     // that has not landed yet (a cold load, a gate that navigates at once) would otherwise let the
@@ -307,14 +380,59 @@ export function mountMergedColumn(host, opts = {}) {
     style: { '--merged-w': `${width}px` },
   });
   const head = el('div', { class: 'merged-head panel-head' },
-    el('span', { class: 'panel-title', text: 'All modules' }),
-    el('span', { class: 'panel-hint mono dim merged-hint', text: 'live' }),
+    el('span', { class: 'panel-title', text: 'Show preview' }),
+    el('span', { class: 'panel-hint mono dim merged-hint', text: '9:16 · live' }),
   );
   const chips = el('div', { class: 'pv-chips merged-chips' });
   head.append(chips);
 
-  const stack = el('div', { class: 'merged-stack' });
-  const stage = el('div', { class: 'merged-stage' }, stack);
+  /* ------------------------------------------------------------ one surface */
+
+  const bodyEl = el('div', { class: 'mx-body' });
+  const surface = el('div', {
+    class: 'mx-surface',
+    role: 'group',
+    'aria-label': 'Show preview: the 9:16 strip as OBS sees it. Press an alert’s control to act on that alert; drag an alert to move it.',
+    'data-strip': `${STRIP.w}x${STRIP.h}`,
+  });
+  const scene = el('div', { class: 'mx-scene' });
+  surface.append(scene);
+
+  /* The wall, in its own 1280×720 picture space; the strip is the middle 405px of it. */
+  const wallEl = el('div', { class: 'mx-wall pv-stage', 'data-shape': 'wave' },
+    el('div', { class: 'pv-look' }),
+    el('div', { class: 'pv-dots' }),
+  );
+  const wallImg = el('img', { class: 'mx-img', alt: '', draggable: 'false' });
+  wallImg.hidden = true;
+  wallImg.addEventListener('load', () => placeWallImg());
+  wallEl.append(wallImg);
+
+  /* Hand FX draws on its own camera canvas in its own pane; the strip mirrors those pixels. */
+  const fxEl = el('div', { class: 'mx-handfx' });
+  const fxMirror = el('canvas', { class: 'mx-mirror' });
+  fxMirror.hidden = true;
+  fxEl.append(fxMirror);
+
+  function shadowLayer(cls, href, base, wrapCls) {
+    const hostEl = el('div', { class: `mx-layer ${cls}` });
+    const root = hostEl.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = base;
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    const wrap = el('div', { class: wrapCls });
+    root.append(style, link, wrap);
+    return { host: hostEl, root, wrap };
+  }
+  const nt = shadowLayer('mx-notifs', '/notify/style.css', LAYER_BASE.notifications, 'stage');
+  const dlg = shadowLayer('mx-dialogs', '/dialogs/style.css', LAYER_BASE.dialogs, 'desk skin-win11');
+
+  // stack order is the show's: wall, then hand fx, then notifications, then alerts on top
+  scene.append(wallEl, fxEl, nt.host, dlg.host);
+  bodyEl.append(surface);
+
   // The resizer is a real focusable separator: a mouse can drag it, a keyboard can nudge it, and
   // a screen reader says what it is. Its hit area is wider than its hairline.
   const resizer = el('div', {
@@ -322,16 +440,13 @@ export function mountMergedColumn(host, opts = {}) {
     role: 'separator',
     tabindex: '0',
     'aria-orientation': 'vertical',
-    'aria-label': 'Resize the merged preview column',
+    'aria-label': 'Resize the show preview column',
     title: 'Drag to resize · double-click to reset',
   });
-  const scroll = el('div', { class: 'merged-scroll' });
-  column.append(head, scroll, resizer);
-  scroll.append(stage);
+  column.append(head, bodyEl, resizer);
   // the column (`aside.merged`) IS the grid cell between the rail and <main>, so it carries no
-  // wrapper. It takes the slot the shell reserved for it — before `#main`, not after the drawer:
-  // a grid item's source order puts it in the track it lands in, and appended last it would be
-  // placed in the drawer's track and clipped to zero width.
+  // wrapper. It takes the track the shell reserved for it, before `#main`: a grid item's source
+  // order puts it in the track it lands in, and appended last it would land in the drawer's.
   const app = document.getElementById('app') || (host && host.parentElement);
   if (host && host.isConnected) host.remove();
   const mainEl = document.getElementById('main');
@@ -356,133 +471,103 @@ export function mountMergedColumn(host, opts = {}) {
         /* private mode: the width holds for this page only */
       }
     }
-    // every slot is laid out from the column, so a resize is one relayout of four frames
-    for (const slot of slots.values()) slot.pv?.layout?.();
+    fit();
+  }
+  applyWidth(width, { persist: false });
+
+  /* ------------------------------------------------------------ fit the strip */
+
+  let scale = 1;
+  /** The strip keeps its aspect; it is scaled into whatever room the column gives it. */
+  function fit() {
+    if (dead() || !bodyEl.isConnected) return;
+    const aw = bodyEl.clientWidth - 18;
+    const ah = bodyEl.clientHeight - 18;
+    if (!(aw > 40 && ah > 40)) return;
+    scale = clamp(Math.min(aw / STRIP.w, ah / STRIP.h), 0.04, 4);
+    surface.style.width = `${(STRIP.w * scale).toFixed(2)}px`;
+    surface.style.height = `${(STRIP.h * scale).toFixed(2)}px`;
+    scene.style.transform = `scale(${scale.toFixed(4)})`;
+  }
+  const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(fit) : null;
+  ro?.observe(bodyEl);
+  timers.push(() => ro?.disconnect());
+
+  /** A client point in the strip's own pixels (405×720), whatever the column's width is. */
+  function toScene(ev) {
+    const r = scene.getBoundingClientRect();
+    return { x: (ev.clientX - r.left) / scale, y: (ev.clientY - r.top) / scale };
   }
 
-  /* ------------------------------------------------------------ slots */
+  /** A module element being dragged in the strip, in strip pixels. */
+  function dragSurface(target, { onMove, onEnd }) {
+    const start = { x: 0, y: 0, moved: false };
+    target.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0 || dead()) return;
+      const id = ev.pointerId;
+      try {
+        target.setPointerCapture(id);
+      } catch {
+        /* a synthetic pointer has no capture; the window listeners below still follow it */
+      }
+      start.x = ev.clientX;
+      start.y = ev.clientY;
+      start.moved = false;
+      const move = (mv) => {
+        if (mv.pointerId !== id) return;
+        if (!start.moved && Math.hypot(mv.clientX - start.x, mv.clientY - start.y) < 3) return;
+        start.moved = true;
+        onMove(mv, toScene(mv), mv.clientX - start.x, mv.clientY - start.y);
+      };
+      const up = (uv) => {
+        if (uv.pointerId !== id) return;
+        window.removeEventListener('pointermove', move, true);
+        window.removeEventListener('pointerup', up, true);
+        window.removeEventListener('pointercancel', up, true);
+        try {
+          target.releasePointerCapture(id);
+        } catch {
+          /* already gone */
+        }
+        if (start.moved) onEnd();
+      };
+      window.addEventListener('pointermove', move, true);
+      window.addEventListener('pointerup', up, true);
+      window.addEventListener('pointercancel', up, true);
+    });
+  }
 
-  const slots = new Map();
+  /* ------------------------------------------------------------ selection */
+
   const order = opts.modules || MODULES;
+  const mods = new Map();
   let selected = null;
   // until the operator picks a module itself, the column follows the route's pane
   let picked = false;
 
-  function buildSlot(m) {
-    // The placeholder is what the slot shows until `start()` mounts the component: four wrapped
-    // component mounts on the frame the shell boots is the one thing this column must not do,
-    // and a mount before the track width is known lays out every frame twice.
-    const placeholder = el('div', { class: 'mp-pp mp-pp-pending' });
-    const body = el('div', { class: 'mp-body' }, placeholder);
-    const label = el('div', { class: 'mp-label' },
-      el('span', { class: 'mp-name mono', text: m.title }),
-      el('span', { class: 'mp-state mono dim', text: '…' }),
-    );
-    const slot = el('div', { class: 'pv-slot mp-slot', 'data-module': m.id, tabindex: '0', role: 'group' }, label, body);
-    slot.style.setProperty('--mp-id', String(['--accent', '--ok', '--warn', '--info'].indexOf('') || 0));
-
-    // Clicking the slot selects the module: its chip presses and its controls show. The action
-    // itself comes only from those controls — a click anywhere in the selected slot used to
-    // spawn(), so tapping an alert to dismiss it created another one.
-    slot.addEventListener('click', (e) => {
-      if (e.target.closest('.mp-controls')) return; // the controls act for themselves
-      select(m.id);
-    });
-    // Enter/Space selects too, from the label the keyboard can focus. It never fires an action,
-    // and never repeats: holding the key must not spawn anything twice.
-    label.tabIndex = 0;
-    label.addEventListener('keydown', (e) => {
-      if (e.repeat) return;
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      e.preventDefault();
-      select(m.id);
-    });
-
-    // The per-module controls: reusing what each module already exposes means sending the same
-    // command its pane sends, from the same API — not a second implementation of the module.
-    const controls = el('div', { class: 'mp-controls' });
-    if (m.id === 'wall') {
-      controls.append(
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'pattern-next', text: 'pattern ›', title: 'Next pattern' }),
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'palette-next', text: 'palette ›', title: 'Next palette' }),
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'blackout', text: 'blackout', title: 'Toggle blackout' }),
-      );
-    } else if (m.id === 'dialogs') {
-      controls.append(
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'send', text: 'send', title: 'Spawn a dialog' }),
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'clear', text: 'clear', title: 'Close every dialog' }),
-      );
-    } else if (m.id === 'notifications') {
-      controls.append(
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'send', text: 'send', title: 'Send a notification' }),
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'clear', text: 'clear', title: 'Clear the strip' }),
-      );
-    } else if (m.id === 'handfx') {
-      controls.append(
-        el('button', { type: 'button', class: 'btn btn-sm mp-c', 'data-act': 'effect-next', text: 'effect ›', title: 'Next effect' }),
-      );
-    }
-    for (const b of controls.children) {
-      b.addEventListener('click', (e) => {
-        e.stopPropagation();
-        select(m.id);
-        act(m.id, b.dataset.act);
-      });
-    }
-    slot.append(controls);
-
-    slots.set(m.id, { id: m.id, m, slot, pv: null, host: placeholder, state: slot.querySelector('.mp-state'), controls, data: {} });
-    stack.append(slot);
-    return slots.get(m.id);
+  for (const m of order) {
+    const stateEl = el('span', { class: 'mx-chip-state', text: '' });
+    const chip = el('button', {
+      type: 'button',
+      class: 'pv-chip mx-chip',
+      'data-chip': m.id,
+      'aria-pressed': 'false',
+      title: `${m.title} — ${m.hint}`,
+    }, el('span', { class: 'mx-chip-name', text: m.title }), stateEl);
+    chip.addEventListener('click', () => select(m.id));
+    chips.append(chip);
+    mods.set(m.id, { chip, state: stateEl, data: {} });
   }
-
-  /**
-   * The component for one slot, mounted the first time the slot is asked for. The panel's own
-   * header is removed: the chip row is the header, and a second title under it would repeat the
-   * module's name twice in a 366px card.
-   */
-  function ensurePv(s) {
-    if (s.pv) return s.pv;
-    s.pv = mountPreview(s.host, {
-      title: s.m.title,
-      hint: '',
-      interactive: false,
-      dim: 0.6,
-      // Every slot draws the wall's 16:9 picture, the 9:16 window on it and the way the stream
-      // cuts between them — that is what the operator is judging. The wall slot is not special:
-      // leaving its window out made it the one pane you could not compare against.
-      windowed: true,
-    });
-    s.pv.el.classList.add('mp-pv');
-    s.pv.el.dataset.module = s.id;
-    const pvHead = s.pv.el.querySelector('.pv-head');
-    if (pvHead && pvHead.parentElement === s.pv.el) s.pv.el.removeChild(pvHead);
-    s.pv.start();
-    return s.pv;
-  }
-
-  for (const m of order) buildSlot(m);
 
   function select(id, { notify = true, byUser = notify } = {}) {
-    if (!slots.has(id)) return;
+    if (!mods.has(id)) return;
     if (byUser) picked = true;
+    if (selected === id && notify) return undefined;
     selected = id;
-    for (const [sid, s] of slots) {
-      s.slot.dataset.selected = String(sid === id);
-      s.slot.setAttribute('aria-current', sid === id ? 'true' : 'false');
-    }
-    for (const chip of chips.children) chip.setAttribute('aria-pressed', String(chip.dataset.chip === id));
+    for (const [sid, s] of mods) s.chip.setAttribute('aria-pressed', String(sid === id));
     column.dataset.selected = id;
     // the column starts on the route's module; a person's own choice wins until they make another
     if (notify) announce(id);
-  }
-
-  /* ------------------------------------------------------------ chips */
-
-  for (const m of order) {
-    const chip = el('button', { type: 'button', class: 'pv-chip mp-chip', 'data-chip': m.id, 'aria-pressed': 'false', title: `${m.title}: click to select` }, m.title);
-    chip.addEventListener('click', () => select(m.id));
-    chips.append(chip);
   }
 
   /** What the column reports upstream: which module was picked (the shell may follow it). */
@@ -494,135 +579,339 @@ export function mountMergedColumn(host, opts = {}) {
     }
   }
 
-  /* ------------------------------------------------------------ driving a module */
+  function setState(id, text, tone = '') {
+    const s = mods.get(id);
+    if (!s) return;
+    s.state.textContent = text;
+    s.chip.dataset.tone = tone || 'ok';
+  }
 
-  /**
-   * The module's primary action from the merged view: exactly the request its own pane makes.
-   * Called by the slot's controls and by nothing else, one at a time.
-   */
-  let busy = false;
+  /* ------------------------------------------------------------ the requests */
 
-  async function act(id, what) {
-    if (busy) return;
-    busy = true;
+  const pushing = new Set();
+  /** One request per module at a time; a poll that overtakes a commit is dropped, not queued. */
+  async function send(id, path, body) {
+    if (dead() || !api) return null;
+    pushing.add(id);
     try {
-      if (id === 'wall') {
-        if (what === 'pattern-next') await post('/api/wall/cmd', { cmd: 'look.pattern', args: { delta: 1 } });
-        else if (what === 'palette-next') {
-          const out = await post('/api/wall/cmd', { cmd: 'look.palette', args: { delta: 1 } });
-          // the answer names the ramp the page applied; the store is the only place it survives
-          if (out && clean(out.palette)) lookStore.set('wall', { palette: out.palette });
-        }
-        else if (what === 'blackout') {
-          const on = lookStore.get('wall').blackout;
-          await post('/api/wall/cmd', { cmd: on ? 'blackout.off' : 'blackout.on' });
-        }
-      } else if (id === 'dialogs') {
-        if (what === 'send') await post('/api/dialogs/live', { origin: 'merged' });
-        else if (what === 'clear') await del('/api/dialogs/live');
-      } else if (id === 'notifications') {
-        if (what === 'send') await post('/api/notifications/live', { origin: 'merged' });
-        else if (what === 'clear') await del('/api/notifications/live');
-      } else if (id === 'handfx') {
-        if (what === 'effect-next') await post('/api/handfx/cmd', { cmd: 'effect.next' });
-      }
-      // one pull right away rather than waiting for the poll: the slot must show the effect the
-      // operator just fired, or the click did not visibly do anything
-      await load(id);
+      const out = await api.patch(path, body);
+      return out;
     } catch (err) {
-      if (!dead()) setState(id, err.message || 'failed', 'bad');
+      if (!dead()) setState(id, err.message || 'write failed', 'bad');
+      return null;
     } finally {
-      busy = false;
+      pushing.delete(id);
     }
   }
 
-  /** One command round trip. Returns the answer, or throws with the server's own words. */
-  async function post(path, body) {
-    return api.post(path, body);
+  /* ------------------------------------------------------------ the wall */
+
+  paintWall();
+
+  function paintWall() {
+    const look = lookStore.get('wall');
+    const pal = Array.isArray(look.palette) && look.palette.length >= 2
+      ? look.palette
+      : WALL_PALETTES[look.palette] || WALL_PALETTES[DEFAULT_PALETTE];
+    wallEl.style.setProperty('--pv-a', pal[0]);
+    wallEl.style.setProperty('--pv-b', pal[Math.min(1, pal.length - 1)]);
+    wallEl.style.setProperty('--pv-c', pal[Math.min(2, pal.length - 1)]);
+    const bright = clamp(num(look.brightness, 1), 0, 2);
+    wallEl.style.setProperty('--pv-bright', String(bright));
+    wallEl.style.setProperty('--pv-sat', String(clamp(num(look.saturation, 1), 0, 2)));
+    wallEl.style.setProperty('--pv-dur', `${clamp(18 / Math.max(0.15, num(look.speed, 1)), 4, 120)}s`);
+    wallEl.dataset.shape = shapeFor(look.pattern);
+    wallEl.dataset.blackout = String(Boolean(look.blackout));
+    wallEl.style.setProperty('--pv-dot', look.blackout ? '0.04' : String(clamp(0.25 + bright * 0.5, 0.12, 1)));
   }
-  async function del(path) {
-    return api.del(path);
+
+  let img = { on: false, rev: -1, x: 0.5, y: 0.5, scale: 0.6, rotate: 0 };
+
+  /** Where the wall's picture sits: `imageX/Y` is its centre as a fraction of the wall, and
+   *  `imageScale` its width as a fraction of the wall's width. The show's own transform. */
+  function placeWallImg() {
+    wallImg.hidden = !(img.on && img.rev >= 0);
+    if (wallImg.hidden) return;
+    const w = Math.max(1, img.scale * STRIP.frameW);
+    const ratio = wallImg.naturalWidth && wallImg.naturalHeight
+      ? wallImg.naturalWidth / wallImg.naturalHeight
+      : STRIP.frameW / STRIP.frameH;
+    const h = w / ratio;
+    wallImg.style.width = `${w}px`;
+    wallImg.style.height = `${h}px`;
+    wallImg.style.left = `${img.x * STRIP.frameW - w / 2}px`;
+    wallImg.style.top = `${img.y * STRIP.frameH - h / 2}px`;
+    wallImg.style.transform = `rotate(${img.rotate}deg)`;
+  }
+
+  /**
+   * The picture drags in the strip, in wall pixels, and the drag commits `imageX/imageY` to the
+   * wall's own settings route — the same keys the wall pane's own drag writes. Nothing new is
+   * stored: the position the show uses is the position the strip wrote.
+   */
+  const dragWall = { cx: null, cy: null };
+  dragSurface(wallImg, {
+    onMove(ev, pt, dx, dy) {
+      if (dragWall.cx === null) {
+        dragWall.cx = img.x * STRIP.frameW;
+        dragWall.cy = img.y * STRIP.frameH;
+      }
+      const cx = clamp(dragWall.cx + dx / scale, 0, STRIP.frameW);
+      const cy = clamp(dragWall.cy + dy / scale, 0, STRIP.frameH);
+      wallImg.style.left = `${cx - wallImg.offsetWidth / 2}px`;
+      wallImg.style.top = `${cy - wallImg.offsetHeight / 2}px`;
+      wallEl.dataset.dragging = 'true';
+      select('wall');
+    },
+    onEnd() {
+      wallEl.dataset.dragging = 'false';
+      if (dragWall.cx === null) return;
+      const x = clamp((parseFloat(wallImg.style.left) + wallImg.offsetWidth / 2) / STRIP.frameW, 0, 1);
+      const y = clamp((parseFloat(wallImg.style.top) + wallImg.offsetHeight / 2) / STRIP.frameH, 0, 1);
+      dragWall.cx = null;
+      dragWall.cy = null;
+      void send('wall', '/api/wall/settings', {
+        imageX: Math.round(x * 1000) / 1000,
+        imageY: Math.round(y * 1000) / 1000,
+      }).then(() => load('wall'));
+    },
+  });
+
+  /* ------------------------------------------------------------ the alerts */
+
+  const dlgNodes = new Map();
+
+  function dialogNode(d) {
+    const node = el('div', { class: 'dialog in', dataset: { id: d.id } });
+    node.style.left = `${num(d.x, 0)}px`;
+    node.style.top = `${num(d.y, 0)}px`;
+    node.style.width = `${num(d.w, 300)}px`;
+    node.style.height = `${num(d.h, 150)}px`;
+
+    const closeBtn = el('button', {
+      type: 'button',
+      class: 'tclose',
+      title: 'Close this alert',
+      'aria-label': 'Close this alert',
+    });
+    closeBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      void decide(d.id, 'close');
+    });
+    const bar = el('div', { class: 'titlebar' },
+      el('span', { class: 'ttitle', text: d.title || d.type || 'Alert' }),
+      closeBtn,
+    );
+
+    const bodyEl2 = el('div', { class: 'body' });
+    const icon = iconNode(d.icon);
+    if (icon) bodyEl2.append(icon);
+    bodyEl2.append(el('div', { class: 'msg', text: d.text || d.message || '' }));
+
+    const acts = el('div', { class: 'buttons' });
+    const buttons = Array.isArray(d.buttons) && d.buttons.length ? d.buttons : [{ label: 'OK', action: 'close' }];
+    const primary = buttons.length - 1;
+    buttons.forEach((b, i) => {
+      const action = String(b.action || 'close');
+      const btn = el('button', { type: 'button', class: `btn${i === primary ? ' primary' : ''}`, text: String(b.label || 'OK') });
+      if (action === 'spawn') {
+        // The preview must never make a new alert. The button is the alert's own shape, inert,
+        // and the pane says what it will do.
+        btn.disabled = true;
+        btn.title = 'Makes another alert — send it from the Alerts pane';
+      } else {
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          void decide(d.id, action);
+        });
+      }
+      acts.append(btn);
+    });
+
+    node.append(bar, bodyEl2, acts);
+    node.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0) return;
+      const t = ev.composedPath()[0];
+      if (t && t.closest && t.closest('button')) return; // a control is a control, not a handle
+      select('dialogs');
+      node.dataset.drag = 'true';
+      const startNode = { x: parseFloat(node.style.left) || 0, y: parseFloat(node.style.top) || 0 };
+      const start = { x: ev.clientX, y: ev.clientY };
+      const move = (mv) => {
+        const dx = (mv.clientX - start.x) / scale;
+        const dy = (mv.clientY - start.y) / scale;
+        node.style.left = `${clamp(startNode.x + dx, 0, Math.max(0, STRIP.w - num(d.w, 300)))}px`;
+        node.style.top = `${clamp(startNode.y + dy, 0, Math.max(0, STRIP.h - num(d.h, 150)))}px`;
+      };
+      const up = () => {
+        window.removeEventListener('pointermove', move, true);
+        window.removeEventListener('pointerup', up, true);
+        node.dataset.drag = 'false';
+        const x = Math.round(parseFloat(node.style.left) || 0);
+        const y = Math.round(parseFloat(node.style.top) || 0);
+        if (Math.hypot(parseFloat(node.style.left) - startNode.x, parseFloat(node.style.top) - startNode.y) < 1) return;
+        void send('dialogs', '/api/dialogs/live', { id: d.id, x, y }).then(() => load('dialogs'));
+      };
+      window.addEventListener('pointermove', move, true);
+      window.addEventListener('pointerup', up, true);
+    });
+    return node;
+  }
+
+  function paintDialogs(live, theme) {
+    const skin = `desk skin-${theme || 'win11'}`;
+    if (dlg.wrap.className !== skin) dlg.wrap.className = skin;
+    const seenIds = new Set();
+    for (const d of live) {
+      seenIds.add(d.id);
+      let node = dlgNodes.get(d.id);
+      if (!node) {
+        node = dialogNode(d);
+        dlgNodes.set(d.id, node);
+        dlg.wrap.append(node);
+      } else if (node.dataset.drag !== 'true') {
+        node.style.width = `${num(d.w, 300)}px`;
+        node.style.height = `${num(d.h, 150)}px`;
+        node.style.left = `${num(d.x, 0)}px`;
+        node.style.top = `${num(d.y, 0)}px`;
+      }
+    }
+    for (const [id, node] of dlgNodes) {
+      if (seenIds.has(id)) continue;
+      dlgNodes.delete(id);
+      node.classList.add('leaving');
+      setTimeout(() => node.remove(), 200);
+    }
+  }
+
+  /**
+   * Act on the live widget, not on a picture of it. `spawn` is refused here by construction: the
+   * preview may close or decide an alert, and may never make one.
+   */
+  async function decide(id, action) {
+    if (!action || action === 'none' || action === 'spawn' || dead() || !api) return;
+    try {
+      if (action === 'closeAll') await api.del('/api/dialogs/live');
+      else await api.del(`/api/dialogs/live?id=${encodeURIComponent(id)}`);
+    } catch (err) {
+      if (!dead()) setState('dialogs', err.message || 'close failed', 'bad');
+      return;
+    }
+    void load('dialogs');
+  }
+
+  /* ------------------------------------------------------------ the toasts */
+
+  const ntNodes = new Map();
+
+  function toastNode(e, skin) {
+    const node = el('div', { class: `toast ${skin} in`, dataset: { id: e.id } });
+    node.style.width = `${num(e.w, 381)}px`;
+    node.style.height = `${num(e.h, 76)}px`;
+    node.style.left = `${num(e.x, 12)}px`;
+    node.style.top = `${num(e.y, 12)}px`;
+    node.append(el('div', { class: 'lead', 'aria-hidden': 'true' }));
+    const body = el('div', { class: 'body' });
+    if (e.title) body.append(el('div', { class: 'title', text: e.title }));
+    body.append(el('div', { class: 'text', text: e.text || '' }));
+    node.append(body);
+    if (Array.isArray(e.buttons) && e.buttons.length) {
+      const acts = el('div', { class: 'acts' });
+      for (const b of e.buttons) {
+        const btn = el('button', { type: 'button', class: 'btn', text: String(b.label || 'OK') });
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          void dismissToast(e.id, String(b.action || 'close'));
+        });
+        acts.append(btn);
+      }
+      node.append(acts);
+    }
+    node.addEventListener('click', () => void dismissToast(e.id, 'close'));
+    return node;
+  }
+
+  function paintToasts(live, style) {
+    // the look class belongs on each toast (`.t-ios` paints the element); the layer is only a box
+    const skin = `t-${style || 'ios'}`;
+    if (nt.wrap.className !== 'stage') nt.wrap.className = 'stage';
+    const seenIds = new Set();
+    for (const e of live) {
+      seenIds.add(e.id);
+      let node = ntNodes.get(e.id);
+      if (!node) {
+        node = toastNode(e, skin);
+        ntNodes.set(e.id, node);
+        nt.wrap.append(node);
+      } else {
+        node.style.top = `${num(e.y, 12)}px`;
+      }
+    }
+    for (const [id, node] of ntNodes) {
+      if (seenIds.has(id)) continue;
+      ntNodes.delete(id);
+      node.classList.add('leaving');
+      setTimeout(() => node.remove(), 220);
+    }
+  }
+
+  async function dismissToast(id, action) {
+    if (!action || action === 'none' || action === 'spawn' || dead() || !api) return;
+    try {
+      await api.del(`/api/notifications/live?id=${encodeURIComponent(id)}`);
+    } catch (err) {
+      if (!dead()) setState('notifications', err.message || 'close failed', 'bad');
+      return;
+    }
+    void load('notifications');
   }
 
   /* ------------------------------------------------------------ fetch + paint */
 
-
-  function setState(id, text, tone = '') {
-    const s = slots.get(id);
-    if (!s) return;
-    s.state.textContent = text;
-    s.state.dataset.tone = tone;
-    s.slot.dataset.state = tone || 'ok';
-  }
-
-  /** The wall: settings look (its palette is a page command, so the store holds it too). */
+  /** The wall: its settings look, plus the picture's placement (the settings route owns both). */
   async function loadWall() {
     const r = await api.get('/api/wall/live', { signal });
     const s = r || {};
     const look = { ...((s.render && s.render.look) || {}), ...((s.settings && s.settings.look) || {}) };
+    const prev = lookStore.get('wall');
+    // `look.palette` and `look.pattern` are page commands: nothing on the server records the ramp
+    // or the shape the wall is running, so those come from the store when a pane told it.
     lookStore.set('wall', {
-      // `look.palette` is a page command: nothing on the server records the ramp the wall is
-      // running, so the palette comes from the store's own write when the slot sent the command,
-      // and from a `palette` the server may expose one day. Reading it from the document per
-      // poll would undo that write with the stale default on the next beat.
-      // `palette` is not a settings key: the document cannot hold the ramp and a poll must not
-      // undo the page's answer. The store's name (fed by a pane's paint or this column's own
-      // command answer) wins; the document's copy, when one exists at all, is the fallback.
-      palette: lookStore.get('wall').palette || clean(s.look && s.look.palette) || clean(look.palette) || DEFAULT_PALETTE,
-      // the document is the wall's own look and wins: it is what the page persists, and it is the
-      // one both readers (this column and the pane) write back after a command
-      pattern: clean(look.pattern) || lookStore.get('wall').pattern,
-      preset: clean(look.preset) || lookStore.get('wall').preset,
-      brightness: num(look.brightness, 1),
-      saturation: num(look.saturation, 1),
-      speed: num(look.speed, 1),
-      blackout: num(look.blackout, 0) > 0,
-      fenceOutDim: num(look.fenceOutDim, 0.18),
-      ratio: (s.ratio && s.ratio.selected) || lookStore.get('wall').ratio,
-      fence: (s.render && s.render.fence) || (s.fence && s.fence.px) || lookStore.get('wall').fence,
+      ...prev,
+      palette: Array.isArray(look.palette) ? look.palette : clean(look.palette) || prev.palette,
+      pattern: clean(look.pattern) || prev.pattern,
+      brightness: num(look.brightness, num(setting(s.settings, 'brightness', 1), 1)),
+      saturation: num(look.saturation, num(setting(s.settings, 'saturation', 1), 1)),
+      speed: num(look.speed, num(setting(s.settings, 'speed', 1), 1)),
+      blackout: num(look.blackout, num(setting(s.settings, 'blackout', 0), 0)) > 0,
+      fenceOutDim: num(setting(s.settings, 'fenceOutDim', 0.18), 0.18),
+      ratio: (s.ratio && s.ratio.selected) || prev.ratio,
+      fence: (s.render && s.render.fence) || (s.fence && s.fence.px) || prev.fence,
     });
     const w = lookStore.get('wall');
+    if (hasDom()) {
+      paintWall();
+      img = {
+        on: num(setting(s.settings, 'imageOn', 0), 0) > 0,
+        rev: num(setting(s.settings, 'imageRev', 0), 0),
+        x: clamp(num(setting(s.settings, 'imageX', 0.5), 0.5), 0, 1),
+        y: clamp(num(setting(s.settings, 'imageY', 0.5), 0.5), 0, 1),
+        scale: clamp(num(setting(s.settings, 'imageScale', 0.6), 0.6), 0.05, 4),
+        rotate: num(setting(s.settings, 'imageRotate', 0), 0),
+      };
+      if (img.on && img.rev !== Number(wallImg.dataset.rev)) {
+        wallImg.dataset.rev = String(img.rev);
+        wallImg.src = `/api/wall/image?rev=${img.rev}`;
+      }
+      if (!img.on) {
+        delete wallImg.dataset.rev;
+        wallImg.removeAttribute('src');
+      }
+      placeWallImg();
+    }
     setState('wall', `${w.pattern}${w.blackout ? ' · black' : ''}`, w.blackout ? 'warn' : '');
   }
 
-  function dialogNodes(live, theme) {
-    // The dialogs are their module's own chrome: the skin class on the layer root and the
-    // .dialog/.titlebar/.ttitle/.body structure, scaled from the 810×1440 canvas into the crop.
-    const desk = el('div', { class: `dg-desk skin-${theme}` });
-    for (const d of live) {
-      const node = el('div', { class: 'dialog', dataset: { id: d.id } });
-      for (const [k, v] of [['left', d.x], ['top', d.y], ['width', d.w], ['height', d.h]]) {
-        if (Number.isFinite(Number(v))) node.style[k] = `${Number(v)}px`;
-      }
-      node.append(
-        el('div', { class: 'titlebar' }, el('span', { class: 'ttitle', text: d.title || d.type || 'Alert' })),
-        el('div', { class: 'body' }, el('div', { class: 'msg', text: d.text || d.message || '' })),
-      );
-      desk.append(node);
-    }
-    return desk;
-  }
-
-  function toastNodes(live, style, height) {
-    // The notifications module's own markup and look class (.t-ios / .t-android / …), at canvas px.
-    const strip = el('div', { class: `nt-layer t-${style}` });
-    strip.style.setProperty('--nt-h', `${height}px`);
-    for (const e of live) {
-      const node = el('div', { class: 'toast in', dataset: { id: e.id } });
-      node.append(
-        el('div', { class: 'lead', 'aria-hidden': 'true' }),
-        el('div', { class: 'body' },
-          e.title ? el('div', { class: 'title', text: e.title }) : null,
-          el('div', { class: 'text', text: e.text || '' }),
-        ),
-      );
-      if (Number.isFinite(Number(e.y))) node.style.top = `${Number(e.y)}px`;
-      strip.append(node);
-    }
-    return strip;
-  }
-
-  /** The dialogs: the strip crop the module uses (810 of 2560, centred). */
   async function loadDialogs() {
     const r = await api.get('/api/dialogs/live', { signal });
     const meta = (r && r.settings) || {};
@@ -630,18 +919,11 @@ export function mountMergedColumn(host, opts = {}) {
     const theme = String((meta.theme && meta.theme.value) || 'win11');
     lookStore.set('dialogs', { theme, scale: num(meta.scale && meta.scale.value, 0.7) });
     if (!hasDom()) return;
-    const s = slots.get('dialogs');
-    const pv = ensurePv(s);
-    const desk = dialogNodes(live, theme);
-    pv.setFence({ x: (2560 - DG_CANVAS_W) / 2 / 2560, w: DG_CANVAS_W / 2560, y: 0 });
-    pv.setFenceVisible(true);
-    pv.setLayer(desk);
-    s.data.count = live.length;
-    fitLayer(pv, desk, DG_CANVAS_W);
+    paintDialogs(live, theme);
+    mods.get('dialogs').data.count = live.length;
     setState('dialogs', `${live.length} up · ${theme}`, live.length ? '' : 'idle');
   }
 
-  /** The notifications: the 405px strip, centred, at the module's own height. */
   async function loadNotifications() {
     const r = await api.get('/api/notifications/live', { signal });
     const meta = (r && r.settings) || {};
@@ -650,26 +932,16 @@ export function mountMergedColumn(host, opts = {}) {
     const height = num(meta.height && meta.height.value, 76);
     lookStore.set('notifications', { style, height });
     if (!hasDom()) return;
-    const s = slots.get('notifications');
-    const pv = ensurePv(s);
-    const strip = toastNodes(live, style, height);
-    strip.style.width = `${NT_W}px`;
-    strip.style.height = `${NT_H}px`;
-    pv.setFence({ x: (2560 - NT_W) / 2 / 2560, w: NT_W / 2560, y: 0 });
-    pv.setFenceVisible(true);
-    pv.setLayer(strip);
-    s.data.count = live.length;
-    fitLayer(pv, strip, NT_W);
+    paintToasts(live, style);
+    mods.get('notifications').data.count = live.length;
     setState('notifications', `${live.length} up · ${style}`, live.length ? '' : 'idle');
   }
 
   /**
    * Hand FX's picture is not a ShockBox render: the module draws it on its own camera canvas,
-   * inside its own pane, and only while that pane's "Start preview" holds the camera. The column
-   * therefore hosts that canvas when the pane is open — the module keeps drawing it, nothing here
-   * draws a second effect — and otherwise says so. Moving the canvas out of a live pane would
-   * blank the pane's own preview, so the column mirrors its pixels instead: a 2-D copy, refreshed
-   * with the poll, is honest about what the pane sees and costs the module no camera.
+   * inside its own pane, and only while that pane's "Start preview" holds the camera. The strip
+   * mirrors those pixels — a 2-D copy, refreshed with the poll — because moving the canvas out of
+   * a live pane would blank the pane's own preview, and nothing here draws a second effect.
    */
   async function loadHandfx() {
     const r = await api.get('/api/handfx/status', { signal });
@@ -681,44 +953,29 @@ export function mountMergedColumn(host, opts = {}) {
       tracking: Boolean(st.page && st.page.tracking),
     });
     if (!hasDom()) return;
-    const s = slots.get('handfx');
-    const pv = ensurePv(s);
-    pv.quiet?.(true);
-
     const source = findHandfxPreview();
-    let mirror = s.data.mirror;
-    if (!mirror) {
-      mirror = el('canvas', { class: 'mp-mirror' });
-      s.data.mirror = mirror;
-      clear(pv.layer);
-      pv.layer.append(mirror, el('div', { class: 'mp-empty' }, el('span', { text: 'open Hand FX to preview' })));
-    }
     if (source) {
-      // a copy of what the module is drawing, scaled to the crop; the pane keeps the original
       const w = source.width || source.clientWidth || 0;
       const h = source.height || source.clientHeight || 0;
       if (w > 0 && h > 0) {
-        if (mirror.width !== w || mirror.height !== h) {
-          mirror.width = w;
-          mirror.height = h;
+        if (fxMirror.width !== w || fxMirror.height !== h) {
+          fxMirror.width = w;
+          fxMirror.height = h;
         }
-        const ctx = mirror.getContext('2d');
+        const ctx = fxMirror.getContext('2d');
         try {
           ctx.clearRect(0, 0, w, h);
           ctx.drawImage(source, 0, 0, w, h);
         } catch {
-          /* a tainted or detached canvas: the placeholder stays */
+          /* a tainted or detached canvas: the layer stays empty */
         }
+        fxMirror.hidden = false;
+        setState('handfx', 'from pane', '');
+        return;
       }
-      mirror.hidden = false;
-      s.data.mirrorLive = true;
-      fitCanvas(pv, mirror);
-      setState('handfx', 'from pane', '');
-    } else {
-      mirror.hidden = true;
-      s.data.mirrorLive = false;
-      setState('handfx', 'no camera', 'idle');
     }
+    fxMirror.hidden = true;
+    setState('handfx', 'no camera', 'idle');
   }
 
   /** The hand fx preview canvas inside the module's pane, if that pane is on screen. */
@@ -728,118 +985,18 @@ export function mountMergedColumn(host, opts = {}) {
     return c && c.width > 0 && c.height > 0 ? c : null;
   }
 
-  /** Scale a module canvas into the window's lit width, the way each pane does for its layer. */
-  function fitCanvas(pv, canvas) {
-    const win = pv.window;
-    const pub = parseFloat((win && win.style.getPropertyValue('--pv-lit-w')) || '') || 0;
-    const w = pub || win?.getBoundingClientRect?.().width || 0;
-    const cw = canvas.width || canvas.clientWidth || 1;
-    if (w > 0) {
-      canvas.style.transformOrigin = 'top left';
-      canvas.style.transform = `scale(${w / cw})`;
-    }
-  }
-
-  function fitLayer(pv, layer, canvasW) {
-    // same rule the module panes use: prefer the width the component published onto the window
-    // (`--pv-lit-w`), and only measure when it has not written one yet
-    const win = pv.window;
-    const pub = parseFloat((win && win.style.getPropertyValue('--pv-lit-w')) || '') || 0;
-    const w = pub || win?.getBoundingClientRect?.().width || 0;
-    if (!(w > 0)) return;
-    layer.style.transform = `scale(${w / canvasW})`;
-    // A layer whose transform drives the CARD's layout would be a feedback loop; the layer is
-    // absolutely positioned inside the window, so pin it: the scale never changes the box that
-    // the ResizeObserver is watching.
-    layer.style.transformOrigin = 'top left';
-  }
-
-  /** The wall's look, painted from the store: palette ramp, brightness, pattern, blackout. */
-  function paintWall() {
-    const s = slots.get('wall');
-    if (!s) return;
-    const w = lookStore.get('wall');
-    const pv = ensurePv(s);
-    pv.setLook({
-      palette: lookStore.wallPalette(w.palette),
-      brightness: w.brightness,
-      saturation: w.saturation,
-      speed: w.speed,
-      pattern: w.pattern,
-      blackout: w.blackout,
-    });
-    // the window is the wall's fence, drawn the way the wall pane draws it; with `ratio: 16:9` the
-    // wall pane shows no window, and neither does this slot
-    const windowed = w.ratio ? w.ratio === '9:16' : true;
-    pv.setFenceVisible(windowed);
-    if (windowed && w.fence && w.fence.px) {
-      const f = w.fence.px;
-      pv.setFence({ x: f.x / 2560, w: f.w / 2560, y: Math.max(0, f.y / 1440) });
-    }
-    s.slot.dataset.palette = w.palette;
-    s.slot.dataset.pattern = w.pattern;
-    s.slot.dataset.blackout = String(Boolean(w.blackout));
-    setState('wall', `${w.pattern}${w.blackout ? ' · black' : ''}`, w.blackout ? 'warn' : '');
-  }
-
-  /** Hand FX and Dialogs carry their theme on the layer root; the notification strip does too. */
-  function paintThemes() {
-    const d = lookStore.get('dialogs');
-    const desk = slots.get('dialogs')?.pv?.layer.querySelector('.dg-desk');
-    if (desk) desk.className = `dg-desk skin-${d.theme}`;
-    slots.get('dialogs')?.slot.setAttribute('data-theme', d.theme);
-    const n = lookStore.get('notifications');
-    const strip = slots.get('notifications')?.pv?.layer.querySelector('.nt-layer');
-    if (strip) strip.className = `nt-layer t-${n.style}`;
-    slots.get('notifications')?.slot.setAttribute('data-style', n.style);
-    slots.get('handfx')?.slot.setAttribute('data-effect', lookStore.get('handfx').effect || '');
-  }
-
-  lookStore.setSync(() => loadLook('wall', { api }));
-
-  const unsub = lookStore.subscribe((id) => {
-    if (dead()) return;
-    if (id === 'wall') paintWall();
-    else paintThemes();
+  const loaders = () => ({
+    wall: loadWall,
+    dialogs: loadDialogs,
+    notifications: loadNotifications,
+    handfx: loadHandfx,
   });
-  timers.push(unsub);
-
-  /* ------------------------------------------------------------ load */
-
-  // a function, not a const map: `loadNow` can be called before this line runs (a headless consumer)
-  function loaders() {
-    return { wall: loadWall, dialogs: loadDialogs, notifications: loadNotifications, handfx: loadHandfx };
-  }
-
-  /**
-   * One module's data. The loaders fill `lookStore` even with no DOM; only the painting half of
-   * this needs the column, so the promise is the network round trip either way.
-   */
-  function loadNow(id) {
-    const fn = loaders()[id];
-    if (!fn) return Promise.resolve(lookStore.get(id));
-    return fn()
-      .then(() => {
-        if (hasDom() && !dead()) {
-          if (id === 'wall') paintWall();
-          else paintThemes();
-        }
-        return lookStore.get(id);
-      })
-      .catch((err) => {
-        if (hasDom() && !dead()) setState(id, err.message || 'unreachable', 'bad');
-        return lookStore.get(id);
-      });
-  }
 
   async function load(id) {
     const fn = loaders()[id];
     if (!fn || dead()) return;
     try {
       await fn();
-      if (!hasDom()) return; // Node: the store is the product, painting is not
-      if (id === 'wall') paintWall();
-      else paintThemes();
     } catch (err) {
       if (!dead() && hasDom()) setState(id, err.message || 'unreachable', 'bad');
     }
@@ -849,11 +1006,10 @@ export function mountMergedColumn(host, opts = {}) {
     await Promise.allSettled(order.map((m) => load(m.id)));
   }
 
-  // The hand fx canvas is the module's to create: a slot above it is dead until the pane opens.
-  // A sweep catches it when the route changes, and a slot is cheap enough to re-fit.
+  // The hand fx canvas is the module's to create: the layer above it is empty until the pane opens.
   function sweepHandfx() {
     if (dead() || !hasDom() || document.hidden) return;
-    if (slots.has('handfx')) void load('handfx');
+    if (mods.has('handfx')) void load('handfx');
   }
 
   let pollTimer = null;
@@ -879,7 +1035,7 @@ export function mountMergedColumn(host, opts = {}) {
   });
   if (sub) timers.push(sub);
 
-  /* ------------------------------------------------------------ the drag */
+  /* ------------------------------------------------------------ the border drag */
 
   let drag = null;
   function onDown(e) {
@@ -897,110 +1053,90 @@ export function mountMergedColumn(host, opts = {}) {
     column.dataset.dragging = 'true';
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
-    e.preventDefault();
   }
   function onMove(e) {
     if (!drag) return;
+    if (e.pointerId !== drag.pointerId) return;
     e.preventDefault();
-    e.stopPropagation();
     // the column is LEFT of the pane, so growing it means moving the handle right
-    applyWidth(drag.w + (e.clientX - drag.x), { persist: false });
+    applyWidth(drag.w + (e.clientX - drag.x));
   }
-  function onUp() {
+  function onUp(e) {
     if (!drag) return;
+    if (e && e.pointerId !== drag.pointerId) return;
     drag = null;
     column.dataset.dragging = 'false';
     document.body.style.cursor = '';
     document.body.style.userSelect = '';
-    applyWidth(width); // one write, once the hand stops
   }
-  // Capture phase: the handle sits inside the column's scroll area, over the pane's stacking
-  // context at the edge. Listening in the capture phase (and stopping there) means the press is
-  // the handle's whatever the card under the pointer would otherwise do with it.
   resizer.addEventListener('pointerdown', onDown, true);
-  resizer.addEventListener('pointermove', onMove, true);
-  resizer.addEventListener('pointerup', onUp, true);
-  resizer.addEventListener('pointercancel', onUp, true);
-  resizer.addEventListener('dblclick', () => applyWidth(DEFAULT_W));
+  window.addEventListener('pointermove', onMove, true);
+  window.addEventListener('pointerup', onUp, true);
+  window.addEventListener('pointercancel', onUp, true);
+  // a keyboard can resize it too: the same two commands the mouse has
   resizer.addEventListener('keydown', (e) => {
-    const step = e.shiftKey ? 48 : 16;
-    if (e.key === 'ArrowLeft') {
-      e.preventDefault();
-      applyWidth(width - step);
-    } else if (e.key === 'ArrowRight') {
-      e.preventDefault();
-      applyWidth(width + step);
-    } else if (e.key === 'Home') {
-      e.preventDefault();
-      applyWidth(MIN_W);
-    } else if (e.key === 'End') {
-      e.preventDefault();
-      applyWidth(maxW());
-    }
+    const step = e.shiftKey ? 32 : 8;
+    if (e.key === 'ArrowLeft') applyWidth(width - step);
+    else if (e.key === 'ArrowRight') applyWidth(width + step);
+    else if (e.key === 'Home') applyWidth(MIN_W);
+    else if (e.key === 'End') applyWidth(maxW());
+    else return;
+    e.preventDefault();
   });
+  resizer.addEventListener('dblclick', () => applyWidth(DEFAULT_W));
   timers.push(() => {
     resizer.removeEventListener('pointerdown', onDown, true);
-    resizer.removeEventListener('pointermove', onMove, true);
-    resizer.removeEventListener('pointerup', onUp, true);
-    resizer.removeEventListener('pointercancel', onUp, true);
+    window.removeEventListener('pointermove', onMove, true);
+    window.removeEventListener('pointerup', onUp, true);
+    window.removeEventListener('pointercancel', onUp, true);
   });
 
-  function onViewport() {
-    // a narrower window clamps the column instead of overflowing the layout; widening gives the
-    // stored width back, because `width` is still what the operator asked for. The slot relayout is
-    // NOT needed here: each slot's own ResizeObserver sees the stage change, and laying four
-    // components out from inside the window's resize handler is what made Chrome report a
-    // ResizeObserver loop ("undelivered notifications") as an uncaught error.
-    applyWidth(width, { persist: false });
-  }
-  window.addEventListener('resize', onViewport);
-  timers.push(() => window.removeEventListener('resize', onViewport));
+  /* ------------------------------------------------------------ lifecycle */
 
-  /* ------------------------------------------------------------ go */
+  /** The route settled on a module: follow it until the operator picks one here. */
+  function followRoute(id) {
+    if (picked || !mods.has(id)) return;
+    select(id, { notify: false });
+  }
+
+  function start() {
+    if (dead()) return;
+    void loadAll();
+    schedulePoll();
+    fit();
+  }
+
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    clearTimeout(pollTimer);
+    for (const off of timers.splice(0)) {
+      try {
+        off();
+      } catch {
+        /* a timer that already fired */
+      }
+    }
+    column.remove();
+  }
+
+  if (opts.route) select(opts.route, { notify: false });
+  else if (order[0]) select(order[0].id, { notify: false });
 
   return {
     el: column,
-    /** Select a module without telling the shell (used when the route agrees with the column). */
-    select: (id) => select(id, { notify: false }),
+    surface,
+    select,
+    followRoute,
+    start,
+    destroy,
+    load,
+    sweepHandfx,
     get width() {
       return width;
     },
-    /** Called by the shell after a route change: follow the pane if the person has not chosen. */
-    followRoute(id) {
-      if (!picked) select(id, { notify: false });
-    },
-    start() {
-      // the column exists before the first load so the shell's grid has its track on frame one
-      loadAll();
-      schedulePoll();
-      const sweep = setInterval(sweepHandfx, 4000);
-      timers.push(() => clearInterval(sweep));
-      // the route may already be a module: start on it, so the column agrees with the pane
-      if (opts.route) select(opts.route, { notify: false });
-      else select(order[0].id, { notify: false });
-    },
-    destroy() {
-      destroyed = true;
-      for (const t of timers) {
-        try {
-          t();
-        } catch {
-          /* already gone */
-        }
-      }
-      // a hand fx canvas borrowed from a pane goes back where it came from, or the pane dies
-      // with a hole in it when this column is torn down
-      for (const s of slots.values()) {
-        const c = s.pv?.window.querySelector('canvas.hfx-landmarks');
-        if (c && c.dataset.mpMoved === 'true') {
-          c.remove();
-          c.dataset.mpMoved = 'false';
-        }
-        s.pv?.stop?.();
-      }
-      column.remove();
+    get scale() {
+      return scale;
     },
   };
 }
-
-export default mountMergedColumn;

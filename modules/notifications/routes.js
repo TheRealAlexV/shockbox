@@ -130,7 +130,15 @@ export default {
       {
         method: 'DELETE',
         path: '/live',
-        handler() {
+        handler(req, res, url) {
+          // `?id=` closes one toast (the show preview's own close), no id clears the stack.
+          const one = url.searchParams.get('id');
+          if (one) {
+            if (!mod.state.live.has(one)) throw new HttpError(404, `unknown notification ${one}`);
+            mod.state.close(one, 'panel close');
+            mod.push('control');
+            return { ok: true, closed: 1 };
+          }
           const ids = [...mod.state.live.keys()];
           for (const id of ids) mod.state.close(id, 'clear all');
           mod.push('control');

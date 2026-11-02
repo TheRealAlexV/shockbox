@@ -1,17 +1,17 @@
-/* The merged preview column — every module's effect in one column, on every route.
+/* The show preview column — ONE 9:16 strip in the shell, on every route.
  *
  * Layout: the shell grid (shell.css `.app`) carries a track for this column, sized from
  * `--merged-w`, so the column is a real grid child and the pane keeps its own scroll. The column
  * is LEFT of the pane and its right border is the drag handle.
  *
- * The slots are the shared component (preview.css `.pv-*`), not a second renderer: a slot only
- * removes the component's header and sizes it to the column. What is added here is the slot
- * chrome — the name, the selected outline, the module's controls — and the resizer.
+ * The surface inside is the OBS strip (405×720 cut from the 1280×720 frame), scaled to the room
+ * the column gives it. It looks like the show, not like a widget: black, hard edges, no radius,
+ * no shadow, no chrome inside the frame — anything added there would read as part of the wall.
  */
 
 .merged {
   /* The column is the app grid's second track. Its width comes from `--merged-w` on the app root;
-     `min-width: 0` keeps a wide slot picture from widening the track, and `position: relative`
+     `min-width: 0` keeps a wide surface from widening the track, and `position: relative`
      makes this the containing block for the resizer, whose 9px hit area is centred on the edge. */
   display: flex;
   flex-direction: column;
@@ -24,7 +24,7 @@
   overflow: hidden;
 }
 
-/* The whole column reads as a rail of previews: one hairline under the header, one between slots. */
+/* one hairline under the header, then the surface owns the rest of the column */
 .merged-head {
   display: flex;
   align-items: center;
@@ -47,164 +47,126 @@
   justify-content: flex-end;
   min-width: 0;
 }
-.merged-chips .pv-chip { font-size: 8.5px; padding: 1px 5px; letter-spacing: 0.07em; }
-.merged-chips .pv-chip[data-chip='wall'][aria-pressed='true'] { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
-
-.merged-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  /* scrollbar on the inside: the column's width is the operator's, not the browser's */
-  scrollbar-gutter: stable;
-}
-
-/* A slot is a picture of another module, not a second copy of it to click into: its layer is
-   inert, so a toast or dialog inside the preview can never steal the click that selects the card. */
-.mp-slot .pv { pointer-events: none; }
-/* the picture is inert, but the controls above it are not */
-.mp-controls, .mp-controls * { pointer-events: auto; }
-
-.merged-stage {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 10px;
-}
-
-/* ---------------------------------------------------------------- a slot */
-
-/* `.pv-slot` is the component's overlay layer class; here it is re-purposed as the card, which is
-   why it is not absolutely positioned (preview.css positions `.pv-slot` inside the merged stack).
-   The card keeps the shared name so a test finds one class for "a module in this column". */
-.mp-slot {
-  position: relative;
-  inset: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 7px;
-  border: var(--hair) solid var(--line-2);
-  border-radius: var(--r);
-  background: var(--bg-2);
-  cursor: pointer;
-  transition: border-color 120ms var(--ease), background-color 120ms var(--ease);
-  min-width: 0;
-}
-.mp-slot:hover { border-color: var(--line-3); background: var(--bg-3); }
-.mp-slot:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
-.mp-slot[data-selected='true'] {
-  border-color: color-mix(in srgb, var(--accent) 62%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent);
-}
-/* a module whose last command failed says so on its own card, not in a toast far away */
-.mp-slot[data-state='bad'] { border-color: color-mix(in srgb, var(--bad) 55%, transparent); }
-
-.mp-label {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  min-width: 0;
-}
-.mp-name {
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--fg-2);
-}
-.mp-slot[data-selected='true'] .mp-name { color: var(--fg); }
-.mp-state {
-  margin-left: auto;
+.merged-chips .pv-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 8.5px;
-  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  letter-spacing: 0.07em;
+}
+
+/* A chip carries the module's name and its live state: the selected module is the one with the
+   accent border and the bright name, and a module whose last request failed turns its state red. */
+.mx-chip-name { color: var(--fg-3); }
+.mx-chip[aria-pressed='true'] .mx-chip-name { color: var(--fg); }
+.mx-chip-state {
+  font-family: var(--font-mono);
+  font-size: 8px;
   color: var(--fg-4);
   white-space: nowrap;
+}
+.mx-chip-state:empty { display: none; }
+.mx-chip[data-tone='bad'] .mx-chip-state { color: var(--bad); }
+.mx-chip[data-tone='warn'] .mx-chip-state { color: var(--warn); }
+.mx-chip[data-tone='ok'] .mx-chip-state { color: var(--fg-4); }
+
+/* ---------------------------------------------------------------- the surface */
+
+.mx-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: 9px;
   overflow: hidden;
-  text-overflow: ellipsis;
-  min-width: 0;
+  background: var(--bg);
 }
-.mp-state[data-tone='bad'] { color: var(--bad); }
-.mp-state[data-tone='warn'] { color: var(--warn); }
-.mp-state[data-tone='ok'] { color: var(--ok); }
 
-/* the component's own panel: header gone, frame sized by the stage, no outer chrome */
-.mp-pv {
-  padding: 0;
-  background: transparent;
-  border: 0;
-  min-width: 0;
+/* The OBS frame. `contain: paint` keeps anything a module draws from bleeding out of the strip;
+   the hairline is the surface's own boundary and nothing inside the frame has one. */
+.mx-surface {
+  position: relative;
+  overflow: hidden;
+  background: #000;
+  outline: 1px solid var(--line-3);
+  contain: paint;
 }
-.mp-pv .pv-stage { padding-bottom: 0; }
 
-/* The layers a module's own pane draws into the window are absolutely placed at their canvas size
-   and scaled: a scaled block in normal flow would grow the box that every sizing observer watches,
-   which is a layout loop, not a fit. */
-.mp-slot .pv-layer-in {
+/* The strip's coordinate space, always 405×720 and scaled from the top-left corner: every layer
+   below is placed in the pixels the show uses, so nothing has to translate twice. */
+.mx-scene {
   position: absolute;
-  inset: 0;
-}
-/* inside the column the frame must never reach the 64vw cap preview.js applies for a pane: the
-   stage is the column's width and the frame is 16:9 of it */
-.mp-pv .pv-frame { max-width: 100%; }
-
-.mp-body { min-width: 0; }
-
-/* the hand fx mirror: a copy of the pane's camera canvas, drawn into the crop at its own px size
-   and scaled to the window, the way the pane scales its own stage */
-.mp-pv .pv-layer-in > canvas.mp-mirror,
-.mp-pv .pv-window > canvas.mp-mirror {
-  position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
+  width: 405px;
+  height: 720px;
   transform-origin: top left;
+  background: #000;
+}
+
+/* The wall layer is the whole 1280×720 picture with the strip's left edge cut off: the crop is a
+   window onto the wall, not a wall that has been resized. */
+.mx-wall {
+  position: absolute;
+  left: -437.5px;
+  top: 0;
+  width: 1280px;
+  height: 720px;
+  pointer-events: none;
+}
+.mx-wall > .pv-look,
+.mx-wall > .pv-dots {
+  position: absolute;
+  inset: 0;
+}
+.mx-wall[data-blackout='true'] { filter: brightness(0.08); }
+/* the picture is the only draggable thing on the wall: empty wall is not a handle */
+.mx-img {
+  position: absolute;
+  pointer-events: auto;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-drag: none;
+  touch-action: none;
+}
+.mx-wall[data-dragging='true'] .mx-img { cursor: grabbing; }
+
+.mx-handfx {
+  position: absolute;
+  left: -437.5px;
+  top: 0;
+  width: 1280px;
+  height: 720px;
+  pointer-events: none;
+}
+.mx-mirror {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: contain;
+  object-fit: cover;
 }
 
-/* the "nothing to show" line: hand fx with no pane open has no canvas to move */
-.mp-empty {
+/* Overlay layers are click-through; the rules inside each shadow root re-enable the pointer on
+   the element itself (.dialog, .toast), so a press in empty strip space reaches nothing. */
+.mx-layer {
   position: absolute;
   inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--fg-4);
-  text-align: center;
-  padding: 8px;
+  pointer-events: none;
 }
 
-/* ---------------------------------------------------------------- controls */
+/* ---------------------------------------------------------------- compact */
 
-/* The module's controls are shown only for the selected card: four rows of buttons in an idle
-   column is noise, and the selected card is the one "interactive" means. */
-.mp-controls {
-  display: none;
-  flex-wrap: wrap;
-  gap: 4px;
-  /* above the inert picture, so a button is always the thing the pointer hits */
-  position: relative;
-  z-index: 2;
-}
-.mp-slot[data-selected='true'] .mp-controls { display: flex; }
-.mp-controls .mp-c {
-  font-size: 9.5px;
-  padding: 0 6px;
-  height: 20px;
-  letter-spacing: 0.04em;
-}
-
-/* A compact column hides the controls' labels down to a scrollable row rather than stacking the
-   card taller than the picture. */
-.merged[data-compact='true'] .mp-label { gap: 4px; }
-.merged[data-compact='true'] .mp-state { display: none; }
+/* A narrow column drops the chips' state text before it drops the chips: the picture is the
+   reason the column exists, the state words are not. */
+.merged[data-compact='true'] .mx-chip-state { display: none; }
+.merged[data-compact='true'] .merged-chips .pv-chip { padding: 1px 3px; }
+.merged[data-compact='true'] .mx-body { padding: 5px; }
 
 /* ---------------------------------------------------------------- the resizer */
 
-/* The handle is the column's right edge. It is 8px wide for the hand but paints a 1px hairline
+/* The handle is the column's right edge. It is 9px wide for the hand but paints a 1px hairline
    and a 2px accent bar on hover/drag, so the affordance is obvious without a permanent stripe. */
 .merged-resize {
   position: absolute;
@@ -253,15 +215,8 @@
 }
 .merged[data-dragging='true'] { transition: none; }
 
-/* ---------------------------------------------------------------- narrow */
-
-/* Below ~900px the column would eat the pane: it stays as a strip on the left with the chips
-   still reachable, and its width is clamped by the same share the resizer uses. */
-.merged[data-compact='true'] .merged-stage { padding: 7px; gap: 7px; }
-.merged[data-compact='true'] .merged-chips .pv-chip { padding: 1px 3px; }
-
 @media (max-width: 760px) {
   /* a phone-ish window has no room for a column at all: the shell hides it (shell.css), and the
-     merged preview is simply not part of that layout */
+     show preview is simply not part of that layout */
   .merged { display: none; }
 }
