@@ -406,7 +406,9 @@ export function mountMergedColumn(host, opts = {}) {
       src: '/wall/portrait',
       scrolling: 'no',
       title: 'Show wall',
-      style: 'width:720px;height:1280px;border:0;position:absolute;inset:0;transform:scale(0.5625);transform-origin:0 0',
+      /* pointer-events:none keeps the stage under the frame receiving the pointer, so a press
+       * lands on the strip and not inside the wall document. */
+      style: 'width:720px;height:1280px;border:0;position:absolute;inset:0;transform:scale(0.5625);transform-origin:0 0;pointer-events:none',
     }),
   );
 
@@ -627,6 +629,59 @@ export function mountMergedColumn(host, opts = {}) {
     wallEl.style.setProperty('--pv-dot', look.blackout ? '0.04' : String(clamp(0.25 + bright * 0.5, 0.12, 1)));
   }
 
+
+  /* ------------------------------------------------------ the pointer bus */
+
+  /* The strip reports where the operator's pointer is, in 0..1 of the stage, so the stage's own
+   * source can react. 30 Hz at most: one POST per 33 ms carrying the newest position, and a press
+   * goes out at once instead of waiting for the timer's turn. */
+  const POINTER_MS = 33;
+  let pointerSent = 0;
+  let pointerTimer = 0;
+  let pointerNext = null;
+
+  function pointerPost(p) {
+    if (dead() || !selected) return;
+    fetch('/api/stage/pointer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ x: p.x, y: p.y, down: p.down, module: selected }),
+    }).catch(() => {
+      /* the bus is best effort: a lost position is not worth a retry or a message */
+    });
+  }
+
+  function pointerFlush() {
+    pointerTimer = 0;
+    const p = pointerNext;
+    pointerNext = null;
+    if (!p) return;
+    pointerSent = Date.now();
+    pointerPost(p);
+  }
+
+  function pointerAt(ev, down) {
+    const at = toScene(ev);
+    pointerNext = {
+      x: clamp(at.x / STRIP.w, 0, 1),
+      y: clamp(at.y / STRIP.h, 0, 1),
+      down,
+    };
+    if (down) {
+      if (pointerTimer) clearTimeout(pointerTimer);
+      pointerFlush();
+      return;
+    }
+    if (pointerTimer) return;
+    const wait = POINTER_MS - (Date.now() - pointerSent);
+    pointerTimer = setTimeout(pointerFlush, wait > 0 ? wait : 0);
+  }
+
+  scene.addEventListener('pointermove', (ev) => pointerAt(ev, false));
+  scene.addEventListener('pointerdown', (ev) => pointerAt(ev, true), true);
+  timers.push(() => {
+    if (pointerTimer) clearTimeout(pointerTimer);
+  });
 
   /* ------------------------------------------------------------ the alerts */
 
