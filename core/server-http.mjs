@@ -11,6 +11,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { HttpError, isObj } from './id.mjs';
+import { createPointer } from './stage-pointer.mjs';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -209,6 +210,8 @@ export function safeJoin(root, rel) {
 }
 
 export function createServer({ port, host, stateDir, publicDir, registry, events, obs, log, version, core = {} }) {
+  // The show preview's cursor: one in-memory value, re-broadcast on the `pointer` channel.
+  const pointer = createPointer({ events });
   const server = http.createServer(async (req, res) => {
     applyCors(res);
     let url;
@@ -242,6 +245,13 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
       }
       if (p === '/api/modules' && req.method === 'GET') {
         return sendJson(res, 200, { ok: true, modules: registry.describe() });
+      }
+      // Stage pointer: POST stores and re-broadcasts (SSE `event: pointer`), GET reads it back.
+      // Core-owned so no module can shadow the path the preview and the overlays agreed on.
+      if (p === '/api/stage/pointer') {
+        if (req.method === 'GET' || req.method === 'HEAD') return sendJson(res, 200, pointer.get());
+        if (req.method === 'POST') return sendJson(res, 200, pointer.set(await readJson(req)));
+        return sendJson(res, 405, { ok: false, error: `${req.method} not allowed` });
       }
       const st = /^\/api\/modules\/([a-z0-9-]+)\/state$/.exec(p);
       if (st && req.method === 'GET') {

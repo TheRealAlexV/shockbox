@@ -152,13 +152,46 @@ function apply(snap) {
   }
 }
 
+/* ---------------------------------------------------------------- stage pointer */
+
+// The show preview POSTs its pointer; the hub re-broadcasts it on `pointer` with x/y normalized
+// to the preview surface. Draw it at the same relative spot here — this page is a different
+// size, so the fraction is the only coordinate that transfers. Above the toasts, never a click
+// target, invisible until the first frame arrives.
+const cursorEl = document.createElement('div');
+cursorEl.className = 'stage-pointer';
+cursorEl.innerHTML =
+  '<svg viewBox="0 0 20 26" width="22" height="28" aria-hidden="true">' +
+  '<path d="M0 0V22L5.8 16.6 9.6 24.9 13 23.4 9.2 15.2 17 14.9Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/>' +
+  '</svg>';
+document.body.appendChild(cursorEl);
+
+let cursorTimer = 0;
+
+function drawPointer(p) {
+  if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') return;
+  const dy = p.down ? 2 : 0;
+  cursorEl.style.transform = `translate3d(${p.x * window.innerWidth}px, ${p.y * window.innerHeight + dy}px, 0)`;
+  cursorEl.style.opacity = '1';
+  clearTimeout(cursorTimer);
+  cursorTimer = setTimeout(() => {
+    cursorEl.style.opacity = '0';
+  }, 1500);
+}
+
 function connect() {
-  const es = new EventSource('/events?channels=notifications&client=notify-overlay');
+  const es = new EventSource('/events?channels=notifications,pointer&client=notify-overlay');
   // The hub sends every frame twice (typed event + `message`) and an EventSource here collapses
   // them into `message` only, so the typed listeners are not what runs. Re-read on `message`:
   // one HTTP read of the full record, applied once.
   let pending = null;
-  es.addEventListener('message', () => {
+  es.addEventListener('message', (ev) => {
+    // A `pointer` frame also arrives as `message`; it is not a state change, so do not refetch.
+    try {
+      if (JSON.parse(ev.data).channel === 'pointer') return;
+    } catch {
+      /* not our record */
+    }
     if (pending) return;
     pending = fetch('/api/notifications/live')
       .then((r) => r.json())
@@ -173,6 +206,14 @@ function connect() {
       apply(JSON.parse(ev.data));
     } catch (err) {
       console.error('bad snapshot', err);
+    }
+  });
+  // The show preview's cursor. Flat payload from the hub: {x, y, down, module, t, channel, seq}.
+  es.addEventListener('pointer', (ev) => {
+    try {
+      drawPointer(JSON.parse(ev.data));
+    } catch {
+      /* malformed frame: leave the last one on screen until it fades */
     }
   });
   es.addEventListener('reset', () => {

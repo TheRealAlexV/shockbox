@@ -174,3 +174,17 @@ body {
 .btn:hover {
   opacity: 1;
 }
+
+/* The stage pointer from the show preview: an annotation on the stream, not part of the strip,
+   so it sits above every toast and never takes a click. */
+.stage-pointer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 220ms ease;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.5));
+  will-change: transform, opacity;
+}
