@@ -325,6 +325,49 @@ try {
   const lookAfter = (await live()).settings.brightness.value;
   ok('a look control reaches the settings document', lookAfter !== lookBefore || lookSet === 'no control', `${lookBefore} → ${lookAfter} (${lookSet})`);
 
+  // ---- the bus, not the poll -------------------------------------------------
+  // Everything above drives the pane's own controls, so it proves the pane's PATCH round-trips
+  // and nothing about the path a *push* takes. That path was the one that was dead: the hub typed
+  // the wire event after the frame kind (`event: state.snapshot`) while the shell's bus listens
+  // per channel, so an outside change reached no subscriber at all and the pane only caught up on
+  // its 4 s `/api/wall/live` poll — which the earlier wait allowances happily let answer for the
+  // bus. Two things fix the gate: the change is made from outside the page, and the poll is held
+  // shut for the measurement, so a repaint can only have come over the hub.
+  const pushBefore = { speed: (await live()).settings.speed.value, brightness: (await live()).settings.brightness.value };
+  await c.send('Fetch.enable', { patterns: [{ urlPattern: '*/api/wall/live*' }] });
+  const pushLatency = async (key, want) => {
+    const t0 = Date.now();
+    const res = await fetch(`${srv.url}/api/wall/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ [key]: want }),
+    });
+    if (!res.ok) return { ms: -1, why: `PATCH ${res.status}` };
+    for (;;) {
+      const shown = await c.eval(`(function(){var n=document.querySelector('input[id="set-${key}"]'); return n ? n.value : null;})()`);
+      const ms = Date.now() - t0;
+      if (shown !== null && Math.abs(Number(shown) - Number(want)) < 1e-9) return { ms, why: `${shown}` };
+      if (ms > 1000) return { ms: 1001, why: `still ${shown}` };
+      await sleep(40);
+    }
+  };
+  try {
+    const push1 = await pushLatency('speed', 0.5);
+    ok('a pushed setting repaints its knob over the bus, not the poll', push1.ms <= 1000, `${push1.ms} ms, speed → ${push1.why}`);
+    const push2 = await pushLatency('brightness', 1.25);
+    ok('the next push repaints too (the bus stays live)', push2.ms <= 1000, `${push2.ms} ms, brightness → ${push2.why}`);
+  } finally {
+    // Released even when a measurement above throws: a held Fetch domain blocks every later
+    // request on the page and wedges the assertions that follow.
+    await c.send('Fetch.disable');
+  }
+  await fetch(`${srv.url}/api/wall/settings`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(pushBefore),
+  });
+  await sleep(600);
+
   // Every rendered row must write a key the server accepts. The schema form ids its controls
   // `set-<key>`, so the rendered key set is the control set: PATCH each one with its current
   // value and read the status (300 = refused).
@@ -643,28 +686,27 @@ try {
     `${bitsPosted}: imageBits ${afterUpload.imageBits} → ${bitsGot}`);
 
   // The dither is offered from 10-bit up and says so: at 8 bit it has no steps worth filling.
-  // The pane repaints these controls from the document it re-reads after the PATCH, and `settle`
-  // only watches the server — so wait for the paint (bounded) instead of judging the switch in
-  // the milliseconds between the server committing and the pane drawing. Measured: at the first
-  // sample the switch still read the previous depth, 100 ms later it read the new one.
-  const painted = async (want, ms = 2000) => {
+  // Wait on the pane's OWN paint — it is the only writer of `disabled`. Waiting on the depth
+  // select would prove nothing: `pickImg` below writes that select itself, so such a wait returns
+  // before the pane has drawn anything and the flag it then reads is whatever the last paint left.
+  const paintedDither = async (want, ms = 2000) => {
     const t0 = Date.now();
     let img = await readImage();
-    while (Date.now() - t0 < ms && String(img.value.bits) !== String(want)) {
+    while (Date.now() - t0 < ms && img.value.ditherDisabled !== want) {
       await sleep(50);
       img = await readImage();
     }
     return img;
   };
-  const at10 = await painted(bitsGot);
+  const at10 = await paintedDither(false);
   await pickImg(imgIds.bits, '8');
   const at8 = await settle('imageBits', '8');
-  const at8Controls = await painted(at8);
+  const at8Controls = await paintedDither(true);
   await pickImg(imgIds.bits, '10');
   const backBits = await settle('imageBits', '10');
   ok('the Dither toggle is offered from 10-bit up and refused at 8-bit',
     at10.value.ditherDisabled === false && at8Controls.value.ditherDisabled === true,
-    `10-bit disabled:${at10.value.ditherDisabled} · 8-bit disabled:${at8Controls.value.ditherDisabled} (bits read back ${at8} → ${backBits})`);
+    `10-bit ${JSON.stringify(at10.value)} disabled:${at10.value.ditherDisabled} · 8-bit ${JSON.stringify(at8Controls.value)} disabled:${at8Controls.value.ditherDisabled} (bits read back ${at8} → ${backBits})`);
 
   const ditherWant = !(at10.value.dither);
   const ditherPosted = await pickImg(imgIds.dither, ditherWant);

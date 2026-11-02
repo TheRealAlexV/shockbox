@@ -146,13 +146,19 @@ export function createEvents({ log }) {
 
   /** Publish a state-ish record (not replayable). Honours `view` exactly like publish(). */
   function emit(channel, event, data, view = null) {
-    const json = JSON.stringify(data);
-    // `message` too, so an onmessage client that only knows the plain frame still sees state.
-    const text = `event: message\ndata: ${json}\n\nevent: ${event}\ndata: ${json}\n\n`;
+    // One record shape for every frame on the wire, and the typed event name is the *channel*
+    // — exactly what publish() sends and what frame() documents. Typing the wire event after
+    // the kind instead (`event: state.snapshot`) left every channel subscriber deaf: the admin
+    // shell's bus listens per channel, so a settings push reached a page that was listening for
+    // `wall` as nothing at all and the pane only caught up on its 4 s poll. The kind rides in
+    // the record, where the consumer already looks for it.
+    // `t` stamps the record: consumers dedupe consecutive frames on channel|seq|kind|t, so two
+    // same-kind emits with no stamp collapse into one and the second is dropped outright.
+    const rec = { channel, event, data, t: Date.now() };
     for (const c of clients.values()) {
       if (!c.channels.has(channel)) continue;
       if (view && c.view && c.view !== view) continue;
-      write(c, text);
+      write(c, frame(channel, rec));
     }
     for (const fn of subs.get(`${channel}|${view || ''}`) || []) {
       try {

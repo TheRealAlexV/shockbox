@@ -126,8 +126,11 @@ function createBus() {
       }
     });
     // Catch-all: cannot see arbitrary named events, so the shell subscribes to the channels it
-    // knows about (core + every module channel from /api/modules) plus a few fixed ones.
-    const names = new Set(['pool', 'core', 'notifications', 'dialogs', 'sound', 'settings', 'layout']);
+    // knows about (core + every module channel from /api/modules) plus the one fixed channel the
+    // core publishes on. The wire names a frame after its *channel*, every time — the frame's
+    // kind (`state.snapshot`, `settings`, `sound`, …) is inside the record, so a listener per
+    // kind would receive nothing.
+    const names = new Set(['pool', 'core']);
     for (const m of state.modules) for (const c of m.channels || []) names.add(c);
     for (const name of names) es.addEventListener(name, onNamed(name));
     retry++;

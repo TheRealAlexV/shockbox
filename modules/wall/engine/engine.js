@@ -2830,11 +2830,16 @@
     // ShockBox state frames: the control pane changed a setting. These carry the render look and
     // the fence, not an engine command, so they are handed to the page rather than applied by
     // applyCommand(). The page's snapshot handler merges them and no-ops an unchanged revision.
-    es.addEventListener('state.snapshot', function (ev) {
-      self.lastEventAt = Date.now();
-      var d = null;
-      try { d = JSON.parse(ev.data); } catch (e2) { return; }
+    // Every frame is typed with its *channel*, so the kind is the record's `event`, not the wire
+    // event name; a command frame on this same channel carries `cmd` and is ignored here.
+    es.addEventListener('wall', function (ev) {
+      var rec = null;
+      try { rec = JSON.parse(ev.data); } catch (e2) { return; }
+      if (!rec || typeof rec !== 'object' || rec.event !== 'state.snapshot') return;
+      // the record wraps the snapshot the page's handler has always been given
+      var d = rec.data;
       if (!d || typeof d !== 'object') return;
+      self.lastEventAt = Date.now();
       if (typeof d.rev === 'number' && d.rev === self.lastRev) return;
       if (typeof d.rev === 'number') self.lastRev = d.rev;
       self.snapshots++;

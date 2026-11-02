@@ -1187,13 +1187,29 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     if (f.rows) rows = f.rows;
   }
 
+  // The settings document is the truth: take the schema map the server just sent and let the
+  // mounted form read its values back. Without this, a knob only ever painted what the *local*
+  // edit left behind — the 4 s pull replaced `settingsMeta` but never touched the form, so a
+  // Speed changed anywhere else showed a stale number until a reload.
+  function adoptSettings(next) {
+    if (!next) return;
+    settingsMeta = next;
+    // A push and the 4 s poll both land here, and the form writes `input.value` straight from
+    // the document — so an unguarded refresh reverted whatever field the operator was typing
+    // in. Leave the mounted form alone while it holds focus; the next adoption after blur
+    // catches it up.
+    if (form && !(document.activeElement && settingsSlot.contains(document.activeElement))) {
+      form.refresh(settingsMeta);
+    }
+  }
+
   function applyLive(data) {
     if (!data) return;
     live = data;
     seq = Number(data.seq) || seq;
     if (data.online) online = { landscape: !!data.online.landscape, portrait: !!data.online.portrait };
     if (Array.isArray(data.history)) history = data.history;
-    if (data.settings) settingsMeta = data.settings;
+    if (data.settings) adoptSettings(data.settings);
     if (data.ratio) ratioState = data.ratio;
     if (data.render) {
       renderDoc = data.render;
@@ -1970,6 +1986,13 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       return;
     }
     if (frame.channel !== 'wall') return;
+    // the core pushes the settings document on the module's channel when it changes — from the
+    // deck, another pane, a scene, or this pane's own PATCH. Adopt it before anything else: the
+    // generic knobs are the pane's only read-out of that document.
+    if (frame.event === 'settings' && frame.data && frame.data.settings) {
+      adoptSettings(frame.data.settings);
+      return;
+    }
     // `state.snapshot` (a settings/look push) and page snapshots both carry `look`
     const snap = frame.event === 'state.snapshot' || (frame.data && frame.data.look !== undefined) ? frame.data || {} : null;
     if (snap) {
