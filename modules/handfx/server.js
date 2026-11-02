@@ -193,9 +193,15 @@ function build(ctx) {
   // Body-tracking status: updated only by the overlay's /ack (a timestamp, never a frame) and by
   // the body page's own /ack. Read back on /status so the pane can say whether a mask is arriving.
   const body = { lastMaskAt: 0, pageOpen: false, lastPoseAt: 0 };
+  // The overlay's draw truth, reported on /ack: how many frames it rendered, where the anchors came
+  // from, and when the last frame landed. Counters and a name, never a frame.
+  const draw = { draws: 0, anchors: 'none', lastDrawAt: 0 };
 
   function publish(cmd, args) {
-    const rec = events.publish('handfx', cmd, { ...args, at: Date.now(), id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}` });
+    // The replay stamp lives on its own key: `args.id` belongs to the caller (it is the effect id
+    // a deck key or the pane names), and overwriting it here made `effect.set {id:"fireball"}`
+    // arrive at the page as `{id:"m1x2y3z"}` — published, acknowledged, and silently ignored.
+    const rec = events.publish('handfx', cmd, { ...args, at: Date.now(), sid: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}` });
     lastCmd = { cmd, args, seq: rec?.seq ?? null, at: Date.now() };
     return rec;
   }
@@ -209,6 +215,11 @@ function build(ctx) {
       model: { local: Boolean(model), name: MODEL_NAME, url: MODEL_URL },
       bodyModels: bodyModels(),
       body: { lastMaskAt: body.lastMaskAt, pageOpen: body.pageOpen && Date.now() - body.lastPoseAt < 5000, lastPoseAt: body.lastPoseAt },
+      // Whether the overlay is drawing at all, and on what: `none` means the page is open but no
+      // loop has rendered (or no page is open), which is the state that looks like a dead source.
+      draws: draw.draws,
+      anchors: draw.anchors,
+      lastDrawAt: draw.lastDrawAt,
       runtime: {
         vendored: fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')),
         simdWasm: fs.existsSync(path.join(VENDOR, 'vision', 'simd-wasm', 'vision_wasm_internal.wasm')),
@@ -343,6 +354,12 @@ function build(ctx) {
             return send(res, 200, { ok: true });
           }
           if (Number.isFinite(bodyIn.maskAt) && bodyIn.maskAt > body.lastMaskAt) body.lastMaskAt = Math.min(Date.now(), bodyIn.maskAt);
+          // The page's draw truth: monotonic counter, the anchor source, the last draw stamp.
+          if (Number.isFinite(bodyIn.draws)) draw.draws = Math.max(draw.draws, Math.max(0, bodyIn.draws | 0));
+          if (['camera', 'synthetic', 'none'].includes(bodyIn.anchors)) draw.anchors = bodyIn.anchors;
+          if (Number.isFinite(bodyIn.lastDrawAt) && bodyIn.lastDrawAt > draw.lastDrawAt) {
+            draw.lastDrawAt = Math.min(Date.now(), bodyIn.lastDrawAt);
+          }
           events.emit('handfx', 'page', {
             effect: typeof bodyIn.effect === 'string' ? bodyIn.effect : null,
             tracking: bodyIn.tracking === true,
@@ -351,6 +368,9 @@ function build(ctx) {
             gesture: typeof bodyIn.gesture === 'string' ? bodyIn.gesture.slice(0, 40) : null,
             body: bodyIn.body === true,
             error: typeof bodyIn.error === 'string' ? bodyIn.error.slice(0, 240) : null,
+            draws: draw.draws,
+            anchors: draw.anchors,
+            lastDrawAt: draw.lastDrawAt,
             at: Date.now(),
           });
           send(res, 200, { ok: true });

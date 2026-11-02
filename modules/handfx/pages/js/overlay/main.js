@@ -56,6 +56,9 @@ const state = {
   hands: 0,
   gesture: 'none',
   synthetic: false,
+  anchors: 'none', // camera | synthetic | none — where the current frame's anchors came from
+  draws: 0, // frames the renderer actually drew: the loop's own counter, reported on /ack
+  lastDrawAt: 0,
   lastAck: 0,
   startedAt: Date.now(),
   bodyAt: 0, // last body-mask message (performance.now)
@@ -149,17 +152,19 @@ function applyBusCommand(msg) {
   if (!msg || msg.channel !== 'handfx') return;
   if (msg.cmd === 'page') return; // this page's own status echo
   if (!msg.cmd) return;
-  // `at` and `id` are the server's per-publish stamp: a ring replay after a reconnect must not
-  // re-fire a one-shot (a reload would loop forever, an effect would double-spawn).
-  if (msg.args && typeof msg.args.id === 'string') {
+  // `sid` is the server's per-publish stamp: a ring replay after a reconnect must not re-fire a
+  // one-shot (a reload would loop forever, an effect would double-spawn). `args.id` is the
+  // caller's own value — the effect id — so it is never used as the dedupe key.
+  if (msg.args && typeof msg.args.sid === 'string') {
     if (!state.seenIds) state.seenIds = new Set();
-    if (state.seenIds.has(msg.args.id)) return;
-    state.seenIds.add(msg.args.id);
+    if (state.seenIds.has(msg.args.sid)) return;
+    state.seenIds.add(msg.args.sid);
     if (state.seenIds.size > 200) state.seenIds = new Set([...state.seenIds].slice(-100));
   }
   const cmd = msg.cmd;
   if (cmd === 'effect.next' || cmd === 'effect.prev') {
     const id = stepEffect(cmd === 'effect.next' ? 1 : -1);
+    ensureSyntheticAnchors(); // no camera: draw on the synthetic rig instead of nothing
     fx.trigger(id, {});
     renderState();
     ack();
@@ -169,6 +174,9 @@ function applyBusCommand(msg) {
     if (list.includes(id)) {
       state.cursor = list.indexOf(id);
       state.effect = id;
+      // An effect is a render, not a promise of a hand: with no camera the synthetic anchors are
+      // the rig, so the command draws now.
+      ensureSyntheticAnchors();
       fx.trigger(id, {});
       renderState();
       ack();
@@ -244,7 +252,10 @@ function noteStartClick() {
 }
 
 async function startTracking({ fromBus = false, synthetic = false } = {}) {
-  if (state.tracking) return;
+  // A running camera owns the view; a running synthetic rig gives way to a real camera (the
+  // overlay starts on synthetic when no camera arrives, so the Start button must still work).
+  if (state.tracking && !state.synthetic) return;
+  if (state.tracking) stopTracking();
   if (fromBus && !canStartFromBus()) {
     setBanner('Camera not started: press Start once in this page (a browser only opens a camera from a real click).', 'warn');
     renderState();
@@ -279,8 +290,32 @@ function stopTracking() {
   tracker.stop();
   state.tracking = false;
   state.camera = 'off';
+  state.anchors = 'none';
+  fx.view = null;
   fx.releaseAll();
   renderState();
+}
+
+/** Are there anchors an effect could draw at? An empty frame is not a hand. */
+function anchorsPresent() {
+  return Boolean(fx.view && (fx.view.anchor || fx.view.front || (fx.view.palms && fx.view.palms.length)));
+}
+
+/**
+ * The rig this page runs on may have no camera at all (an OBS browser source on a streaming PC,
+ * or a laptop with the lid shut). Rather than render nothing, the page keeps drawing on the
+ * synthetic hands the pane already offers — same classifier, same renderer, labelled on the badge
+ * and on /ack as `synthetic`, never claimed to be camera input. Returns whether it drew.
+ */
+function ensureSyntheticAnchors() {
+  if (state.tracking && !state.synthetic) return false; // a camera session owns the view
+  if (!state.synthetic) tracker.startSynthetic();
+  state.synthetic = true;
+  state.tracking = true;
+  // Fill the view in this same tick, so a command fired now draws on the very next frame instead
+  // of on the first frame of the synthetic loop.
+  onFrame({ hands: syntheticHands(performance.now() / 1000), width: 640, height: 480, source: 'synthetic', at: performance.now() });
+  return true;
 }
 
 function onTrackerState(snap) {
@@ -327,6 +362,11 @@ function onFrame(frame) {
   // Every pose feeds the effect it belongs to; the classifier's gesture *is* the beat. The cursor
   // (`effect.next` / `effect.prev`) is the list position a deck key steps, and the badge says so.
   // Embers are ambience, not a beat: any hand present keeps a rising ember field alive.
+  // The anchors come first: a gesture that fires `shoot` spawns its burst from them.
+  const anchors = anchorsFrom(result.hands);
+  if (swipe && swipe.speed > 0.5 && anchors.anchor) anchors.swipe = { ...anchors.anchor, radius: 0.18 };
+  fx.view = anchors;
+  state.anchors = frame.source === 'synthetic' ? 'synthetic' : 'camera';
   if (hands.length && effectiveEffects().includes('embers') && !fx.live.has('embers') && result.gesture) {
     fx.trigger('embers', {});
   }
@@ -346,9 +386,6 @@ function onFrame(frame) {
     if (beat === 'shoot') spawnShoot(anchors);
     else fx.trigger(beat, {});
   }
-  const anchors = anchorsFrom(result.hands);
-  if (swipe && swipe.speed > 0.5 && anchors.anchor) anchors.swipe = { ...anchors.anchor, radius: 0.18 };
-  fx.view = anchors;
   if (debugCtx) drawDebug(frame, hands, now);
   if (fx.settings.debugOverlay && tracker.video && now - (onFrame._texAt || 0) > 60) {
     onFrame._texAt = now;
@@ -484,6 +521,11 @@ function ack(now = performance.now()) {
       // ever leaving this page. `body` also lets the pane name the body effects honestly.
       maskAt: state.bodySeen ? state.bodyAt : 0,
       body: state.bodySeen,
+      // The draw truth: how many frames the loop has rendered, where its anchors came from, and
+      // when the last one landed. Counters only — still no frame and no landmark leaves the page.
+      draws: state.draws,
+      anchors: state.anchors,
+      lastDrawAt: state.lastDrawAt,
     }),
   }).catch(() => {});
 }
@@ -577,6 +619,12 @@ function loop(now) {
       }
     }
     fx.render(now, fx.view || {});
+    // What actually reached the canvas: one count per render pass, and when. The pane and a
+    // `curl /status` read these back through /ack instead of assuming the picture is alive.
+    if (fx.supported) {
+      state.draws += 1;
+      state.lastDrawAt = Date.now();
+    }
   }
   requestAnimationFrame(loop);
 }
@@ -625,6 +673,13 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   connectBus();
   renderState();
   requestAnimationFrame(loop);
+  // No camera, no waiting: if nothing has produced anchors 1.5 s after load (no track opened, or
+  // one that never delivered a hand), the overlay draws on the synthetic rig and keeps animating.
+  // The truth is on the badge and on /ack (`anchors: 'synthetic'`), never dressed as a camera.
+  setTimeout(() => {
+    if (anchorsPresent() || (state.tracking && !state.synthetic)) return;
+    ensureSyntheticAnchors();
+  }, 1500);
   // Test hook: the browser test drives the page through this, not through the DOM.
   window.__handfx = {
     state,
