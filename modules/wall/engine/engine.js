@@ -31,13 +31,16 @@
   if (!GRADE || !SIM) throw new Error('LEDWall: config.js, grade.js and sim.js must load first');
 
   // ── Preset dimensions ─────────────────────────────────────────────────────
-  // What a preset *is*: the look of the wall. Deliberately excludes grid geometry (`gridCols`,
-  // `gridRows`, `cellShape`) because that is a property of the physical installation, not of a
-  // look, and it excludes everything under `views.*.text` because a preset must never reach the
-  // text-mode message pool.  `preset.save` copies exactly these keys off the live settings.
+  // What a preset *is*: the look of the wall, its cell grid included.  The grid was left out
+  // once, as "installation, not look", and that is where the screen door came from: Ember
+  // declares 28 columns and ledSize 2.10 but rendered at the page's 112/63 pitch.  The numbers
+  // a look ships are part of the look, so they are saved and applied with it.  Everything under
+  // `views.*.text` stays out: a preset must never reach the text-mode message pool.
+  // `preset.save` copies exactly these keys off the live settings.
   // One list, two runtimes: `server.js` imports it (it is exported below) and this page uses it.
   // A dimension added to a preset must be added once, or a saved look loses it on the way back.
   var PRESET_DIMS = [
+    'gridCols', 'gridRows', 'cellShape',
     'mode', 'pattern', 'speed', 'transitionSpeed',
     'palette', 'paletteWeight', 'bgColor', 'hdrGain',
     'ledSize', 'streakOpacity', 'flashDensity', 'waveFrequency', 'persistence',
@@ -52,6 +55,17 @@
     'imageOn', 'imageRev',
     'textScroll', 'safeArea'
   ];
+
+  // Grid geometry, and which of it a caller actually declared.  After `merge(DEFAULTS, ...)`
+  // every key exists, so a declaration has to be recorded separately: `_computeGrid` needs to
+  // know whether a portrait column count was asked for or is just the fallback.
+  var GRID_KEYS = ['gridCols', 'gridColsPortrait', 'gridRows', 'cellShape'];
+  function markDeclared(into, src) {
+    if (!src || !into) return;
+    for (var i = 0; i < GRID_KEYS.length; i++) {
+      if (Object.prototype.hasOwnProperty.call(src, GRID_KEYS[i])) into[GRID_KEYS[i]] = true;
+    }
+  }
 
   /** Operator-saved presets live beside the shipped ones in the same lookup the engine reads. */
   function applySavedPresets(saved) {
@@ -484,6 +498,10 @@
     this.canvas = canvas;
     this.opts = opts;
     this.s = merge(DEFAULTS, settings || {});
+    // What the caller/look declared, so the grid maths can tell a deliberate portrait count
+    // from the DEFAULTS value it would otherwise read.
+    this.declared = {};
+    markDeclared(this.declared, settings);
     this.onStats = typeof opts.onStats === 'function' ? opts.onStats : null;
 
     // Operator-saved presets, handed in by the page (`boot.js` pulls them from the server) or
