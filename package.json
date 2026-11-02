@@ -14,6 +14,7 @@
     "test": "node test/log-rotation.mjs && node test/ratio.mjs && node test/ratio-commands.mjs && node test/schedule.mjs && node test/schedule-delivery.mjs && node test/api-smoke.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs && node test/wall-browser.mjs && node test/handfx-browser.mjs && node test/panes-notify-dialogs.mjs && node test/sound.mjs && node test/merged-preview.mjs && node test/schedule-ui-browser.mjs",
     "test:ci": "npm test && node test/handfx-visual.mjs",
     "test:wall": "node test/ratio.mjs && node test/ratio-commands.mjs && node test/pane-browser.mjs && node test/pane-drag.mjs",
+    "test:wall-image": "node test/wall-image-browser.mjs",
     "test:handfx": "node test/handfx-browser.mjs",
     "test:handfx-visual": "node test/handfx-visual.mjs",
     "test:handfx-visual:strict": "node test/handfx-visual.mjs --strict",

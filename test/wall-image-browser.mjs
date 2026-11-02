@@ -11,13 +11,11 @@
 //
 // Exits non-zero on the first failed expectation, printing the page console and its diag().
 
-import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { launchChrome, CHROME } from './lib/chrome.mjs';
+import { launchChrome, CHROME, startServer as startTestServer } from './lib/chrome.mjs';
 import { probeGl, glLine } from './lib/gl-probe.mjs';
 
 const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
@@ -95,42 +93,10 @@ function multibandPng(w = 256, h = 256) {
 }
 
 // ── server + CDP plumbing (the same shape the other wall gates use) ─────────
-async function freePort() {
-  return new Promise((resolve) => {
-    const s = http.createServer();
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address();
-      s.close(() => resolve(port));
-    });
-  });
-}
-
 async function startServer() {
   if (argUrl) return { url: argUrl, stop() {} };
-  const port = await freePort();
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-wallimg-'));
-  const child = spawn(process.execPath, [path.join(ROOT, 'server.mjs'), '--port', String(port), '--state', stateDir], {
-    cwd: ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  const log = [];
-  child.stdout.on('data', (d) => log.push(String(d)));
-  child.stderr.on('data', (d) => log.push(String(d)));
-  const url = `http://127.0.0.1:${port}`;
-  for (let i = 0; i < 80; i++) {
-    await sleep(200);
-    try {
-      if ((await fetch(`${url}/health`)).ok) {
-        const stop = () => { if (child.exitCode === null) child.kill('SIGTERM'); };
-        process.on('exit', () => child.kill('SIGKILL'));
-        return { url, stateDir, log, stop };
-      }
-    } catch {
-      /* not up yet */
-    }
-  }
-  child.kill('SIGKILL');
-  throw new Error(`server did not come up:\n${log.join('')}`);
+  const srv = await startTestServer({ root: ROOT, statePrefix: 'sb-wall-image-' });
+  return { url: srv.url, stateDir: srv.stateDir, log: srv.log, stop: srv.stop };
 }
 
 async function cdp(url) {
@@ -427,9 +393,10 @@ async function main() {
   try {
     // Start from a known wall: whole 16:9, a SMOOTH pattern (the default `random` re-fires cells
     // every frame, and that flicker is larger than the picture's own step, which swamps the
-    // on/off differencing below), no motion that would fight the picture, a slow ramp so a cell
-    // does not change colour between two reads.
-    await patch({ ratio: '16:9', pattern: 'wave', speed: 0.1, persistence: 0, streakOpacity: 0, bloom: 0, imageOn: 0, imageRev: 0 });
+    // on/off differencing below), and no motion that would fight the picture.
+    // speed:0 freezes the wave (its only clock is `speed`, engine.js:1607) and grain:0 kills the
+    // wall-clock noise term (grade.js:167), so the on/off diff isolates the picture alone.
+    await patch({ ratio: '16:9', pattern: 'wave', speed: 0, persistence: 0, streakOpacity: 0, bloom: 0, grain: 0, imageOn: 0, imageRev: 0 });
 
     await c.send('Page.navigate', { url: `${srv.url}/wall/render` });
     const mounted = await waitFor(c, 'Boolean(window.LEDWALL_INSTANCE && window.LEDWALL_INSTANCE.gl)');

@@ -9,6 +9,11 @@
 //
 //   const { devtools, stop } = await launchChrome({ size: [1440, 900] });
 //
+// The same reaper covers the second way a headless browser burns a core forever: `spawn`ning one
+// outside this module. Every stray Chrome on this box is killed by `isUnmanagedHeadless()`, at
+// launch time and from the exit/signal handlers, because a gate that leaks one costs a full core
+// of SwiftShader until somebody notices the fans.
+//
 // What it guarantees:
 //   · binary from CHROME, then CHROME_PATH, then the /usr/bin names every gate already probed
 //   · --no-sandbox only when CI is set (a runner user cannot use the setuid sandbox); never locally
@@ -18,6 +23,33 @@
 //     registered, one is opened with PUT /json/new?about:blank rather than assuming the first tab
 //     shows up in time
 //   · timeout 30 s when CI is set, 15 s otherwise
+//   · the whole browser dies with the gate: Chrome runs in its own process group and `stop()` —
+//     also armed on process exit, SIGINT, SIGTERM and SIGHUP — kills that GROUP, not just the
+//     top-level child. Killing only the child leaves chrome, zygote and gpu-process reparented to
+//     PID 1, and on a page with WebGL the gpu-process burns 300–520 % CPU in SwiftShader forever.
+//     A gate that hangs, throws or is Ctrl-C'd used to leave one of those per run; 43 of them
+//     took the host's CPU to 100 °C and throttling.
+//
+// NO GATE SPAWNS A BROWSER OR A SERVER ITSELF. Every one goes through `launchChrome` and
+// `startServer` here. A file that calls `spawn` on chrome/chromium, or that writes its own
+// `freePort()` / `child.kill('SIGKILL')` / finally-timeout launcher, is the bug this module
+// exists to remove: it puts a browser outside the reaper, which is exactly how the leak came back
+// last time. If a gate needs a flag, a size or a timeout, pass `extraArgs`, `size` or `timeoutMs`.
+//
+// COST: a wall/render page under SwiftShader costs roughly ONE FULL CORE per browser for as long as
+// it is open — the LED shader runs on the CPU, and a gpu-process at 300–520 % is a single WebGL
+// page, not a busy machine. So:
+//   · never run two wall-page gates at the same time (wall-browser, wall-image-browser,
+//     merged-preview all mount /wall/render; run them one after another — that is why
+//     `test:wall-image` and `test:preview` are separate npm scripts and are NOT in `npm test`,
+//     which is a serial && chain only because each step waits for the previous to exit)
+//   · every launch here must be followed by `stop()` in a `finally` — the reaper only saves you
+//     from a gate that throws, not from one that opens a second page "just to check something"
+//   · a gate that hangs still burns that core until something reaps it; a generous waitFor is
+//     cheaper than a retry loop that leaves the page open
+//   · if you suspect a gate was killed before its `finally`: `bash gui/sweep-orphans.sh` lists
+//     (and, without --dry-run, reaps) every headless Chrome and stray test server on the box.
+//     `npm test` runs it as `pretest`; `npm run sweep` runs it by hand.
 //
 // Anything a caller needs that this does not pass goes in `extraArgs`.
 
@@ -28,6 +60,120 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const IN_CI = Boolean(process.env.CI && process.env.CI !== 'false' && process.env.CI !== '0');
+
+// --- the test server ---------------------------------------------------------------------------
+// The other half of the same leak. Every gate started `server.mjs` with a plain spawn and stopped
+// it with `child.kill('SIGTERM')`; when the gate threw or hung, the stop never ran and the server
+// kept its port, its state dir and its log file open until the host was rebooted. Same fix as the
+// browser: its own process group, and a reaper that kills the group.
+
+const SERVERS = new Set();
+let serverReaperArmed = false;
+
+/** Stop a gate's `server.mjs`. Idempotent, and safe to call from an exit handler. */
+export function reapServer(entry) {
+  if (!entry || entry.stopped) return;
+  entry.stopped = true;
+  SERVERS.delete(entry);
+  try {
+    process.kill(-entry.pid, 'SIGKILL');
+  } catch {
+    /* no group (already gone, or spawn failed) — the direct kill below still runs */
+  }
+  try {
+    if (entry.child.exitCode === null && entry.child.signalCode === null) entry.child.kill('SIGKILL');
+  } catch {
+    /* already gone */
+  }
+}
+
+function reapAllServers() {
+  for (const entry of [...SERVERS]) reapServer(entry);
+}
+
+// A server.mjs left by a dead gate is cheap next to a browser, but it holds a port and a state
+// dir; it costs one /proc pass to leave nothing at all behind.
+function reapStrayServers() {
+  for (const pid of procDirEntries()) {
+    if (Number(pid) === process.pid) continue;
+    const cmd = readProc(pid, 'cmdline');
+    if (!cmd) continue;
+    const argv = cmd.split('\0').filter(Boolean);
+    if (!argv.some((a) => a.endsWith('server.mjs'))) continue;
+    if (!argv.includes('--state')) continue; // a real dev server takes no --state
+    try {
+      process.kill(Number(pid), 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+export function armServerReaper() {
+  if (serverReaperArmed) return;
+  serverReaperArmed = true;
+  process.on('exit', () => {
+    reapAllServers();
+    reapStrayServers();
+  });
+  for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) {
+    process.on(sig, () => {
+      reapAllServers();
+      reapStrayServers();
+      process.exit(code);
+    });
+  }
+}
+
+/**
+ * Start `server.mjs` on a free port with a throwaway state dir and wait for /health.
+ *
+ * @param {object} opts
+ * @param {string} opts.root                 the repo root (where server.mjs lives)
+ * @param {string} [opts.statePrefix]        temp state dir prefix, e.g. 'sb-drag-'
+ * @param {string[]} [opts.args]             extra argv after --port/--state
+ * @param {Function} [opts.spawn]            the spawn to use (defaults to node:child_process)
+ * @param {Function} [opts.mkdtemp]          the temp-dir maker (defaults to fs.mkdtempSync)
+ * @returns {Promise<{url: string, stateDir: string, child: object, stop: () => void}>}
+ */
+export async function startServer({ root, statePrefix = 'sb-srv-', args: extra = [], spawn: spawnFn, mkdtemp } = {}) {
+  const { spawn: spawnDefault } = await import('node:child_process');
+  const spawnChild = spawnFn || spawnDefault;
+  const mkdtempSync = mkdtemp || fs.mkdtempSync;
+  const port = await freePort();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), statePrefix));
+  const child = spawnChild(process.execPath, [path.join(root, 'server.mjs'), '--port', String(port), '--state', stateDir, ...extra], {
+    cwd: root,
+    // stderr is kept (a ring of the last lines) and stdout dropped: a boot failure has to name its
+    // reason in the throw, which is what every gate's hand-rolled log buffer existed for.
+    stdio: ['ignore', 'ignore', 'pipe'],
+    detached: true,
+  });
+  const entry = { child, pid: child.pid, stopped: false, log: [] };
+  if (child.stderr) {
+    child.stderr.on('data', (d) => {
+      for (const line of String(d).split('\n')) if (line) entry.log.push(`${line}\n`);
+      if (entry.log.length > 60) entry.log.splice(0, entry.log.length - 60);
+    });
+  }
+  if (child.pid) {
+    SERVERS.add(entry);
+    armServerReaper();
+  }
+  const stop = () => reapServer(entry);
+  child.on('exit', () => SERVERS.delete(entry));
+  const url = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 80; i++) {
+    await sleep(200);
+    try {
+      if ((await fetch(`${url}/health`)).ok) return { url, stateDir, child, stop, log: entry.log };
+    } catch {
+      /* starting */
+    }
+  }
+  stop();
+  throw new Error(`server did not start:\n${entry.log.join('')}`);
+}
 
 const PROBED = ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
 
@@ -52,6 +198,171 @@ function freePort() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const STDERR_LINES = 60;
+
+// --- unmanaged browsers -----------------------------------------------------------------------
+// A Chrome started by hand (a gate that rolled its own spawn, a probe script, a crashed run) does
+// not belong to any LIVE entry, so nothing above ever reaps it. Its command line is what identifies
+// it: a headless Chrome carrying --remote-debugging-port was started to be driven by a script, and
+// once its driver is gone it is dead weight burning a full core on a WebGL page.
+const MANAGED = new Set(); // every pid this module has ever launched
+const KILLED = new Set(); // ...and their groups, so nothing is reported twice
+
+function procDirEntries() {
+  try {
+    return fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d));
+  } catch {
+    return []; // not Linux: this pass is a no-op rather than a throw
+  }
+}
+
+function readProc(pid, name) {
+  try {
+    return fs.readFileSync(`/proc/${pid}/${name}`, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/** The argv of every live headless Chrome nobody in this process launched. */
+export function unmanagedHeadlessChromes() {
+  const out = [];
+  const self = process.pid;
+  for (const pid of procDirEntries()) {
+    if (Number(pid) === self || MANAGED.has(Number(pid))) continue;
+    const cmd = readProc(pid, 'cmdline');
+    if (!cmd) continue;
+    const argv = cmd.split('\0').filter(Boolean);
+    if (!argv.length) continue;
+    const exe = path.basename(argv[0]);
+    if (!/^(google-chrome|chromium|chrome|headless_shell)(-stable)?$/.test(exe)) continue;
+    if (!argv.some((a) => a === '--headless' || a.startsWith('--headless='))) continue;
+    const dbg = argv.find((a) => a.startsWith('--remote-debugging-port'));
+    if (!dbg) continue; // a visible browser is the user's; a headless one with no port is not a test
+    const stat = readProc(pid, 'stat');
+    // pid (comm) state ppid pgrp ...
+    const fields = stat ? stat.slice(stat.lastIndexOf(')') + 2).split(' ') : [];
+    const pgrp = fields.length > 2 ? Number(fields[2]) : Number(pid);
+    const ppid = fields.length > 1 ? Number(fields[1]) : 0;
+    out.push({ pid: Number(pid), pgrp, ppid, exe, dbg });
+  }
+  return out;
+}
+
+/** True when `pid` looks like an unmanaged headless Chrome. */
+export function isUnmanagedHeadless(pid) {
+  if (!pid || MANAGED.has(Number(pid))) return false;
+  return unmanagedHeadlessChromes().some((c) => c.pid === Number(pid));
+}
+
+/**
+ * Kill every unmanaged headless Chrome on the box (process group first, so gpu-process and
+ * zygote go with it). Returns the pids it took down. Cheap: ~400 /proc reads, no spawn.
+ */
+export function reapUnmanagedHeadlessChromes() {
+  const killed = [];
+  for (const c of unmanagedHeadlessChromes()) {
+    let gone = false;
+    if (c.pgrp && c.pgrp !== Number(c.pid) && KILLED.has(c.pgrp)) gone = true;
+    if (!gone) {
+      try {
+        process.kill(-c.pgrp, 'SIGKILL');
+        gone = true;
+      } catch {
+        /* its own group is already empty; the direct kill below decides */
+      }
+      try {
+        process.kill(c.pid, 'SIGKILL');
+        gone = true;
+      } catch {
+        /* already gone */
+      }
+    }
+    KILLED.add(c.pgrp || c.pid);
+    MANAGED.add(c.pid);
+    if (gone) killed.push(c.pid);
+  }
+  return killed;
+}
+
+/**
+ * Guard a pid that came out of a gate's logs (`log: [server 12345: ...]`). When it is an unmanaged
+ * headless Chrome - the pid a leaked browser printed at boot - it is killed and `true` returned.
+ */
+export function reapIfBrowser(pid) {
+  if (!pid || MANAGED.has(Number(pid))) return false;
+  const cmd = readProc(Number(pid), 'cmdline');
+  if (!cmd) return false;
+  const argv = cmd.split('\0').filter(Boolean);
+  const exe = argv.length ? path.basename(argv[0]) : '';
+  if (!/^(google-chrome|chromium|chrome|headless_shell)(-stable)?$/.test(exe)) return false;
+  if (!argv.some((a) => a === '--headless' || a.startsWith('--headless='))) return false;
+  let gone = false;
+  try {
+    process.kill(-Number(pid), 'SIGKILL');
+    gone = true;
+  } catch {
+    /* not a group leader */
+  }
+  try {
+    process.kill(Number(pid), 'SIGKILL');
+    gone = true;
+  } catch {
+    /* already gone */
+  }
+  MANAGED.add(Number(pid));
+  return gone;
+}
+
+// --- the browser reaper ------------------------------------------------------------------------
+// Every launch registers its process group here and unregisters when it has been killed. The
+// exit/signal handlers are installed once, on the first launch, so a gate that forgets its
+// `finally` still leaves nothing behind. `kill(-pgid)` is the only call that reaches the zygote
+// and gpu-process children, which are never in our process tree for long enough to wait on.
+const LIVE = new Set();
+let reaperArmed = false;
+
+/** Kill a browser and its whole process group. Idempotent. */
+export function reap(entry) {
+  if (!entry || entry.reaped) return;
+  entry.reaped = true;
+  LIVE.delete(entry);
+  try {
+    // The launched Chrome is the group leader (spawn → detached), so -pid is every child it made:
+    // zoom, zygote, gpu-process, renderer, utility.
+    if (entry.pid) process.kill(-entry.pid, 'SIGKILL');
+  } catch {
+    /* already gone: ESRCH means the group is clean */
+  }
+  // Belt and braces for a child that somehow left the group (or was launched on a platform
+  // without process groups): the direct kill is what the old code did.
+  try {
+    if (entry.child && entry.child.exitCode === null && entry.child.signalCode === null) entry.child.kill('SIGKILL');
+  } catch {
+    /* already gone */
+  }
+}
+
+function reapAll() {
+  for (const entry of [...LIVE]) reap(entry);
+}
+
+function armReaper() {
+  if (reaperArmed) return;
+  reaperArmed = true;
+  process.on('exit', () => {
+    reapAll();
+    reapUnmanagedHeadlessChromes(); // a gate that spawned its own browser leaves it to us
+  });
+  // A signal handler suppresses the default action, so each of these ends the process itself:
+  // exit code 130/143/129, which is what a shell reports for an interrupted gate anyway.
+  for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) {
+    process.on(sig, () => {
+      reapAll();
+      reapUnmanagedHeadlessChromes();
+      process.exit(code);
+    });
+  }
+}
 
 /**
  * Start headless Chrome with the remote debugging endpoint up and one page target ready.
@@ -85,7 +396,16 @@ export async function launchChrome({ size = [1280, 720], extraArgs = [], profile
     'about:blank',
   ];
 
-  const child = spawn(CHROME, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // detached puts Chrome in a new process group led by itself, which is what makes `kill(-pid)`
+  // reach the children it spawns. Nothing here waits on the browser, so it never needs the
+  // terminal to stay in the loop; the gate's own output is unaffected.
+  const child = spawn(CHROME, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  const entry = { child, pid: child.pid, reaped: false };
+  if (child.pid) {
+    LIVE.add(entry);
+    MANAGED.add(child.pid);
+    armReaper();
+  }
 
   // Ring buffer of Chrome's own words. stdout is read and dropped so a full pipe can never block
   // Chrome; stderr is what diagnostics come from.
@@ -131,9 +451,7 @@ export async function launchChrome({ size = [1280, 720], extraArgs = [], profile
     return bits.join('\n  ');
   };
 
-  const stop = () => {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-  };
+  const stop = () => reap(entry);
 
   const base = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + (timeoutMs ?? (IN_CI ? 30_000 : 15_000));
@@ -164,13 +482,18 @@ export async function launchChrome({ size = [1280, 720], extraArgs = [], profile
       } catch {
         /* list raced the browser; retry on the next tick */
       }
-      if (wsUrl) return { devtools: base, wsUrl, port, profile, child, stderr: stderrTail, stop };
+      if (wsUrl) {
+        // A browser that dies on its own must stop being a reaper target.
+        child.on('exit', () => LIVE.delete(entry));
+        return { devtools: base, wsUrl, port, profile, child, stderr: stderrTail, stop };
+      }
     }
     await sleep(150);
   }
 
   // Timed out: give an exited process a moment to report, then say everything we know.
   await Promise.race([exited, sleep(500)]);
-  stop();
+  stop(); // the group goes with it, not just the child this handle names
+  fs.rmSync(profile, { recursive: true, force: true });
   throw new Error(`chrome did not expose a page target within ${Math.round((Date.now() - t0) / 1000)} s:\n  ${describe()}`);
 }
