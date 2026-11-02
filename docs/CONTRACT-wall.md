@@ -21,13 +21,13 @@ Source: `modules/wall/server.js`, `commands.mjs`, `ratio.mjs`, `module.json`, `u
   Neither is declared in `module.json`; a client asking `?channels=wall,wall-state` gets both.
 - No `order` (defaults to 100). No `settings` block in the manifest — the settings schema below is
   built in `server.js`, not by the registry.
-- **`/wall/render` is the only page.** There is no `/wall/portrait` route: `module.json` does not
-  declare it and nothing in the server or the shell references it. The 9:16 picture is a fence
-  inside `/wall/render`, and the view list below survives only at the wire level. A standalone
-  9:16 page (`display-portrait.html`) sat in `modules/wall/pages/` from the initial import until
-  2026-11-02; nothing routed it, its six script paths resolved above the module and 404'd, and
-  the fence already produces 9:16, so it was deleted. Do not reinstate it: a real 9:16 mount
-  would need a `pages[]` entry and a `<base href="/mod/wall/engine/">` of its own.
+- **Two pages, one engine.** `/wall/render` is the 16:9 surface and `/wall/portrait` is a native
+  9:16 mount (`engine/display-portrait.html`, `LEDWALL_PAGE = {ratio:'9:16', view:'portrait'}`,
+  canvas at 100vw/100vh). The engine already handles both: `ratio` picks a 1280x720 or 720x1280
+  base (both ×scale) and the grid follows (112x63 or 63x112, same cell pitch). The 9:16 fence in
+  `settings.fence` belongs to the landscape page only — `boot.js` skips it when `RATIO === '9:16'`,
+  because that page is the window the fence describes. The old standalone
+  `pages/display-portrait.html` is gone for good: it had no route and its script paths 404'd.
 
 ## HTTP routes (all under `/api/wall`)
 
@@ -37,7 +37,7 @@ Source: `modules/wall/server.js`, `commands.mjs`, `ratio.mjs`, `module.json`, `u
 | PATCH | `/settings` | any subset of the settings keys | `{ok, changed[], settings, ratio}` |
 | POST | `/cmd` | `{cmd, args?, view?}` | dispatcher answer: `{…, ok, note, delivered}`; `{seq, ok:false, note:'refused: scene forces 16:9', ratio}` for a refused toggle |
 | GET | `/cmd` | — | `{ok, commands[], seq}` |
-| POST | `/state` | `{view:'landscape'\|'portrait', state{…}}` | `{ok, online}`; stores what the page reports as its last-known state. The server still accepts `view:'portrait'` (`modules/wall/server.js:405`), but **no page serves it**: `/wall/render` reports itself as landscape, so the `portrait` slot stays offline |
+| POST | `/state` | `{view:'landscape'\|'portrait', state{…}}` | `{ok, online}`; stores what the page reports as its last-known state. `/wall/portrait` reports `view:'portrait'`, so the `portrait` slot is online whenever that source is running (`/wall/render` reports landscape) |
 | GET | `/state` | — | `{ok, seq, gates, views, online, history}` |
 | PUT | `/state` | `{gates:{landscapeLive?,portraitLive?}}` | `{ok, gates}`; 400 on any other key |
 | GET | `/render` | — | `{ok, settings:{look,ratio,fence,rev}, online:{landscape,portrait}, seq}` |
@@ -125,12 +125,16 @@ ratio watcher through `ctx.core.settings` (`server.js:89`).
 
 | route | file | expects |
 |---|---|---|
-| `/wall/render` | `engine/display.html` + `engine/*.js` | the wall canvas; opens SSE `/events?channels=wall&view=<landscape\|portrait>`, posts `/api/wall/state` ≤1 per 1.5 s, reads `/api/wall/render` | 
+| `/wall/render` | `engine/display.html` + `engine/*.js` | the wall canvas; opens SSE `/events?channels=wall&view=<landscape\|portrait>`, posts `/api/wall/state` ≤1 per 1.5 s, reads `/api/wall/render` |
+| `/wall/portrait` | `engine/display-portrait.html` + `engine/*.js` | the same canvas at 720x1280 (`LEDWALL_PAGE = {ratio:'9:16', view:'portrait'}`), for the OBS strip. Lays out 63x112 cells natively; the shared `fence` is not applied (this page *is* the 9:16 window) |
 
-Only `/wall/render` is a page. There is **no `/wall/portrait` route**: `pages/display-portrait.html`
-exists in the tree but nothing serves it, so a browser source pointed at `/wall/portrait` gets the
-shell's 404, not a portrait renderer. Use `/wall/render` with `ratio: 9:16` (or the fence) for the
-9:16 picture.
+Both pages carry `COOP: same-origin` / `COEP: require-corp` from their `pages[]` entry, and each has
+its own `<base href="/mod/wall/engine/">` so the shared classic scripts resolve.
+
+`pages[]` in `module.json` is the only page mechanism: the registry (`core/registry.mjs`) resolves a
+page route from an entry's `pages`, and serves that page's sibling files under the page's own URL.
+`/mod/<id>/…` only serves the raw module files, with no route and no headers, so it is not an
+alternative mount.
 
 Pane: `ui/pane.js` in the admin shell — settings form (writes `PATCH /settings`), preview with a
 draggable fence (`POST /broadcast` while dragging, `PUT /fence` on release), ratio and blackout

@@ -19,6 +19,15 @@
         "cross-origin-opener-policy": "same-origin",
         "cross-origin-embedder-policy": "require-corp"
       }
+    },
+    {
+      "route": "/wall/portrait",
+      "file": "engine/display-portrait.html",
+      "title": "LED wall (9:16 render surface, OBS browser source at 720x1280)",
+      "headers": {
+        "cross-origin-opener-policy": "same-origin",
+        "cross-origin-embedder-policy": "require-corp"
+      }
     }
   ],
   "settings": {

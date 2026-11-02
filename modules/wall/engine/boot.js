@@ -1,9 +1,10 @@
 /**
  * LED Wall v2.1 — shared page boot
  * =================================
- * One page, one classic script: `engine/display.html` sets `LEDWALL_PAGE` and loads this file.
- * The 9:16 picture is not a second page — it is the fence block inside that page's 16:9
- * canvas, selected by `?view=portrait` or by the render settings.
+ * One page, one classic script: `engine/display.html` (16:9) or `engine/display-portrait.html`
+ * (9:16) sets `LEDWALL_PAGE` and loads this file. On the 16:9 page the 9:16 picture is the fence
+ * block inside the landscape canvas, selected by `?view=portrait` or by the render settings; the
+ * 9:16 page is that window as a page of its own and ignores the fence.
  *
  * WHY classic script: the production page is loaded from
  * `file:///C:/OBS/LEDWall/display.html` inside OBS CEF.  `file://` blocks ES
@@ -211,7 +212,9 @@
     }
     // `fence` is a whole-cell window from the server, or null when the wall is whole. Both
     // cases are handed over: a null is how the pane turns the window off.
-    if (inst.setFence && Object.prototype.hasOwnProperty.call(d, 'fence')) {
+    // The 9:16 page IS that window: the server's fence is in the 16:9 page's grid, so applying
+    // it to a 720x1280 canvas would crop the portrait a second time. Landscape pages only.
+    if (inst.setFence && RATIO !== '9:16' && Object.prototype.hasOwnProperty.call(d, 'fence')) {
       inst.setFence(d.fence || null);
       applied = true;
     }

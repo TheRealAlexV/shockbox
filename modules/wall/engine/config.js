@@ -26,7 +26,8 @@
     try {
       if (/(^|[?&])source=shockbox(&|$)/.test(location.search)) return true;
       if (location.protocol === 'file:') return false;
-      return /^\/(wall|api)\/render(\/|$)/.test(location.pathname);
+      // Every wall page served by ShockBox: the 16:9 surface and the 9:16 mount.
+      return /^\/wall\/(render|portrait)(\/|$)/.test(location.pathname) || /^\/api\/render(\/|$)/.test(location.pathname);
     } catch (e) {
       return false;
     }

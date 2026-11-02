@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<base href="/mod/wall/engine/">
+<title>LED wall — 9:16</title>
+<!--
+  The 9:16 mount: its own page, its own base href, so an OBS source at 720x1280 gets a portrait
+  canvas instead of a left-cropped slice of /wall/render's landscape one (CONTRACT-wall §pages).
+  The engine already lays 9:16 out natively — `LEDWALL_PAGE.ratio` picks a 720x1280 base at the
+  same cell pitch as 16:9's (63x112 instead of 112x63), so nothing is cropped here. `view:
+  'portrait'` makes this page honour `views.portrait` in the settings. Live settings come from
+  /api/wall/render exactly as they do for /wall/render; the markup is 100vw/100vh because the
+  canvas is the whole source at whatever size OBS gives it.
+-->
+<style>
+  html, body { margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; background: #000; }
+  #wall { display: block; width: 100vw; height: 100vh; }
+  #diag { position: absolute; left: 8px; top: 8px; color: #0f0; font: 11px monospace; white-space: pre; display: none; }
+</style>
+</head>
+<body>
+<canvas id="wall" width="720" height="1280"></canvas>
+<div id="diag"></div>
+<script>window.LEDWALL_PAGE = { ratio: '9:16', view: 'portrait' };</script>
+<script src="config.js"></script>
+<script src="sim.js"></script>
+<script src="grade.js"></script>
+<script src="presets/presets.js"></script>
+<script src="engine.js"></script>
+<script src="boot.js"></script>
+</body>
+</html>
