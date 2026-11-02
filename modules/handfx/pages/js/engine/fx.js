@@ -408,6 +408,12 @@ void main() {
 
 const PARTICLES = 512;
 const P_FIELDS = ['x', 'y', 'vx', 'vy', 'age', 'life', 'size', 'skin'];
+/** The 9:16 page has side walls: how much of a hit comes back, how much of the slide it keeps, and
+ *  how long a particle is allowed to live on after touching one (a fireball spends itself on the
+ *  wall instead of bouncing for the rest of its life). */
+const FENCE_RESTITUTION = 0.35;
+const FENCE_FRICTION = 0.9;
+const FENCE_IMPACT_LIFE = 0.12;
 
 /**
  * A tiny CPU particle store, flat `Float32Array` records so a headless test can count and a batched
@@ -815,6 +821,15 @@ export class FxRenderer {
   _integrateParticles(dt) {
     const data = this.particles.data;
     const L = P_FIELDS.length;
+    // The 9:16 page is taller than wide, so its side walls are physical ground: an effect thrown at
+    // the edge hits the wall and comes back rather than sailing out of frame. The bounds come from
+    // the viewport ratio the shaders already use (u_aspect), never from a pixel constant: a drawn
+    // orb is `size` field units tall, which is size / (2 * aspect) in page-x, so the wall inset is
+    // that radius. 16:9 keeps the free-flight rule below — no fence, off-frame records retire.
+    const aspect = this.h > 0 ? this.w / this.h : 1;
+    const fenced = aspect < 1;
+    const radiusToX = 1 / (2 * aspect);
+    const impacts = fenced ? [] : null;
     for (let r = this.particles.count - 1; r >= 0; r--) {
       const o = r * L;
       data[o + 4] += dt;
@@ -824,6 +839,21 @@ export class FxRenderer {
       }
       data[o + 0] += data[o + 2] * dt;
       data[o + 1] += data[o + 3] * dt;
+      if (fenced) {
+        const inset = data[o + 6] * radiusToX;
+        const x = data[o + 0];
+        if (x < inset || x > 1 - inset) {
+          const hit = x < inset ? inset : 1 - inset;
+          const inward = x < inset ? 1 : -1; // normal of the wall it touched
+          // Only a particle arriving from inside is an impact; a clamped one is just held.
+          const impact = data[o + 2] * inward < 0;
+          data[o + 0] = hit;
+          data[o + 2] = inward * Math.abs(data[o + 2]) * FENCE_RESTITUTION;
+          data[o + 3] *= FENCE_FRICTION;
+          data[o + 5] = Math.min(data[o + 5], data[o + 4] + FENCE_IMPACT_LIFE);
+          if (impact && impacts.length < 6) impacts.push(hit, data[o + 1]);
+        }
+      }
       // Off-frame particles are retired here, so the store cannot grow with invisible records and
       // a later draw cannot resurrect one.
       if (data[o + 0] < -0.15 || data[o + 0] > 1.15 || data[o + 1] < -0.15 || data[o + 1] > 1.15) {
@@ -834,6 +864,10 @@ export class FxRenderer {
       data[o + 2] *= 1 - Math.min(0.9, dt * 1.8);
       data[o + 3] = data[o + 3] * (1 - Math.min(0.9, dt * 1.8)) - dt * 0.05;
     }
+    // Sparks go in after the walk, not during it: the store compacts in place and `alloc` on a full
+    // store rewrites records the loop is still visiting. spawnBurst is the one emit path this file
+    // has, so the impact reuses it rather than growing a second allocator.
+    if (impacts) for (let i = 0; i < impacts.length; i += 2) this.spawnBurst('spark', { x: impacts[i], y: impacts[i + 1] }, null, 3);
   }
 
   /**
