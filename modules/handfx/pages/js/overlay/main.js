@@ -395,6 +395,7 @@ function stopTracking({ manual = true, keepView = false } = {}) {
   camWasLive = false;
   tracker.stop();
   state.tracking = false;
+  state.synthetic = false; // the rig's frame loop is gone with the tracker; the flag goes with it
   state.camera = 'off';
   // Giving way to a camera that is still opening (`keepView`): the page keeps drawing on the
   // anchors it has instead of going blank while the device and the model load.
@@ -414,7 +415,10 @@ function stopTracking({ manual = true, keepView = false } = {}) {
  */
 function ensureSyntheticAnchors() {
   if (state.tracking && !state.synthetic) return false; // a camera session owns the view
-  if (!state.synthetic) tracker.startSynthetic();
+  // Ask the tracker, never a remembered flag: a camera attempt (and a Stop) closes the rig's frame
+  // loop, and `state.synthetic` stayed true across it — the rig was then never restarted, so no
+  // frames arrived, `fx.view` stopped moving and /ack (which rides on those frames) went quiet.
+  if (tracker.state !== 'running' || tracker.source !== 'synthetic') tracker.startSynthetic();
   state.synthetic = true;
   state.tracking = true;
   // Fill the view in this same tick, so a command fired now draws on the very next frame instead
@@ -426,6 +430,9 @@ function ensureSyntheticAnchors() {
 function onTrackerState(snap) {
   state.model = snap.model;
   state.tracking = snap.state === 'running';
+  // Where the frames come from, taken from the tracker rather than remembered: a stopped tracker
+  // is a stopped rig, and treating it as running is how the page went quiet while it still drew.
+  state.synthetic = snap.state === 'running' && snap.source === 'synthetic';
   // The overlay's start is the operator's action for the bus: a deck key may start a session the
   // operator has just opened this page for, and may never open a camera on its own. The synthetic
   // rig is not a start — it runs from load and must not arm the bus.
@@ -731,33 +738,39 @@ function drawDebug(frame, hands, now) {
 
 let bodyTickAt = 0;
 function loop(now) {
-  // The body mask expires 1 s after its last message; checked twice a second, not per frame.
-  if (now - bodyTickAt > 500) {
-    bodyTickAt = now;
-    tickBody();
-  }
-  if (state.settings && state.settings.enabled !== false && state.settings.obsHandFx !== false) {
-    // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
-    // sees something and the channel is up), each enabled body effect stays alive, so a mask that
-    // goes quiet releases them through the expiry above.
-    if (state.bodySeen) {
-      for (const id of ['bodyonfire', 'bodysmoke', 'frozenbody']) {
-        const live = fx.live.get(id);
-        if (effectiveEffects().includes(id) && (!live || !live.active || live.age > 6)) fx.trigger(id, {});
+  // One frame may fail (a GL hiccup, a body bitmap, a broken effect); the loop may not. The frame
+  // is what the page has instead of a sign of life, so the next one is always scheduled, and the
+  // throw still reaches the console instead of being swallowed here.
+  try {
+    // The body mask expires 1 s after its last message; checked twice a second, not per frame.
+    if (now - bodyTickAt > 500) {
+      bodyTickAt = now;
+      tickBody();
+    }
+    if (state.settings && state.settings.enabled !== false && state.settings.obsHandFx !== false) {
+      // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
+      // sees something and the channel is up), each enabled body effect stays alive, so a mask
+      // that goes quiet releases them through the expiry above.
+      if (state.bodySeen) {
+        for (const id of ['bodyonfire', 'bodysmoke', 'frozenbody']) {
+          const live = fx.live.get(id);
+          if (effectiveEffects().includes(id) && (!live || !live.active || live.age > 6)) fx.trigger(id, {});
+        }
+      }
+      fx.render(now, fx.view || {});
+      // What actually reached the canvas: one count per render pass, and when. The pane and a
+      // `curl /status` read these back through /ack instead of assuming the picture is alive.
+      if (fx.supported) {
+        state.draws += 1;
+        state.lastDrawAt = Date.now();
       }
     }
-    fx.render(now, fx.view || {});
-    // What actually reached the canvas: one count per render pass, and when. The pane and a
-    // `curl /status` read these back through /ack instead of assuming the picture is alive.
-    if (fx.supported) {
-      state.draws += 1;
-      state.lastDrawAt = Date.now();
-    }
+    // Runs straight after the effects pass, while the canvas still holds this frame's pixels.
+    // Publishes nothing unless the server says `publish` is raw or effects.
+    publisher.tick(now);
+  } finally {
+    requestAnimationFrame(loop);
   }
-  // Runs straight after the effects pass, while the canvas still holds this frame's pixels.
-  // Publishes nothing unless the server says `publish` is raw or effects.
-  publisher.tick(now);
-  requestAnimationFrame(loop);
 }
 
 /* ---------------------------------------------------------------- buttons */

@@ -155,11 +155,8 @@ export class Tracker {
           `Camera blocked: ${location.origin} is not a secure context. Open http://127.0.0.1:PORT or http://localhost:PORT.`,
         );
       }
-      const res = DEVICES[opts.resolution] || DEVICES['720p'];
-      const video = { width: { ideal: res.width }, height: { ideal: res.height }, frameRate: { ideal: 30, max: 60 } };
-      if (opts.deviceId) video.deviceId = { exact: opts.deviceId };
       this.failStage = 'getUserMedia';
-      this.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+      this.stream = await this._openCamera(opts);
       this.failStage = 'track';
       const stream = this.stream;
       const track = stream.getVideoTracks()[0];
@@ -203,8 +200,45 @@ export class Tracker {
     }
   }
 
+  /**
+   * The camera request, in the only order a browser allows it. Before the page holds a grant,
+   * `enumerateDevices()` hands out devices with an empty `deviceId` and an empty label; passing
+   * that id back as `deviceId: { exact: '' }` is an OverconstrainedError no camera can satisfy.
+   * So the first request names nothing at all (`{ video: true }`), and the operator's device and
+   * resolution are asked for afterwards — the id only when an enumerate *after* the grant offers
+   * it, the resolution only as `ideal`. A refused preference keeps the plain stream: a camera
+   * that is already open is never given up for a nicer size.
+   */
+  async _openCamera(opts = {}) {
+    const md = navigator.mediaDevices;
+    const plain = await md.getUserMedia({ video: true, audio: false });
+    let devices = [];
+    try {
+      devices = await md.enumerateDevices();
+    } catch {
+      devices = [];
+    }
+    const wanted = String(opts.deviceId || '').trim();
+    const named = Boolean(wanted) && devices.some((d) => d.kind === 'videoinput' && d.deviceId === wanted);
+    const res = DEVICES[opts.resolution] || DEVICES['720p'];
+    const track = plain.getVideoTracks()[0];
+    const got = (track && typeof track.getSettings === 'function' && track.getSettings()) || {};
+    if (!named && Number(got.height || 0) >= res.height) return plain;
+    const video = { width: { ideal: res.width }, height: { ideal: res.height }, frameRate: { ideal: 30 } };
+    if (named) video.deviceId = { exact: wanted };
+    try {
+      const better = await md.getUserMedia({ video, audio: false });
+      for (const t of plain.getTracks()) t.stop();
+      return better;
+    } catch {
+      return plain; // the operator's preference is not worth a dead picture
+    }
+  }
+
   async _loadModel(opts) {
-    if (this.model === 'ready') return;
+    // The loaded SDK is the truth, not the `model` label: the synthetic rig labels itself 'ready'
+    // without one, and a camera started after it then crashed in detectForVideo.
+    if (this.landmarker) return;
     this._setState({ model: 'loading' });
     try {
       const mod = await import('/api/handfx/vendor/vision/vision_bundle.mjs');
@@ -311,11 +345,16 @@ export class Tracker {
     this._t0 = performance.now();
     const tick = () => {
       if (this.state !== 'running' || this.source !== 'synthetic') return;
-      const t = (performance.now() - this._t0) / 1000;
-      const hands = syntheticHands(t);
-      countFrame(this);
-      this.onFrame({ hands, width: 640, height: 480, source: 'synthetic', at: performance.now() });
-      this.raf = requestAnimationFrame(tick);
+      try {
+        const t = (performance.now() - this._t0) / 1000;
+        const hands = syntheticHands(t);
+        countFrame(this);
+        this.onFrame({ hands, width: 640, height: 480, source: 'synthetic', at: performance.now() });
+      } finally {
+        // A consumer that throws (the page's onFrame) must not end the rig: the picture and the
+        // page's status line both ride on these frames.
+        if (this.state === 'running' && this.source === 'synthetic') this.raf = requestAnimationFrame(tick);
+      }
     };
     cancelAnimationFrame(this.raf);
     this.raf = requestAnimationFrame(tick);
