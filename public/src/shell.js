@@ -297,7 +297,11 @@ async function navigate() {
       statusEl.replaceChildren();
       const mod = await import('./panes/messages.js');
       const cleanup = await mod.render(slot, makeCtx({ id: 'messages', title: 'Messages', settings: {} }, null, controller.signal));
-      if (state.current?.signature === signature) state.current.cleanup = cleanup || null;
+      if (state.current?.signature === signature) {
+        state.current.cleanup = cleanup || null;
+        state.current.loading?.remove();
+        window.__shell = { ...(window.__shell || {}), phase: 'ready', route: signature, notes: [], mountedAt: Date.now() };
+      }
       return;
     }
 
@@ -319,6 +323,8 @@ async function navigate() {
     titleEl.textContent = 'error';
     clear(paneEl);
     paneEl.appendChild(errorPane(err));
+    state.current?.loading?.remove();
+    window.__shell = { ...(window.__shell || {}), phase: 'error', route: signature, notes: [String(err?.message || err)], mountedAt: Date.now() };
   }
 }
 
