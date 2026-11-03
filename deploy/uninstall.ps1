@@ -95,7 +95,9 @@ function Get-SupervisorState {
     # running" over a live one.
     $runtime = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime'
     $live = @{}
-    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $live[[int]$p.ProcessId] = $true }
+    # pid -> command line, for the same reason as install.ps1: a pid that is alive is not
+    # necessarily a supervisor, and this runtime file outlives the process that wrote it.
+    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $live[[int]$p.ProcessId] = [string]$p.CommandLine }
 
     $candidates = @()
     $fromPid = Read-RuntimePid (Join-Path $runtime 'supervisor.pid')
@@ -113,10 +115,16 @@ function Get-SupervisorState {
     if (Test-Path -LiteralPath $hb) {
         try { $age = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $hb).LastWriteTime).TotalSeconds, 1) } catch { $age = $null }
     }
+    # Reap a supervisor.pid that does not name a live supervisor (same rule as install.ps1):
+    # it survives its writer and would otherwise be read as a supervisor that does not exist.
+    if ($fromPid -gt 0 -and -not ($live.ContainsKey($fromPid) -and (-not $live[$fromPid] -or $live[$fromPid] -match 'shockbox_tui'))) {
+        Remove-Item -LiteralPath (Join-Path $runtime 'supervisor.pid') -Force -ErrorAction SilentlyContinue
+    }
     foreach ($c in ($candidates | Select-Object -Unique)) {
-        if ($live.ContainsKey([int]$c)) {
-            return @{ Alive = $true; Pid = [int]$c; Age = $age; Why = "published pid $c is alive" }
-        }
+        if (-not $live.ContainsKey([int]$c)) { continue }
+        # Unknown command line: believe the pid. Readable and not ours: a reused pid, skip it.
+        if ($live[[int]$c] -and $live[[int]$c] -notmatch 'shockbox_tui') { continue }
+        return @{ Alive = $true; Pid = [int]$c; Age = $age; Why = "published pid $c is alive and is a shockbox_tui process" }
     }
     if ($age -ne $null -and $age -le 10) {
         return @{ Alive = $true; Pid = 0; Age = $age; Why = 'heartbeat is fresh, pid not published' }

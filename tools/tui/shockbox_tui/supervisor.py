@@ -86,8 +86,9 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
+            # No fsync: readers are protected by the atomic replace below, not by durability
+            # across a power cut (a runtime dir is rebuilt on the next start anyway), and the
+            # fsync of a 700-byte heartbeat was 3.6 ms/s of the idle supervisor on the rig.
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -288,6 +289,26 @@ def is_our_server(pid: int, app_dir: Path) -> bool:
         return (cwd / server_name).resolve() == (app / server_name).resolve()
     except OSError:
         return False
+
+
+def is_supervisor_process(pid: int | None) -> bool:
+    """True when ``pid`` is alive *and* looks like a ShockBox TUI supervisor.
+
+    A pid file is a hint, never proof: it outlives its writer (SIGKILL, or a machine that was
+    rebooted) and the OS reuses pids, so trusting the number alone reported a supervisor that
+    did not exist. The test stays broad on purpose — the module name on POSIX, the image name
+    on Windows — because a wrapper, a venv shim and ``python -m`` all have to match, and it is
+    never the app dir. An unreadable command line is "unknown", not "not ours".
+    """
+    if not pid_alive(pid):
+        return False
+    line = _proc_cmdline(int(pid))
+    if not line:
+        return True
+    if sys.platform == "win32":
+        # QueryFullProcessImageNameW gives the image, not the argv (`-m shockbox_tui...`).
+        return line.rsplit("\\", 1)[-1].lower().startswith("python")
+    return "shockbox_tui" in line
 
 
 def _mock_server_pid(pid: int, app_dir: Path) -> int | None:
@@ -1126,6 +1147,14 @@ def main(argv: list[str] | None = None) -> int:
         if sup.status.get("state") == "stopped":
             sup.cleanup()
         lock.close()
+        # The runtime pid file is a hint, not a lock: delete it while we still know it is ours,
+        # so a clean exit never leaves a number for the next reader to believe in. (A SIGKILL
+        # can still leave one behind — that is why every reader verifies the pid as well.)
+        try:
+            if paths.supervisor_pid_file.read_text(encoding="ascii").strip() == str(os.getpid()):
+                paths.supervisor_pid_file.unlink()
+        except OSError:
+            pass
         life_note(life, f"exit pid {os.getpid()} code {code}")
 
 

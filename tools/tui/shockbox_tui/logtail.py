@@ -48,6 +48,7 @@ class LogFile:
         self._day: str | None = None
         self._path: Path | None = None
         self._size = 0
+        self._dirty = False  # a line was written since the last fsync
         self._open(self._name_today())
 
     # ---- naming -----------------------------------------------------------------
@@ -70,13 +71,20 @@ class LogFile:
         return self._path
 
     def flush(self) -> None:
+        """fsync the day's file, but only when a line was written since the last flush.
+
+        Callers flush on a timer (the supervisor every 2s) whether or not anything was logged.
+        With nothing to sync, the open+fsync was 21% of the idle supervisor's CPU on the rig —
+        for a file whose bytes were already on disk from the unbuffered write.
+        """
         with self._lock:
-            if self._path is None:
+            if self._path is None or not self._dirty:
                 return
             try:
                 with open(self._path, "ab") as fh:
                     fh.flush()
                     os.fsync(fh.fileno())
+                self._dirty = False
             except OSError:
                 pass
 
@@ -139,6 +147,7 @@ class LogFile:
                 with open(self._path, "ab", buffering=0) as fh:
                     fh.write(raw)
                 self._size += len(raw)
+                self._dirty = True
             except OSError:
                 pass
 

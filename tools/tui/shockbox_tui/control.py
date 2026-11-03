@@ -233,14 +233,45 @@ class Control:
         age = self._status_age()
         return age is not None and age <= STATUS_STALE_S
 
+    def _published_supervisor_pid(self) -> int | None:
+        """The supervisor pid from ``supervisor.pid``, verified — and deleted when it is a lie.
+
+        The file is a hint, not proof: it outlives its writer on SIGKILL, and the OS reuses pids.
+        One sat in this runtime dir from 2026-10-30 naming a pid that had been dead for days,
+        while the live supervisor published a different number — the same class of lie as
+        trusting a command line, in reverse. The number is believed only when that pid is alive
+        *and* names this package (``install.ps1``/``uninstall.ps1`` apply the same rule);
+        otherwise the file is removed, so the next reader sees "nothing published" instead of a
+        supervisor that does not exist.
+        """
+        try:
+            pid = int(self.paths.supervisor_pid_file.read_text(encoding="ascii").strip() or "0")
+        except (OSError, ValueError):
+            return None
+        if not pid:
+            return None
+        from .supervisor import is_supervisor_process
+
+        if is_supervisor_process(pid):
+            return pid
+        try:
+            self.paths.supervisor_pid_file.unlink()
+        except OSError:
+            pass
+        return None
+
     def supervisor_pid(self) -> int | None:
-        """The pid of the running supervisor, from status.json, or None.
+        """The pid of the running supervisor, or None. Never taken on trust.
 
         `supervisor_responding()` is a heartbeat judgment and can lag a dead process by seconds;
-        for "is it really gone" and "is it really there", this is the number to check.
+        for "is it really gone" and "is it really there", this is the number to check. It comes
+        from the published pid file (verified) and falls back to status.json.
         """
+        published = self._published_supervisor_pid()
         if not self.supervisor_responding():
             return None
+        if published:
+            return published
         data = self._read_status()
         pid = data.get("supervisor_pid") or data.get("pid")
         return int(pid) if pid and _alive(pid) else None

@@ -156,7 +156,9 @@ function Get-SupervisorState([string]$AppDir, $Table) {
     # miss it, and an install once printed "no TUI supervisor running" over a live supervisor.
     $runtime = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime'
     $live = @{}
-    foreach ($p in $Table) { $live[[int]$p.ProcessId] = $true }
+    # pid -> command line. A pid alone is not proof: pids are reused, and a stale
+    # supervisor.pid once named a pid that had belonged to another program for days.
+    foreach ($p in $Table) { $live[[int]$p.ProcessId] = [string]$p.CommandLine }
 
     $candidates = @()
     $fromPid = Read-RuntimePid (Join-Path $runtime 'supervisor.pid')
@@ -175,10 +177,19 @@ function Get-SupervisorState([string]$AppDir, $Table) {
     if (Test-Path -LiteralPath $hb) {
         try { $age = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $hb).LastWriteTime).TotalSeconds, 1) } catch { $age = $null }
     }
+    # Reap a supervisor.pid that does not name a live supervisor. It is the one runtime file
+    # that outlives its writer (SIGKILL, reboot, the other OS's tree), and left in place it makes
+    # the next reader believe in a supervisor that does not exist.
+    if ($fromPid -gt 0 -and -not ($live.ContainsKey($fromPid) -and (-not $live[$fromPid] -or $live[$fromPid] -match 'shockbox_tui'))) {
+        Remove-Item -LiteralPath (Join-Path $runtime 'supervisor.pid') -Force -ErrorAction SilentlyContinue
+    }
     foreach ($c in ($candidates | Select-Object -Unique)) {
-        if ($live.ContainsKey([int]$c)) {
-            return @{ Alive = $true; Pid = [int]$c; Age = $age; Why = "supervisor.pid/status.json names live pid $c" }
-        }
+        if (-not $live.ContainsKey([int]$c)) { continue }
+        # An unreadable command line is "unknown", not "not ours": a permissions hiccup must not
+        # turn a live supervisor into a missing one. A readable one that is not shockbox_tui is a
+        # reused pid, and believing it would be the same lie pointing the other way.
+        if ($live[[int]$c] -and $live[[int]$c] -notmatch 'shockbox_tui') { continue }
+        return @{ Alive = $true; Pid = [int]$c; Age = $age; Why = "published pid $c is alive and is a shockbox_tui process" }
     }
     if ($null -ne $age -and $age -le 10) {
         # No pid on file but something is breathing. Find it: the supervisor, not the TUI that
@@ -239,7 +250,8 @@ if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launc
     $table = Get-ProcessTable
 
     # 1. the TUI supervisor: ask, then insist. The evidence is its published state (live pid,
-    #    fresh heartbeat), never its command line - see Get-SupervisorState.
+    #    fresh heartbeat); a command line is used only to reject a pid that was reused, never to
+    #    require one - see Get-SupervisorState.
     $state = Get-SupervisorState $AppDir $table
     $sup = @()
     if ($state.Alive -and $state.Pid -gt 0) { $sup += $state.Pid }
