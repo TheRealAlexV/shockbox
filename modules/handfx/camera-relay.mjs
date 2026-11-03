@@ -14,6 +14,16 @@
 // One process, ever. It starts on the first stream client and stops five seconds after the last one
 // leaves; `cameraRelay: off` never spawns. A crash is retried with backoff (1s, 2s, 4s … capped at
 // 10s) and the operator sees why as ffmpeg's own stderr tail on /status.
+//
+// `status().state` is the whole vocabulary, and each value says what it means:
+//   off      the config says `cameraRelay: off`; nothing will ever spawn
+//   idle     enabled, but no page is reading — there is nothing for the relay to do
+//   starting ffmpeg is running and no complete frame has arrived yet
+//   live     a complete frame arrived within the last 2 s
+//   error    ffmpeg opened but produced no frame in 2 s, frames stopped for 2 s with clients
+//            attached, or ffmpeg exited. `error` carries its stderr tail.
+// A stalled producer keeps its last frame (`/camera/latest.jpg` still answers) and the status marks
+// it `stale`; it is never reported `live`.
 
 import { spawn as spawnProcess } from 'node:child_process';
 import fs from 'node:fs';
@@ -29,6 +39,9 @@ const STDERR_TAIL = 400;
 /** A stream with an SOI and no EOI must not grow forever. */
 const MAX_PENDING = 8 * 1024 * 1024;
 const STOP_AFTER_MS = 5000;
+/** A producer that opens and then says nothing is broken, not live: 2 s of silence says so. */
+const STALL_MS = 2000;
+const WATCHDOG_MS = 500;
 const MAX_BACKOFF = 10000;
 const SIZES = ['640x360', '960x540', '1280x720'];
 
@@ -172,14 +185,16 @@ export function framePart(frame) {
  */
 export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log = null } = {}) {
   let cfg = normalizeConfig(read());
-  let state = 'off';
+  let state = cfg.enabled ? 'idle' : 'off';
   let child = null;
   let parser = null;
   let latest = null;
   let stderrTail = '';
   let attempt = 0;
+  let spawnedAt = 0;
   let restartTimer = null;
   let stopTimer = null;
+  let watchdogTimer = null;
   const clients = new Set();
   const counters = { frames: 0, dropped: 0, lastFrameAt: 0, error: null };
 
@@ -191,6 +206,69 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     if (stopTimer) clearTimeout(stopTimer);
     stopTimer = null;
   };
+
+  /** ffmpeg owns the device until it says otherwise: ask politely, then force it. */
+  function killProcess(proc) {
+    try {
+      proc.stdin.write('q');
+      proc.stdin.end();
+    } catch {
+      /* stdin already closed */
+    }
+    const kill = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }, 1500);
+    kill.unref?.();
+    proc.once('close', () => clearTimeout(kill));
+  }
+
+  /** Milliseconds since the running producer last produced a frame, or since it spawned. */
+  function silenceFor(now = Date.now()) {
+    if (!child) return 0;
+    return now - Math.max(spawnedAt, counters.lastFrameAt);
+  }
+
+  /**
+   * ffmpeg is running but has delivered no frame in 2 s. That is a dead camera, not a slow one:
+   * report the state with the producer's own words, keep the last frame for /camera/latest.jpg
+   * (status marks it `stale`), and restart the producer under the normal backoff.
+   */
+  function stall() {
+    const tail = stderrTail.trim();
+    const waited = Math.max(1, Math.round(silenceFor() / 1000));
+    const what = counters.lastFrameAt
+      ? `no frame for ${waited} s`
+      : `ffmpeg opened but produced no frame in ${waited} s`;
+    const proc = child;
+    child = null; // the exit handler must ignore the process we are about to kill
+    parser = null;
+    setError(`${what}${tail ? `: ${tail}` : ''}`);
+    scheduleRestart();
+    if (proc) killProcess(proc);
+  }
+
+  function checkSilent() {
+    if (!child) {
+      stopWatchdog();
+      return;
+    }
+    if (silenceFor() > STALL_MS) stall();
+  }
+
+  function startWatchdog() {
+    if (watchdogTimer) return;
+    watchdogTimer = setInterval(checkSilent, WATCHDOG_MS);
+    watchdogTimer.unref?.();
+  }
+
+  function stopWatchdog() {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
 
   function setError(message) {
     counters.error = String(message || 'camera relay failed').slice(0, STDERR_TAIL + 120);
@@ -267,30 +345,18 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
 
   function stopChild() {
     clearRestart();
+    stopWatchdog();
     const proc = child;
     child = null;
     parser = null;
     latest = null;
+    spawnedAt = 0;
     counters.lastFrameAt = 0;
     attempt = 0;
-    state = 'off';
+    // `idle` is enabled-but-nobody-reading; `off` is the config forbidding the relay entirely.
+    state = cfg.enabled ? 'idle' : 'off';
     if (!proc) return;
-    // ffmpeg owns the device until it says otherwise: ask politely, then force it.
-    try {
-      proc.stdin.write('q');
-      proc.stdin.end();
-    } catch {
-      /* stdin already closed */
-    }
-    const kill = setTimeout(() => {
-      try {
-        proc.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
-    }, 1500);
-    kill.unref?.();
-    proc.once('close', () => clearTimeout(kill));
+    killProcess(proc);
   }
 
   function onFrame(frame) {
@@ -331,7 +397,9 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     child = proc;
     parser = createFrameParser(onFrame);
     stderrTail = '';
+    spawnedAt = Date.now();
     state = 'starting';
+    startWatchdog();
     proc.stdout.on('data', (chunk) => {
       if (parser) parser.push(chunk);
     });
@@ -366,8 +434,10 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
         endClients();
       }
       counters.error = null;
+      state = 'off';
       return;
     }
+    if (state === 'off') state = 'idle';
     if (changed && (child || restartTimer)) {
       clearRestart();
       stopChild();
@@ -378,7 +448,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   return {
     sync,
 
-    /** The newest frame as bytes, or null when there is no live feed. */
+    /** The newest frame as bytes, or null when none ever arrived. A stalled feed keeps its last one. */
     latest() {
       return latest;
     },
@@ -408,9 +478,21 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       return client;
     },
 
+    /**
+     * The relay's own truth, read by /api/handfx/status. `state` is `off` (disabled by config),
+     * `idle` (enabled, no reader), `starting`, `live`, or `error`. `live` is never reported for a
+     * frame older than 2 s; `stale` marks a kept frame that is being served by /camera/latest.jpg
+     * past its freshness, and `error` carries ffmpeg's stderr tail when there is one.
+     */
     status() {
+      const silent = silenceFor() > STALL_MS;
+      const reported = silent ? 'error' : state;
+      const error =
+        silent && !counters.error
+          ? `no frame for ${Math.max(1, Math.round(silenceFor() / 1000))} s${stderrTail.trim() ? `: ${stderrTail.trim()}` : ''}`
+          : counters.error;
       return {
-        state,
+        state: reported,
         source: cfg.source,
         fps: cfg.fps,
         size: cfg.size,
@@ -418,13 +500,15 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
         dropped: counters.dropped,
         clients: clients.size,
         lastFrameAt: counters.lastFrameAt || null,
-        error: counters.error,
+        stale: reported === 'error' && Boolean(latest),
+        error,
       };
     },
 
     dispose() {
       clearRestart();
       clearStop();
+      stopWatchdog();
       endClients();
       stopChild();
     },

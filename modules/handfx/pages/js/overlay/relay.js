@@ -17,6 +17,9 @@
 const BOUNDARY = '--framebound';
 const HEADERS_END = Uint8Array.of(13, 10, 13, 10);
 const ACQUIRE_TIMEOUT = 10000;
+/** Frames that stop arriving are a dead camera: 3 s of silence fails the stream and hands the view
+ * back to the page's fallback instead of freezing on the last picture. */
+const STALL_TIMEOUT = 3000;
 const MAX_HEADER = 8192;
 
 function indexOf(hay, needle, from = 0) {
@@ -112,6 +115,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
   let frames = 0;
   let dropped = 0;
   let firstWaiter = null;
+  let stallTimer = null;
 
   function emit(state) {
     try {
@@ -121,7 +125,22 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     }
   }
 
+  function clearStall() {
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = null;
+  }
+
+  /** Re-arm the silence clock; any complete frame resets it. */
+  function armStall() {
+    clearStall();
+    stallTimer = setTimeout(() => {
+      stallTimer = null;
+      if (ctrl) fail(`relay: no frame for ${Math.round(STALL_TIMEOUT / 1000)} s`);
+    }, STALL_TIMEOUT);
+  }
+
   function close() {
+    clearStall();
     if (ctrl) {
       ctrl.abort();
       ctrl = null;
@@ -138,6 +157,12 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     live = false;
     latest = null;
     error = message;
+    // A stall during acquisition must end `start()`'s wait now, not at its own timeout.
+    if (firstWaiter) {
+      const w = firstWaiter;
+      firstWaiter = null;
+      w(false);
+    }
     if (current) {
       current.close();
       current = null;
@@ -214,6 +239,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       for (const jpeg of parser.push(value)) {
         if (latest) dropped += 1; // the decoder was still busy: keep only the newest
         latest = jpeg;
+        armStall();
         if (!decoding) void drain();
       }
     }
@@ -228,6 +254,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     if (ctrl) return live;
     const ac = new AbortController();
     ctrl = ac;
+    error = null;
     try {
       const res = await fetch(url, {
         signal: ac.signal,
@@ -238,6 +265,8 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       if (!res.body) throw new Error('stream carried no body');
       const type = res.headers.get('content-type') || '';
       if (!/multipart\/x-mixed-replace/i.test(type)) throw new Error(`unexpected content-type ${type || '(missing)'}`);
+      // The connection is open: from here on, 3 s without a complete frame is a dead camera.
+      armStall();
       // Losing the connection after the first frame is a state change, not a start failure.
       void read(res, ac).catch((err) => {
         if (ac.signal.aborted || !ctrl) return;
@@ -252,6 +281,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
           }
         }, timeout);
       });
+      if (!got && error) return false; // the stall already reported through fail()
       if (!got) throw new Error(`no frame within ${Math.round(timeout / 1000)} s`);
       return true;
     } catch (err) {
@@ -275,7 +305,14 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       void start();
     }
   });
-  window.addEventListener('pagehide', () => stop());
+  // `pagehide` drops the connection but never forgets that the page wants frames: an OBS browser
+  // source that is hidden and shown again (bfcache) reacquired on the visibilitychange above, but
+  // `stop()` with its default `forget: true` cleared `wanted` and nothing could ever start again —
+  // that is how the relay sat at 0 clients while publish still had a reader.
+  window.addEventListener('pagehide', () => stop({ forget: false }));
+  window.addEventListener('pageshow', () => {
+    if (wanted && !ctrl && document.visibilityState !== 'hidden') void start();
+  });
 
   return {
     start,

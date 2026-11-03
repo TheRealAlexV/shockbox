@@ -90,11 +90,14 @@ const relay = createRelay({
     state.relayError = s.error || null;
     renderState();
     if (s.state !== 'error' || state.cameraSource !== 'relay') return;
-    // The relayed camera went away (EOF or a read error). Hand the view back the way a device
-    // track ending does — tracker to idle, then fallBackToSynthetic — and make the page's one
-    // bounded retry, which the 5 s gap and the attempt cap already limit. No reconnect loop.
+    // The relayed camera went away (EOF, a read error, or 3 s without a frame). Hand the view back
+    // the way a device track ending does — tracker to idle, then fallBackToSynthetic — and make the
+    // page's one bounded retry, which the 5 s gap and the attempt cap already limit. No reconnect
+    // loop. `anchors` is cleared here because the render loop only rewrites it when a frame arrives,
+    // so a dead feed would otherwise keep reporting the last camera frame's `camera` forever.
     state.cameraSource = 'none';
     tracker.stop();
+    state.anchors = 'none';
     void autoCamera();
   },
 });
