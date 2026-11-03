@@ -23,6 +23,9 @@
     "test:schedule": "node test/schedule.mjs",
     "test:schedule-delivery": "node test/schedule-delivery.mjs",
     "test:schedule-ui": "node test/schedule-ui-browser.mjs",
-    "test:merged": "node test/merged-preview.mjs"
+    "test:merged": "node test/merged-preview.mjs",
+    "perf:base": "node tools/perf/baseline.mjs",
+    "perf:watch": "node tools/perf/sample.mjs --watch",
+    "perf:bracket": "node tools/perf/bracket.mjs"
   }
 }

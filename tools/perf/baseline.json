@@ -1,0 +1,115 @@
+{
+  "captured_at": "2026-11-03T08:01:33.457Z",
+  "window_minutes": 5,
+  "rows": 59,
+  "expected_rows": 60,
+  "host": "ADV-DT01",
+  "kernel": "6.6.114.1-microsoft-standard-WSL2",
+  "nproc": 12,
+  "lhm_version": "0.9.6.0",
+  "lhm_url": "http://localhost:8085/data.json",
+  "source": "tools/perf/baseline.mjs (reads ~/.local/state/shockbox-perf/*.csv)",
+  "metrics": {
+    "pkg_c": {
+      "n": 59,
+      "mean": 70.17,
+      "min": 64,
+      "max": 85,
+      "p95": 79
+    },
+    "core_avg_c": {
+      "n": 59,
+      "mean": 64.55,
+      "min": 59.1,
+      "max": 72.1,
+      "p95": 71.8
+    },
+    "core_max_c": {
+      "n": 59,
+      "mean": 71.61,
+      "min": 64,
+      "max": 82,
+      "p95": 78
+    },
+    "gpu_c": {
+      "n": 59,
+      "mean": 29.83,
+      "min": 29,
+      "max": 43,
+      "p95": 32
+    },
+    "gpu_load": {
+      "n": 59,
+      "mean": 28.95,
+      "min": 10,
+      "max": 94,
+      "p95": 54
+    },
+    "load1": {
+      "n": 59,
+      "mean": 0.82,
+      "min": 0.41,
+      "max": 1.6,
+      "p95": 1.35
+    },
+    "sb_node_cpu": {
+      "n": 0,
+      "mean": null,
+      "min": null,
+      "max": null,
+      "p95": null
+    },
+    "sb_node_rss_mb": {
+      "n": 0,
+      "mean": null,
+      "min": null,
+      "max": null,
+      "p95": null
+    },
+    "sb_sup_cpu": {
+      "n": 0,
+      "mean": null,
+      "min": null,
+      "max": null,
+      "p95": null
+    },
+    "sb_sup_rss_mb": {
+      "n": 0,
+      "mean": null,
+      "min": null,
+      "max": null,
+      "p95": null
+    }
+  },
+  "noise": {
+    "window_minutes": 2,
+    "rows": 24,
+    "measured_at": "2026-11-03T08:04:05.060Z",
+    "deltas": {
+      "pkg_c": {
+        "mean_delta": -2.96,
+        "p95_delta": -6
+      },
+      "core_avg_c": {
+        "mean_delta": -4.22,
+        "p95_delta": -7.2
+      },
+      "core_max_c": {
+        "mean_delta": -2.07,
+        "p95_delta": -1
+      },
+      "gpu_c": {
+        "mean_delta": 0.25,
+        "p95_delta": -1
+      },
+      "gpu_load": {
+        "mean_delta": -11.62,
+        "p95_delta": -14
+      },
+      "load1": {
+        "mean_delta": -0.58,
+        "p95_delta": -0.86
+      }
+    }
+  }
+}

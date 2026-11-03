@@ -1,0 +1,22 @@
+[Unit]
+Description=ShockBox perf sampler (thermal + resource, one row per 5 s)
+Documentation=file:%h/OBS/shockbox/tools/perf/README.md
+# Do not wait for the Windows-side LHM web server: rows with empty temperature
+# columns are better than a gap, and the sampler picks LHM up when it appears.
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/OBS/shockbox/tools/perf/monitor.sh
+Restart=always
+RestartSec=10
+# Deliberately the lightest thing on the box: idle I/O, lowest CPU weight, nice 19,
+# and a memory cap so a leak cannot become the problem it is meant to observe.
+Nice=19
+CPUWeight=10
+IOSchedulingClass=idle
+MemoryMax=128M
+# Sampler state lives under ~/.local/state/shockbox-perf; no writable paths needed.
+
+[Install]
+WantedBy=default.target
