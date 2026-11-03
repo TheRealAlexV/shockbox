@@ -18,7 +18,8 @@
 //   node tools/perf/sample.mjs --prune-only    run retention, then exit
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { spawn } from "node:child_process";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 
 const STATE_DIR = process.env.SHOCKBOX_PERF_DIR || join(homedir(), ".local/state/shockbox-perf");
@@ -27,6 +28,13 @@ const INTERVAL_MS = 5000;
 const RETENTION_DAYS = 14;
 const SHOCKBOX_PORT = 8972;
 const CLK_TCK = 100; // Linux x86_64 USER_HZ; change if /proc/stat ever disagrees
+
+// The shipping rig runs on the Windows host, so its pids are invisible to WSL /proc.
+// Windows side of the runtime dir (Paths.resolve: %LOCALAPPDATA%\ShockBox\runtime).
+const WIN_RUNTIME = process.env.SHOCKBOX_WIN_RUNTIME
+  || `/mnt/c/Users/${userInfo().username}/AppData/Local/ShockBox/runtime`;
+const WIN_STATUS = join(WIN_RUNTIME, "status.json");
+const WIN_PROBE = process.env.SHOCKBOX_WIN_PROBE !== "0" && existsSync(WIN_RUNTIME);
 
 const COLUMNS = [
   "ts", "load1", "load5", "cpu_user", "cpu_sys", "cpu_idle",
@@ -249,6 +257,114 @@ function supervisorPid() {
   }
 }
 
+// --- Windows rig (the shipping layout) ---------------------------------------
+//
+// One long-lived powershell, not one per row: a powershell start costs ~1.6 s of wall
+// time, which would make the observer a load source. It re-reads status.json itself, so
+// a supervisor restart or a new node pid is picked up without us respawning anything.
+// Line format: pid|cpuSeconds|rssBytes|epochMs
+
+const win = { child: null, buf: "", samples: new Map(), prev: new Map() };
+
+function winStatus() {
+  if (!WIN_PROBE) return null;
+  try {
+    const st = JSON.parse(readFileSync(WIN_STATUS, "utf8"));
+    const ageS = (Date.now() - Date.parse(st.updated ?? 0)) / 1000;
+    if (!(st.pid > 0) || !(ageS < 60)) return null; // gone, or stale heartbeat
+    return st;
+  } catch {
+    return null;
+  }
+}
+
+function winPath(wslPath) {
+  const m = /^\/mnt\/([a-z])\/(.*)$/.exec(wslPath);
+  return m ? `${m[1].toUpperCase()}:\\${m[2].replace(/\//g, "\\")}` : wslPath;
+}
+
+function powershellExe() {
+  // systemd --user has no /mnt/c in PATH, and interop puts powershell.exe there, not in
+  // /usr/bin. Resolve an absolute path or give up (columns stay empty rather than lying).
+  const candidates = [
+    process.env.SHOCKBOX_POWERSHELL,
+    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+    "/mnt/c/Program Files/PowerShell/7/pwsh.exe",
+  ].filter(Boolean);
+  return candidates.find((c) => existsSync(c)) ?? null;
+}
+
+function startWinProbe() {
+  if (!WIN_PROBE || win.child) return;
+  const exe = powershellExe();
+  if (!exe) {
+    if (!win.warned) {
+      console.error("winprobe: no powershell.exe found - sb_node/sb_sup columns will stay empty");
+      win.warned = true;
+    }
+    return;
+  }
+  const status = winPath(WIN_STATUS).replace(/'/g, "''");
+  const script = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    `$rt='${status}'`,
+    "while($true){",
+    "  if(Test-Path $rt){",
+    "    $s=Get-Content $rt -Raw | ConvertFrom-Json",
+    "    foreach($id in @($s.node_pid,$s.supervisor_pid)){",
+    "      if($id -gt 0){",
+    "        $p=Get-Process -Id $id",
+    "        if($p){'{0}|{1}|{2}|{3}' -f $id,[double]$p.TotalProcessorTime.TotalSeconds,[int64]$p.WorkingSet64,[int64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())}",
+    "      }",
+    "    }",
+    "  }",
+    "  Start-Sleep -Milliseconds 2500",
+    "}",
+  ].join(";");
+
+  try {
+    win.child = spawn(exe, ["-NoProfile", "-Command", script], {
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+  } catch {
+    win.child = null;
+    return;
+  }
+  win.child.on("error", (err) => {
+    win.child = null;
+    if (!win.warned) {
+      console.error(`winprobe: ${err.message}`);
+      win.warned = true;
+    }
+  });
+  win.child.on("exit", () => { win.child = null; });
+  win.child.stdout.setEncoding("utf8");
+  win.child.stdout.on("data", (chunk) => {
+    win.buf += chunk;
+    let nl;
+    while ((nl = win.buf.indexOf("\n")) >= 0) {
+      const line = win.buf.slice(0, nl).trim();
+      win.buf = win.buf.slice(nl + 1);
+      const [pid, cpu, rss, at] = line.split("|");
+      if (!pid || cpu === undefined) continue;
+      win.samples.set(Number(pid), { cpu: Number(cpu), rss: Number(rss), at: Number(at) });
+    }
+  });
+  process.on("exit", () => { try { win.child?.kill(); } catch { /* already gone */ } });
+}
+
+// CPU% is percent of one core, same scale as the /proc columns.
+function winCost(pid) {
+  const s = pid ? win.samples.get(pid) : null;
+  if (!s) return { cpu: null, rss: null };
+  const prev = win.prev.get(pid);
+  win.prev.set(pid, s);
+  const dt = prev ? (s.at - prev.at) / 1000 : 0;
+  const cpu = prev && dt > 0 ? Math.round(((s.cpu - prev.cpu) / dt) * 1000) / 10 : null;
+  return { cpu, rss: Math.round((s.rss / 1024 / 1024) * 10) / 10 };
+}
+
 // --- /proc/<pid>/stat --------------------------------------------------------
 
 let PAGE_SIZE = 4096;
@@ -298,8 +414,18 @@ async function sample(prevState) {
 
   const nodePid = pidOnPort(SHOCKBOX_PORT);
   const supPid = supervisorPid();
-  const node = procUsage(nodePid, `pid:${nodePid ?? "none"}`, prevState.procs, prevState.ts ?? ts, ts);
-  const sup = procUsage(supPid, `pid:${supPid ?? "none"}`, prevState.procs, prevState.ts ?? ts, ts);
+
+  // Prefer the Windows rig: that is where ShockBox actually ships and runs. /proc is the
+  // fallback for a dev/TUI run inside WSL.
+  const wst = winStatus();
+  let node, sup;
+  if (wst) {
+    node = winCost(wst.node_pid);
+    sup = winCost(wst.supervisor_pid);
+  } else {
+    node = procUsage(nodePid, `pid:${nodePid ?? "none"}`, prevState.procs, prevState.ts ?? ts, ts);
+    sup = procUsage(supPid, `pid:${supPid ?? "none"}`, prevState.procs, prevState.ts ?? ts, ts);
+  }
 
   const row = {
     ts: now.toISOString().replace(/\.\d+Z$/, "Z"),
@@ -347,6 +473,7 @@ function printMap(leaves, lv) {
 
 async function main() {
   initPageSize();
+  startWinProbe();
   const state = loadState();
 
   if (flag("--prune-only")) {

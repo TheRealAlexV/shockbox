@@ -75,7 +75,14 @@ const doc = {
   source: "tools/perf/baseline.mjs (reads ~/.local/state/shockbox-perf/*.csv)",
   metrics,
   noise: null,
+  previous: null,
 };
+// Never lose the last window: a baseline taken while the rig was down is still evidence.
+try {
+  const old = JSON.parse(readFileSync(outfile, "utf8"));
+  delete old.previous;
+  doc.previous = old;
+} catch { /* first run */ }
 writeFileSync(outfile, JSON.stringify(doc, null, 2) + "\n");
 
 console.log(`baseline ${doc.window_minutes} min, ${doc.rows}/${doc.expected_rows} rows, ${doc.host} ${doc.kernel} nproc=${doc.nproc} lhm=${doc.lhm_version}`);

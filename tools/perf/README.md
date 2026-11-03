@@ -16,9 +16,39 @@ One CSV row every 5 s:
 | WSL memory | `mem_avail_mb`, `cached_mb` | `/proc/meminfo` |
 | ShockBox cost | `sb_node_cpu`, `sb_node_rss_mb`, `sb_sup_cpu`, `sb_sup_rss_mb` | `/proc/<pid>/stat` deltas |
 
-`sb_node_*` is whatever process owns TCP port 8972; `sb_sup_*` is the `shockbox_tui` supervisor
-(pid from `~/.local/state/shockbox/supervisor.pid`, else a cmdline scan). Both are empty when
-ShockBox is not running. Process CPU% is percent of **one** core, like `top`.
+`sb_node_*` is whatever process owns TCP port 8972; `sb_sup_*` is the `shockbox_tui` supervisor.
+Both are empty when ShockBox is not running. Process CPU% is percent of **one** core, like `top`.
+
+### Which side the rig runs on (and the two runtime dirs)
+
+The shipping rig runs on the **Windows host** (`C:\OBS\ShockBox`), so its pids do not exist in
+WSL `/proc`. The sampler therefore resolves them from the Windows runtime dir first:
+
+```
+%LOCALAPPDATA%\ShockBox\runtime\status.json   -> node_pid, supervisor_pid, updated, adopted
+C:\Users\<user>\AppData\Local\ShockBox\runtime\supervisor.pid
+```
+
+`status.json` is re-read every row (so a supervisor restart or a new node pid is picked up with
+no hardcoded number), and a single long-lived `powershell.exe` reports each pid's
+`TotalProcessorTime` and `WorkingSet64` every 2.5 s. One powershell per row would cost ~1.6 s of
+wall time each, which is why it is one process and not a spawn per sample. CPU% is a delta
+between reports, so the first row after a restart has RSS but no CPU%.
+
+If Windows is not reachable, the sampler falls back to WSL `/proc`: the pid listening on 8972 and
+the pid in `~/.local/state/shockbox/supervisor.pid` (verified against its cmdline).
+
+**Known wart, worth a follow-up:** there are two runtime dirs, and only the Windows one is live.
+
+| path | contents now | writer |
+|---|---|---|
+| `%LOCALAPPDATA%\ShockBox\runtime\` | `supervisor.pid` = **33276**, live, heartbeat fresh | the Windows supervisor |
+| `~/.local/state/shockbox/` (WSL) | `supervisor.pid` = **168254**, dead since 2026-10-30 | an old WSL run; nothing reaps it |
+
+A detector that trusts the WSL pid file without checking the process would report a supervisor
+that does not exist. This sampler checks, so it reports empty rather than a stale number - but
+the stale file itself is a trap for the next tool, and `paths.py` documents only the
+OS-appropriate dir with no cleanup of the other.
 
 Temperatures come from LibreHardwareMonitor's web server (`http://localhost:8085/data.json`) on
 the Windows host; WSL reaches it as `localhost` because `.wslconfig` sets
@@ -117,43 +147,58 @@ it adds no load of its own. The result is `baseline.json` here: counts, mean/min
 package temp, core avg/max, GPU temp, GPU load, load1 and the ShockBox node/supervisor CPU and
 RSS, plus host, kernel, `nproc` and the LHM version so a later run can be told apart.
 
-Baseline `2026-11-03T08:01:33Z`, 5-minute window, 59/60 rows, `ADV-DT01`,
-kernel `6.6.114.1-microsoft-standard-WSL2`, `nproc=12`, LHM `0.9.6.0`:
+Baseline `2026-11-03T08:10:27Z`, 5-minute window, **60/60 rows**, rig up (Windows node 33684 on
+8972 + supervisor 33276, `adopted: true`), `ADV-DT01`, kernel
+`6.6.114.1-microsoft-standard-WSL2`, `nproc=12`, LHM `0.9.6.0`:
 
-| metric | mean | min | max | p95 |
-|---|---|---|---|---|
-| pkg_c (°C) | 70.17 | 64 | 85 | 79 |
-| core_avg_c (°C) | 64.55 | 59.1 | 72.1 | 71.8 |
-| core_max_c (°C) | 71.61 | 64 | 82 | 78 |
-| gpu_c (°C) | 29.83 | 29 | 43 | 32 |
-| gpu_load (%) | 28.95 | 10 | 94 | 54 |
-| load1 | 0.82 | 0.41 | 1.6 | 1.35 |
-| sb_node_cpu / rss | empty (n=0) | - | - | - |
-| sb_sup_cpu / rss | empty (n=0) | - | - | - |
+| metric | mean | min | max | p95 | n |
+|---|---|---|---|---|---|
+| pkg_c (°C) | 66.33 | 55 | 78 | 72 | 60 |
+| core_avg_c (°C) | 60.53 | 52.7 | 69 | 65.8 | 60 |
+| core_max_c (°C) | 67.73 | 58 | 84 | 76 | 60 |
+| gpu_c (°C) | 30.68 | 30 | 49 | 31 | 60 |
+| gpu_load (%) | 25.8 | 0 | 95 | 43 | 60 |
+| load1 | 0.58 | 0.23 | 0.92 | 0.85 | 60 |
+| sb_node_cpu (% of 1 core) | 0.64 | 0 | 1.8 | 1.5 | 33 |
+| sb_node_rss_mb | 46.29 | 46.2 | 46.8 | 46.8 | 34 |
+| sb_sup_cpu (% of 1 core) | 2.09 | 1.2 | 3.1 | 3.1 | 33 |
+| sb_sup_rss_mb | 32 | 32 | 32 | 32 | 34 |
 
-The ShockBox columns are **empty, not zero**: ShockBox was not running during the baseline
-(nothing listening on 8972, `~/.local/state/shockbox/supervisor.pid` stale from 2026-10-30).
-Re-run `perf:base` with the rig actually running to get a process baseline.
+**Does ShockBox cost anything while idle?** Node: **0.64 % of one core, 46.3 MB**. Supervisor:
+**2.09 % of one core, 32.0 MB**. Together ~2.7 % of one core, ~78 MB, i.e. ~0.23 % of the
+12-thread box. Since-start averages agree (node 26.4 s CPU over ~66 min on Windows = 0.67 %;
+supervisor 29.9 s over ~36 min = 1.38 %).
 
-**Noise floor** (second 2-minute window, 24 rows, taken immediately after the baseline):
+`n=33/34` for the process columns is honest: the Windows probe went live at 08:07:43, 27 rows
+into that window, so the first rows have no process data. Every row after that does. An earlier
+baseline taken with the rig **down** is kept under `previous` in `baseline.json` - do not mistake
+its empty process columns for zeros.
+
+**Noise floor** (second 2-minute window, 23 rows, taken immediately after the baseline):
 
 | metric | 5-min mean | 2-min mean | delta | 5-min p95 | 2-min p95 |
 |---|---|---|---|---|---|
-| pkg_c | 70.17 | 67.21 | **-2.96 °C** | 79 | 73 |
-| core_avg_c | 64.55 | 60.33 | **-4.22 °C** | 71.8 | 64.6 |
-| core_max_c | 71.61 | 69.54 | **-2.07 °C** | 78 | 77 |
-| gpu_c | 29.83 | 30.08 | **+0.25 °C** | 32 | 31 |
-| gpu_load | 28.95 | 17.33 | **-11.62 %** | 54 | 40 |
-| load1 | 0.82 | 0.24 | **-0.58** | 1.35 | 0.49 |
+| pkg_c | 66.33 | 64.83 | **-1.50 °C** | 72 | 71 |
+| core_avg_c | 60.53 | 58.72 | **-1.81 °C** | 65.8 | 67.5 |
+| core_max_c | 67.73 | 67.39 | **-0.34 °C** | 76 | 78 |
+| gpu_c | 30.68 | 30.35 | **-0.33 °C** | 31 | 31 |
+| gpu_load | 25.8 | 15.83 | **-9.97 %** | 43 | 28 |
+| load1 | 0.58 | 0.75 | **+0.17** | 0.85 | 0.91 |
+| sb_node_cpu | 0.64 | 0.67 | **+0.03 %** | 1.5 | 1.5 |
+| sb_node_rss_mb | 46.29 | 46.43 | **+0.14 MB** | 46.8 | 46.8 |
+| sb_sup_cpu | 2.09 | 1.97 | **-0.12 %** | 3.1 | 2.8 |
+| sb_sup_rss_mb | 32 | 32 | **0** | 32 | 32 |
 
-So on this box, two back-to-back quiet-ish windows differ by up to ~3 °C on package temp,
-~4 °C on core average, and ~12 percentage points of GPU load. Treat anything inside
-**±4 °C CPU / ±1 °C GPU / ±0.6 load1 / ±12 % GPU load** as noise, not as a regression.
+Resolution to quote: **±2 °C pkg / ±2 °C core avg / ±0.5 °C core max / ±0.5 °C GPU /
+±10 % GPU load / ±0.2 load1 / ±0.2 % process CPU / ±0.2 MB RSS**. Anything inside that is noise,
+not a regression.
 
-That interval is wide because a pytest run from a parallel session (2-6 `pytest` processes) was
-active during both windows; it was recorded, not excluded, so the number is honest but
-pessimistic. A baseline taken with the box quiet and the rig idle will be tighter - take it
-again rather than trusting this one forever.
+Both windows contained the same background load: the user's browser (25 Brave processes), a
+pytest suite from a parallel session (5-6 processes), and the agent stack (`bun` ~30 % and
+`opencode` ~20 % of one core in WSL). That is this machine's real steady state, so the two
+windows are **trusted as a like-for-like comparison** - that is what makes the floor valid. The
+absolute temperatures are **not** a quiet-box figure: on an idle machine the same rig sits
+lower. GPU load swings ±10 points on browser activity alone.
 
 Anything inside the noise floor is **not** a regression. Compare like with like: this box runs
 OBS, Stream Deck and other Windows software, so a baseline taken while OBS is streaming is a
@@ -162,13 +207,13 @@ different baseline from one taken idle.
 ## Cost of the observer
 
 Measured on this host: `node tools/perf/sample.mjs --duration 60` used **0.140 s of CPU over
-60.2 s wall = 0.233 % of one core** (0.02 % of the 12-thread box). The installed
-`shockbox-perf-monitor.service` showed **0.92 s CPU over ~9 minutes of running** (~0.17 % of one
-core), consistent with the foreground measurement. Cadence over 245 rows: median gap **5 s**,
-min 3 s, max 6 s, **zero** gaps over 10 s.
+60.2 s wall = 0.233 % of one core** (0.02 % of the 12-thread box). With the Windows probe
+running, the installed `shockbox-perf-monitor.service` cgroup (node **and** its powershell
+child) used **1.04 s of CPU over 551 s = 0.19 % of one core**. Cadence over 393 rows: median
+gap **5 s**, min 2 s, max 6 s, **zero** gaps over 10 s.
 
-In price terms: one sample costs about one 97 KB JSON fetch plus a few `/proc` reads every
-5 seconds. It is not a load source.
+In price terms: one sample costs about one 97 KB JSON fetch, a few `/proc` reads every 5
+seconds, and a 2.5 s powershell poll of two Windows processes. It is not a load source.
 
 A browser under SwiftShader costs roughly **one core** on its own - that is orders of magnitude
 more than this sampler, so look there first when a ShockBox run is hot. The sampler is
