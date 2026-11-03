@@ -143,15 +143,40 @@ export function createPublisher({ log = console, pipeName = process.env.SHOCKBOX
     return { width: geom.width, height: geom.height, stride: geom.width, format: 'nv12', fps: geom.fpsNum / geom.fpsDen };
   }
 
+  /** Silence longer than this, with a consumer attached, is a stalled publisher — not health. */
+  const STALL_MS = 2000;
+
+  /** Milliseconds since a frame last reached the pipe, null when none ever did. */
+  function frameAge() {
+    return stat.lastFrameAt ? Date.now() - stat.lastFrameAt : null;
+  }
+
   function stage() {
+    // Three different silences, three different names: nobody asked for frames (`off`), nobody is
+    // reading them (`waiting` — the server drops them by design), or somebody is reading a pipe
+    // the page stopped feeding (`stalled`).
     if (mode === 'off') return 'off';
     if (!clients.size) return 'waiting';
-    // Connected but silent is not "live": the camera would show black while this said otherwise.
-    return Date.now() - stat.lastFrameAt < 1500 ? 'live' : 'waiting';
+    // A fresh stage is a claim that frames moved. Nothing here may say `live` while `frames` has
+    // sat still for longer than a frame or two: that is exactly a frozen camera behind a live pipe.
+    const age = frameAge();
+    return age !== null && age < STALL_MS ? 'live' : 'stalled';
   }
 
   function status() {
-    return { stage: stage(), mode, frames: stat.frames, dropped: stat.dropped, lastFrameAt: stat.lastFrameAt, clients: clients.size, geometry: geom ? geometry() : null, error: stat.error };
+    return {
+      stage: stage(),
+      mode,
+      frames: stat.frames,
+      dropped: stat.dropped,
+      lastFrameAt: stat.lastFrameAt,
+      // The evidence behind `stalled`: frames frozen at a number with no age beside them reads as
+      // health, which is how a stalled publisher sat at 2402 for six minutes.
+      lastFrameAge: frameAge(),
+      clients: clients.size,
+      geometry: geom ? geometry() : null,
+      error: stat.error,
+    };
   }
 
   function drop(client) {

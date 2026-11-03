@@ -605,6 +605,11 @@ function onFrame(frame) {
   state.effect = currentEffect();
   renderState(now);
   ack(now);
+  // This frame is already the newest picture on `tracker.frameSurface()`, and `onFrame` is called
+  // by the stream reader (relay.js `drain`) or the tracker, not by the paint loop — so publish
+  // from here too. Rate-limited inside the publisher: one clock, one request in flight, newest
+  // frame wins, and a kick during a live timer posts nothing extra.
+  publisher.kick();
 }
 
 /** `shoot`: the projectile skin's burst from the pointing hand (or the palm, if only that is
@@ -844,9 +849,10 @@ function loop(now) {
         state.lastDrawAt = Date.now();
       }
     }
-    // Runs straight after the effects pass, while the canvas still holds this frame's pixels.
-    // Publishes nothing unless the server says `publish` is raw or effects.
-    publisher.tick(now);
+    // Publishing is not on this clock. The publisher owns a `setInterval` at the pipe's frame rate
+    // (publish.js `arm`) and is kicked by frame arrival (`onFrame`), because this loop only runs
+    // while the page paints: in a hidden or paused OBS source the loop stops dead while the camera
+    // stream keeps arriving, which froze `publish` at 2402 frames with `stage: "waiting"`.
     // The draw truth rides the render loop, not the tracker's frame callback. On the device path
     // `onFrame` was driven by this page's own rAF, so its `/ack` beat came free; a relayed frame
     // instead arrives from the stream reader (relay.js `drain`), and a reader that stalls (or a

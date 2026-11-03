@@ -24,7 +24,26 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
   let ctx = null;
   let inflight = false;
   let last = 0;
+  let timer = null; // the publish clock; see arm()
+  let timerFps = 0;
   const sent = { ok: 0, failed: 0, skipped: 0 };
+
+  /**
+   * The publish clock. `setInterval`, not `requestAnimationFrame`: rAF only runs while the browser
+   * paints, so an OBS browser source whose scene is hidden (or whose compositor is paused) stops
+   * ticking while its `fetch` stream and its timers keep delivering — publishing froze at a fixed
+   * frame count with no error anywhere. A timer survives that; a paint callback does not.
+   */
+  function arm() {
+    const fps = mode === 'off' || !ctx ? 0 : Math.max(1, geom.fps || 30);
+    if (timer && timerFps === fps) return;
+    if (timer) clearInterval(timer);
+    timer = null;
+    timerFps = 0;
+    if (!fps) return; // off: no timer, no canvas, no fetch — the same nothing as before
+    timerFps = fps;
+    timer = setInterval(() => tick(performance.now()), Math.round(1000 / fps));
+  }
 
   /** Take the mode and geometry from a /status document (the only source of both). */
   function fromStatus(status) {
@@ -34,6 +53,7 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
     if (next !== 'off' && (!g || !g.width || !g.height)) {
       // A publisher with no geometry has nothing to send: stay off instead of guessing a size.
       mode = 'off';
+      arm();
       return;
     }
     mode = next;
@@ -41,6 +61,7 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
       geom = null;
       surface = null;
       ctx = null;
+      arm();
       return;
     }
     if (!geom || geom.width !== g.width || geom.height !== g.height || geom.fps !== g.fps) {
@@ -51,6 +72,7 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
       // A readback every frame: a software canvas beats a GPU canvas that has to stall to answer.
       ctx = surface.getContext('2d', { alpha: false, willReadFrequently: true });
     }
+    arm();
   }
 
   /**
@@ -129,5 +151,14 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
       });
   }
 
-  return { fromStatus, tick, stats: () => ({ ...sent, mode }) };
+  /**
+   * Ask for a frame now, from whatever just received a picture. A kick is not a second clock: it
+   * goes through the same `tick`, its rate limit and its one-in-flight rule, so a kick during a
+   * running timer posts nothing extra, and a kick on a paused page still ships the newest frame.
+   */
+  function kick() {
+    tick(performance.now());
+  }
+
+  return { fromStatus, tick, kick, stats: () => ({ ...sent, mode, clock: timer ? 'timer' : 'off' }) };
 }

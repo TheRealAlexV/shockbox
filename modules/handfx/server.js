@@ -197,7 +197,7 @@ function build(ctx) {
   const body = { lastMaskAt: 0, pageOpen: false, lastPoseAt: 0 };
   // The overlay's draw truth, reported on /ack: how many frames it rendered, where the anchors came
   // from, and when the last frame landed. Counters and a name, never a frame.
-  const draw = { draws: 0, anchors: 'none', lastDrawAt: 0 };
+  const draw = { draws: 0, anchors: 'none', lastDrawAt: 0, lastAckAt: 0 };
   // Why the overlay's camera did not open (the page's own diagnostic object), the label of the
   // device it did open, which pipe is carrying frames (relay | device | synthetic | none) and why
   // the relay is not it. Reported on /ack, read back on /status; never a frame.
@@ -252,6 +252,9 @@ function build(ctx) {
       draws: draw.draws,
       anchors: draw.anchors,
       lastDrawAt: draw.lastDrawAt,
+      // The page's own beat: `draws` frozen with this fresh is a page that cannot paint (hidden
+      // OBS source), not a dead page. Both frozen is a page that stopped ticking.
+      lastAckAt: draw.lastAckAt,
       // The overlay's camera answer: why it did not open (object or null) and what it did open.
       cameraError: camera.error,
       cameraLabel: camera.label,
@@ -443,6 +446,10 @@ function build(ctx) {
           if (Number.isFinite(bodyIn.lastDrawAt) && bodyIn.lastDrawAt > draw.lastDrawAt) {
             draw.lastDrawAt = Math.min(Date.now(), bodyIn.lastDrawAt);
           }
+          // When the page last spoke at all. `draws` only moves while the page paints, so a paused
+          // browser source freezes it; this stamp keeps "ticking but not painting" readable from
+          // /status instead of looking like a dead page next to live camera frames.
+          draw.lastAckAt = Date.now();
           // The camera's failure reason and the device that opened. The object is the page's; the
           // shape and the stage vocabulary are this server's, so a client cannot inject anything
           // but the fields /status promises.
