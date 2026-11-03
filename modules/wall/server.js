@@ -380,12 +380,11 @@ export default {
    * and the picture is never stretched by the wall's shape.
    */
   imageGeometry() {
-    const s = this.ctx.settings;
     const meta = this.image;
     const w = Number(meta && meta.w) || 0;
     const h = Number(meta && meta.h) || 0;
     const picH = w > 0 && h > 0 ? h / w : 1;
-    const ratio = String((s && (typeof s.get === 'function' ? s.get('ratio') : s.ratio)) || '16:9');
+    const ratio = this.effectiveRatio();
     const parts = ratio.split(':').map(Number);
     const wallAspect = parts.length === 2 && parts[0] > 0 && parts[1] > 0 ? parts[0] / parts[1] : 16 / 9;
     return { picH, wallAspect, aspect: picH * wallAspect, w, h };
@@ -432,13 +431,14 @@ export default {
         look[k] = v;
       }
     }
+    const ratio = this.effectiveRatio();
     return {
       look,
-      ratio: s ? s.get('ratio') : '16:9',
-      // The fence the engine sees is in CELLS (it is a grid window, not a pixel clip), derived
-      // here so the operator can keep dragging pixels in the control pane and the GPU never has
-      // to round on its own. `grid` is whichever page is live; the value is advisory for the pane.
-      fence: s ? this.fenceCellsFor(s.get('fence')) : null,
+      ratio,
+      // The window is a property of the ratio, never a stored rect: 9:16 is the portrait column
+      // inside the full-surface 16:9 page, 16:9 is the whole wall. Derived on every frame, so a
+      // stale rect from an old scale can never put the window off the surface.
+      fence: this.derivedFence(ratio),
       rev: this.renderRev,
       // The image layer's identity. Derived from what the module actually holds, never from the
       // settings document alone: a page holding a picture for a revision this server no longer
@@ -471,11 +471,58 @@ export default {
   },
 
   /**
+   * The ratio the wall is actually running: the module's own value, or the core-wide one when the
+   * module says `default`. One resolver, used by the snapshot frame, the pane and `/live`, so a
+   * page and its control pane can never disagree about what "default" resolves to.
+   */
+  effectiveRatio() {
+    const s = this.ctx.settings;
+    const own = s && typeof s.get === 'function' ? s.get('ratio') : 'default';
+    if (own === '9:16' || own === '16:9') return own;
+    const core = this.ctx.core && this.ctx.core.settings;
+    const global = core && typeof core.get === 'function' ? core.get('ratio') : null;
+    return global === '9:16' ? '9:16' : '16:9';
+  },
+
+  /**
+   * The 9:16 window, derived from the ratio and the landscape page's grid.
+   *
+   *   width  = canvas height * 9 / 16      height = canvas height
+   *   x      = (canvas width - width) / 2  y      = 0
+   *
+   * In cells on the 1280x720 (x2) surface that is the centred 35x63 window inside the 112x63
+   * grid. Never stored: a rect in the settings document went stale the moment the surface's
+   * scale or grid changed, and the pane dragged a window the page then ignored.
+   */
+  derivedFence(ratio = this.effectiveRatio()) {
+    if (ratio !== '9:16') return null;
+    const s = this.ctx.settings;
+    const cols = Math.max(4, Math.round(Number(s ? s.get('gridCols') : 0) || 112));
+    const scale = 2; // the engine's default scale; the page reports its real one on heartbeat
+    const W = 1280 * scale;
+    const H = 720 * scale;
+    const pitchX = W / cols;
+    const rows = Math.max(4, Math.round(Number(s ? s.get('gridRows') : 0) || 0) || Math.round(H / pitchX));
+    const pitchY = H / rows;
+    const wPx = (H * 9) / 16;
+    const xPx = (W - wPx) / 2;
+    const x = Math.max(0, Math.min(cols - 2, Math.round(xPx / pitchX)));
+    const w = Math.max(2, Math.round(wPx / pitchX));
+    return {
+      cells: { x, y: 0, w, h: rows },
+      px: { x: xPx, y: 0, w: wPx, h: H },
+      pitch: { x: pitchX, y: pitchY },
+      cols,
+      rows,
+    };
+  },
+
+  /**
    * Whole-cell window from a pixel rect, using the landscape page's grid (the one source OBS
    * loads). The engine re-snaps against its own grid anyway; this is what the pane shows.
    */
+  // Idempotent: `renderSettings()` already returns this function's converted shape, and every
   fenceCellsFor(px) {
-    // Idempotent: `renderSettings()` already returns this function's converted shape, and every
     // settings/image/preset frame hands that converted fence straight back to `broadcastState`,
     // which calls this again. Without the pass-through the `w/h > 0` bail below reads a converted
     // fence as "no fence" and clears it on every live page. Both shapes reach here (converted
@@ -958,27 +1005,19 @@ export default {
         },
       },
       {
-        // Commit a fence rect the operator dragged: same value, but it becomes the persisted
-        // document (a live drag never does) and reaches every page as a normal snapshot.
+        // Commit a fence rect the operator dragged. The window is derived from the ratio now, so
+        // the rect itself is not stored: a queued drag pins 9:16 (or 16:9 when cleared) and the
+        // page gets the derived window back. Kept as a route because the pane's gesture commits
+        // here and an older pane still calls it.
         method: 'PUT',
         path: '/fence',
         handler(req, res, url, body) {
           if (!body || typeof body !== 'object') throw new HttpError(400, 'body must be a JSON object');
           const f = body.fence;
-          if (f !== null) {
-            if (!f || typeof f !== 'object') throw new HttpError(400, 'fence must be an object or null');
-            for (const k of ['x', 'y', 'w', 'h']) {
-              if (!Number.isFinite(Number(f[k]))) throw new HttpError(400, `fence.${k} must be a number`);
-            }
-            if (Number(f.w) < 1 || Number(f.h) < 1) throw new HttpError(400, 'fence w/h must be positive');
-            // Persist as well as broadcast. A broadcast-only PUT moved the pane and the OBS pages
-            // and left the settings document on the old rect, so every `/live` poll and every
-            // settings frame repainted the window where it used to be — a drag that "did not
-            // commit" while the wall had already moved.
-            S().assign('fence', { x: Number(f.x), y: Number(f.y), w: Number(f.w), h: Number(f.h) });
-          }
+          if (f !== null && (!f || typeof f !== 'object')) throw new HttpError(400, 'fence must be an object or null');
+          S().set('ratio', f === null ? '16:9' : '9:16');
           mod._bumpRender();
-          const snap = mod.broadcastState({ fence: f }, 'fence');
+          const snap = mod.broadcastState({}, 'fence');
           mod.pushState();
           return { ok: true, fence: snap.fence, rev: snap.rev };
         },

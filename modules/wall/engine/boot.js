@@ -1,10 +1,12 @@
 /**
  * LED Wall v2.1 — shared page boot
  * =================================
- * One page, one classic script: `engine/display.html` (16:9) or `engine/display-portrait.html`
- * (9:16) sets `LEDWALL_PAGE` and loads this file. On the 16:9 page the 9:16 picture is the fence
- * block inside the landscape canvas, selected by `?view=portrait` or by the render settings; the
- * 9:16 page is that window as a page of its own and ignores the fence.
+ * One page, one classic script: `engine/display.html` serves both routes and sets
+ * `LEDWALL_PAGE`; everything else is the same document. The page is a full surface whose shape
+ * the ratio decides — 16:9 is the whole wall, 9:16 is the centred portrait column inside it — and
+ * `applyLook` switches between them on any settings frame, in place, without a reload.
+ * `/wall/portrait` is the one exception: it pins 9:16 (`forceRatio`) and ignores the document's
+ * ratio, because that OBS source is nothing but the window.
  *
  * WHY classic script: the production page is loaded from
  * `file:///C:/OBS/LEDWall/display.html` inside OBS CEF.  `file://` blocks ES
@@ -206,6 +208,14 @@
     // moved the revision) still has to reach the shader, or the picture is drawn at the wall's
     // aspect until the next settings change.
     if (d.imageGeometry && typeof d.imageGeometry === 'object') inst.imageGeometry = d.imageGeometry;
+    // `ratio` rides on every frame and is the page's own geometry: 16:9 and 9:16 are the same
+    // document, so the wall re-grids and re-lays out in place — no reload, no render-loop restart.
+    // `/wall/portrait` is pinned: that source IS the 9:16 window, whatever the document says.
+    if (!PAGE.forceRatio && d.ratio && inst.setRatio) {
+      var settled = inst.setRatio(d.ratio);
+      RATIO = settled.ratio;
+      applied = true;
+    }
     if (d.look && typeof d.look === 'object' && !loadingPreset) {
       inst.setSettings(d.look, { source: 'server' });
       applied = true;

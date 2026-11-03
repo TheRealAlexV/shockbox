@@ -163,6 +163,15 @@ const coreSettings = new Settings({
       label: 'Scenes that force 16:9',
       group: 'ratio',
     },
+    // The show-wide ratio. A wall whose own `ratio` is `default` follows this, so the deck's ratio
+    // key or a scene forcing one value drives every wall source at once.
+    ratio: {
+      type: 'enum',
+      values: ['16:9', '9:16'],
+      default: '16:9',
+      label: 'Global wall ratio',
+      group: 'ratio',
+    },
     obsEnabled: { type: 'boolean', default: OBS_ENABLED, label: 'Talk to OBS over obs-websocket', group: 'obs' },
     obsUrl: { type: 'string', default: OBS_URL, label: 'obs-websocket URL', group: 'obs' },
     compatPort: { type: 'number', default: COMPAT_PORT, min: 0, max: 65535, integer: true, label: 'Legacy popup port (0 = off)', group: 'compat' },

@@ -237,21 +237,35 @@ export async function render(container, ctx) {
 const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'live' });
   const ratioWrap = el('div', { class: 'wall-ratio' });
   const ratioSeg = el('div', { class: 'segmented', role: 'radiogroup', 'aria-label': 'Wall ratio' });
-  const seg169 = el('button', { type: 'button', class: 'seg mono', text: '16:9', dataset: { value: '16:9' } });
-  const seg916 = el('button', { type: 'button', class: 'seg mono', text: '9:16', dataset: { value: '9:16' } });
-  seg169.setAttribute('aria-checked', 'false');
-  seg916.setAttribute('aria-checked', 'false');
-  seg169.title = 'Whole wall';
-  seg916.title = '9:16 window inside the wall';
-  seg169.addEventListener('click', () => chooseRatio('16:9'));
-  seg916.addEventListener('click', () => chooseRatio('9:16'));
-  // the pair is one radio group; arrow keys move the choice like the arrow buttons around it
+  // The ratio is a setting: `Default (global)` leaves the wall to its own document (a forcing
+  // scene can still pin 16:9), and the other two pin it. Each button PATCHes `ratio` and nothing
+  // else — the 9:16 window is derived from the ratio, so there is no rect to send and no stale
+  // fence left behind by a second key in the patch.
+  const RATIO_CHOICES = [
+    ['default', 'Default', 'Default (global): the wall’s own ratio setting'],
+    ['16:9', '16:9', 'Whole wall'],
+    ['9:16', '9:16', '9:16 window inside the wall'],
+  ];
+  const ratioSegBtn = {};
+  let ratioChoice = null; // the stored setting: default | 16:9 | 9:16
+  for (const [value, text, title] of RATIO_CHOICES) {
+    const b = el('button', { type: 'button', class: 'seg mono', text, dataset: { value } });
+    b.title = title;
+    b.setAttribute('aria-checked', 'false');
+    if (value === 'default') b.setAttribute('aria-label', 'Default (global)');
+    b.addEventListener('click', () => chooseRatio(value));
+    ratioSegBtn[value] = b;
+    ratioSeg.append(b);
+  }
+  // the three are one radio group; arrow keys move the choice like the arrow buttons around it
   ratioSeg.addEventListener('keydown', (e) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
     e.preventDefault();
-    chooseRatio(e.key === 'ArrowLeft' ? '16:9' : '9:16');
+    const order = RATIO_CHOICES.map((c) => c[0]);
+    const at = Math.max(0, order.indexOf(ratioChoice || 'default'));
+    const step = e.key === 'ArrowLeft' ? -1 : 1;
+    chooseRatio(order[(at + step + order.length) % order.length]);
   });
-  ratioSeg.append(seg169, seg916);
   const forceWrap = el('div', { class: 'wall-force', hidden: true });
   const forceNote = el('span', { class: 'wall-force-note mono' });
   const forceBtn = el('button', { type: 'button', class: 'btn btn-sm', text: 'Force 16:9 now' });
@@ -523,60 +537,15 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
 
   /* --- fence controls ----------------------------------------------------- */
 
-  const fenceToggle = el('input', { type: 'checkbox', id: 'wall-fence-on' });
-  // A rect is the persisted fence and the only shape the settings schema stores. "Whole wall"
-  // is `ratio: 16:9`: the preview draws no window and no dim there, and turning the window back
-  // on also picks 9:16. The schema's `fence` is an object, so `null` is a refused PATCH.
-  fenceToggle.addEventListener('change', () => {
-    const want = fenceToggle.checked;
-    const rect = fencePx ? snapToCells(fencePx) : snapToCells(centredFence());
-    fenceToggle.disabled = true;
-    patchSettings(want ? { fence: rect, ratio: '9:16' } : { ratio: '16:9' })
-      .then((out) => {
-        if (want && out) {
-          fencePx = rect;
-          paintPreview();
-          paintFenceFields();
-        }
-      })
-      .finally(() => {
-        fenceToggle.disabled = false;
-        paintFenceFields();
-      });
-  });
-  const resetBtn = el('button', { type: 'button', class: 'btn btn-sm', text: 'Centre', title: 'Centre the window at 1440×2560' });
-  resetBtn.addEventListener('click', () => {
-    const rect = snapToCells(centredFence());
-    fencePx = rect;
-    paintPreview();
-    paintFenceFields();
-    commitFence(rect);
-  });
-
+  // The window has no on/off switch any more: it exists when the ratio is 9:16, and its rect is
+  // derived from the wall's own geometry (server.js `derivedFence`) — height = the surface, width =
+  // height × 9/16, x centred. The fields below are a readout of that, not an editor, so a drag,
+  // a nudge or a stale rect in the document cannot disagree with the page the wall is drawing.
   const numFields = {};
   for (const k of ['x', 'y', 'w', 'h']) {
+    // A readout, not a form: the window is the ratio's shape, so nothing here is editable.
     const box = el('input', { type: 'number', class: 'input input-num', step: '1', id: `wall-fence-${k}` });
-    box.addEventListener('change', () => {
-      const n = Number(box.value);
-      // an empty box is "leave it", not NaN; an out-of-wall number is clamped by the snap
-      if (box.value.trim() === '' || !Number.isFinite(n)) {
-        paintFenceFields();
-        return;
-      }
-      const next = { ...(fencePx || centredFence()), [k]: round(n) };
-      const snapped = snapToCells(next, k === 'w' || k === 'h' ? k : null);
-      fencePx = snapped;
-      paintPreview();
-      autoZoom();
-      commitFence(snapped);
-    });
-    box.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        box.dispatchEvent(new Event('change'));
-        box.blur();
-      }
-    });
+    box.disabled = true;
     numFields[k] = box;
   }
   const dimRange = el('input', { type: 'range', id: 'wall-fence-dim', min: '0', max: '1', step: '0.01', 'aria-label': 'Dim outside the window' });
@@ -602,20 +571,14 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   });
   timers.push(() => clearTimeout(dimTimer));
 
-  const resetGrip = el('div', { class: 'fence-grip', 'aria-hidden': 'true' });
-  resetGrip.classList.add('wall-reset-mark');
+  /* --- the window, as the server derives it -------------------------------- */
 
   const fenceStateOut = el('span', { class: 'wall-fence-state mono', text: 'whole wall' });
   const fencePanel = el('section', { class: 'panel wall-fence-panel' },
     el('div', { class: 'panel-head' },
       el('span', { class: 'panel-title', text: '9:16 window' }),
       fenceStateOut,
-      el('span', { class: 'panel-hint' },
-        // a switch needs a name a person can read: the state is the name
-        el('label', { class: 'switch wall-switch', for: 'wall-fence-on', title: 'Off = the wall is whole (no window)' },
-          fenceToggle, el('span', { class: 'switch-track', 'aria-hidden': 'true' }),
-          el('span', { class: 'wall-switch-label mono', text: 'window' })),
-      ),
+      el('span', { class: 'panel-hint mono dim', text: 'derived from the ratio' }),
     ),
     el('div', { class: 'wall-fence-body' },
       el('div', { class: 'wall-fence-grid' },
@@ -631,9 +594,9 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
         el('label', { class: 'wall-dim-label', for: 'wall-fence-dim' }, el('span', { text: 'Dim outside' })),
         dimWrap,
       ),
-      el('div', { class: 'wall-fence-foot' }, resetBtn),
+      el('div', { class: 'wall-fence-foot' }, el('span', { class: 'mono dim', text: 'read-only' })),
       ),
-      el('p', { class: 'wall-hint dim', text: 'Taller window = bigger portrait. The drag keeps 9:16; the server pins the width to the height.' }),
+      el('p', { class: 'wall-hint dim', text: 'Height is the surface height; width and x follow from 9:16, snapped to the grid. Switch the ratio above to show or hide it.' }),
     ),
   );
 
@@ -1406,15 +1369,23 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   }
 
   function paintRatio() {
-    seg169.setAttribute('aria-checked', String(ratioSelection === '16:9'));
-    seg916.setAttribute('aria-checked', String(ratioSelection === '9:16'));
+    // Two different facts, painted separately: `ratioChoice` is what the document says
+    // (default / 16:9 / 9:16) and `ratioSelection` is what the wall is actually running — a
+    // forcing scene pins 16:9 without touching the operator's own setting.
+    const own = String(metaValue('ratio') ?? 'default');
+    ratioChoice = (own === '16:9' || own === '9:16') ? own : 'default';
+    for (const [value, btn] of Object.entries(ratioSegBtn)) {
+      btn.setAttribute('aria-checked', String(value === ratioChoice));
+      btn.dataset.effective = String(value === ratioChoice && ratioSelection && ratioSelection !== value);
+    }
     const forcing = !!ratioState.forcing;
-    // Locked, not disabled: the server refuses the toggle and says why, and a dead control
-    // teaches nothing. A click on 9:16 while locked surfaces that answer as a toast.
-    seg916.setAttribute('aria-disabled', String(forcing));
-    seg916.dataset.locked = String(forcing);
-    seg916.title = forcing
-      ? `"${ratioState.lastScene || 'this scene'}" forces 16:9 — clicking asks the server why`
+    // Locked, not disabled: the server's watcher pins 16:9 and the pane says why instead of
+    // leaving a control that silently does nothing.
+    const pin = ratioSegBtn['9:16'];
+    pin.setAttribute('aria-disabled', String(forcing));
+    pin.dataset.locked = String(forcing);
+    pin.title = forcing
+      ? `"${ratioState.lastScene || 'this scene'}" forces 16:9 — leaving the scene restores your choice`
       : '9:16 window inside the wall';
     // `hidden` is display:none !important-free, but this rule must also beat `.wall-force { display:inline-flex }`
     forceWrap.hidden = !forcing;
@@ -1491,38 +1462,14 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     if (preview) return preview;
     preview = mountPreview(previewHost, {
       title: 'Wall preview',
-      hint: `${WALL_W} × ${WALL_H} · drag the window · corner grip · arrows nudge`,
-      interactive: true,
+      hint: `${WALL_W} × ${WALL_H} · the 9:16 window is derived from the ratio`,
+      // Read-only: the window is a consequence of the ratio, so there is nothing here to drag.
+      interactive: false,
       dim: Number(lookValue('fenceOutDim') ?? 0.18),
       look: previewLook(),
-      // set by wirePreviewDrag(); guarded so a resize during boot cannot throw
-      onFence: (f) => {
-        preview?.onFenceChange?.(f);
-      },
     });
     preview.setLayer(null);
     preview.host = previewHost;
-    // the pane's fence is only meaningful on the 9:16 wall; a drag on a whole wall is ignored
-    // there instead of silently creating a window the engine will not honour
-    preview.onFenceChange = (f) => {
-      if (ratioSelection !== '9:16') return;
-      const raw = fenceToRect({ ...f, y: fencePx?.y ?? f.y });
-      fencePx = snapToCells(raw);
-      fenceCells = cellsFor(fencePx);
-      paintPreview();
-      paintFenceFieldsLive();
-      commitFence(fencePx);
-    };
-    // a live push on every pointer move (the component calls this only while dragging), so the
-    // open pages follow the window without waiting for the release to commit
-    preview.onFenceMove = (f) => {
-      if (ratioSelection !== '9:16') return;
-      fencePx = snapToCells(fenceToRect({ ...f, y: fencePx?.y ?? f.y }));
-      fenceCells = cellsFor(fencePx);
-      paintPreview();
-      paintFenceFieldsLive();
-      pushFenceLive();
-    };
     return preview;
   }
 
@@ -1629,18 +1576,15 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
 
 
   function paintFenceFields() {
-    // "on" is the window being the live mode: a 9:16 wall with a rect. A rect kept for later
-    // while the wall is whole must not leave the switch reading "on".
+    // The window exists when the wall runs 9:16, and the server derives its rect from the wall's
+    // own geometry — so these fields are a readout, never an edit.
     const on = Boolean(fencePx) && ratioSelection === '9:16';
-    fenceToggle.checked = on;
     fenceStateOut.textContent = on ? `${Math.round(fencePx.w)}×${Math.round(fencePx.h)} px` : 'whole wall';
     fencePanel.dataset.fence = on ? 'on' : 'off';
     const r = fencePx || centredFence();
     for (const k of ['x', 'y', 'w', 'h']) {
-      if (document.activeElement !== numFields[k]) numFields[k].value = String(Math.round(r[k]));
-      numFields[k].disabled = !on;
+      numFields[k].value = String(Math.round(r[k]));
     }
-    resetBtn.disabled = false;
     dimRange.value = String(Number(lookValue('fenceOutDim') ?? 0.18));
     if (document.activeElement !== dimNum) dimNum.value = Number(lookValue('fenceOutDim') ?? 0.18).toFixed(2);
   }
@@ -1692,147 +1636,8 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     return { x: (WALL_W - w) / 2, y: (WALL_H - h) / 2, w, h };
   }
 
-  /* ---------------------------------------------------------------- drag */
-
-  /**
-   * The drag itself lives in the preview component now: it owns the 16:9 frame, the 9:16 window
-   * and the pointer→fraction maths for both. The pane subscribes to the component's `onFence`
-   * and turns the resulting fractions back into wall pixels through the same cell grid the
-   * numeric fields use, so a drag and a typed value cannot disagree.
-   *
-   * What stays here is the semantic bit the component must not know: a fence is only meaningful
-   * on the 9:16 wall. On a whole 16:9 wall a drag is ignored rather than silently creating a
-   * window that the engine will not honour.
-   */
-
-  function paintFenceFieldsLive() {
-    const r = fencePx;
-    if (!r) return;
-    for (const k of ['x', 'y', 'w', 'h']) {
-      if (document.activeElement !== numFields[k]) numFields[k].value = String(Math.round(r[k]));
-    }
-  }
-
-  /* ---- live push, throttled to ~10 Hz; the final value is PATCHed on release */
-
-  let lastPush = 0;
-  let pushTimer = null;
-  let pushQueued = false;
-
-  function pushFenceLive() {
-    if (!autoApply) return; // off: the drag is local until Apply
-    if (!fencePx) return;
-    pushQueued = true;
-    if (pushTimer) return;
-    const send = () => {
-      pushTimer = null;
-      if (!pushQueued) return;
-      pushQueued = false;
-      lastPush = Date.now();
-      // A drag is a preview: the frame reaches every page but is never persisted, so a crash
-      // mid-drag cannot leave the operator's last real choice replaced by a half-dragged rect.
-      api.post('/api/wall/broadcast', { patch: { fence: { ...fencePx } }, note: 'drag', live: true }).catch(() => {});
-      if (pushQueued) pushTimer = setTimeout(send, 100);
-    };
-    const wait = Math.max(0, 100 - (Date.now() - lastPush));
-    pushTimer = setTimeout(send, wait);
-  }
-  timers.push(() => clearTimeout(pushTimer));
-
-  /* ---- keyboard nudge: the wall is focusable, arrows move one cell */
-
-  previewHost.addEventListener('keydown', (e) => {
-    if (ratioSelection !== '9:16' || !fencePx) return;
-    const g = gridInfo();
-    const page = e.shiftKey ? 8 : 1;
-    let dx = 0;
-    let dy = 0;
-    if (e.key === 'ArrowLeft') dx = -g.px * page;
-    else if (e.key === 'ArrowRight') dx = g.px * page;
-    else if (e.key === 'ArrowUp') dy = -g.py * page;
-    else if (e.key === 'ArrowDown') dy = g.py * page;
-    else if (e.key === '+' || e.key === '=') {
-      e.preventDefault();
-      growFence(1);
-      return;
-    } else if (e.key === '-' || e.key === '_') {
-      e.preventDefault();
-      growFence(-1);
-      return;
-    } else if (e.key === 'Home') {
-      e.preventDefault();
-      fencePx = snapToCells(centredFence());
-      paintPreview();
-      commitFence(fencePx);
-      return;
-    } else return;
-    e.preventDefault();
-    fencePx = snapToCells({ ...fencePx, x: fencePx.x + dx, y: fencePx.y + dy });
-    fenceCells = cellsFor(fencePx);
-    paintPreview();
-    paintFenceFieldsLive();
-    commitFence(fencePx);
-  });
-
-  function growFence(dir) {
-    const g = gridInfo();
-    const c = cellsFor(fencePx);
-    const hCells = clamp(c.h + dir, 8, g.rows);
-    const h = hCells * g.py;
-    fencePx = snapToCells({ ...fencePx, h });
-    fenceCells = cellsFor(fencePx);
-    paintPreview();
-    paintFenceFieldsLive();
-    commitFence(fencePx);
-  }
-
-  /* --------------------------------------------------------------- writes */
-
-  async function commitFence(rect) {
-    if (signal.aborted) return;
-    if (!autoApply) {
-      fencePx = { ...rect };
-      Object.assign(pendingPatch, { fence: rect });
-      paintFenceFields();
-      paintPreview();
-      paintPending();
-      return { ok: true, queued: true };
-    }
-    previewPanel.dataset.busy = 'true';
-    try {
-      // Commit through the fence route: a drag preview never persisted, so this is what makes
-      // the rect survive a restart.
-      const out = await api.put('/api/wall/fence', { fence: rect });
-      const saved = out && out.fence;
-      if (saved) applyFenceDoc(saved);
-      if (out && out.render) renderDoc = out.render;
-      if (out && out.ratio) ratioState = out.ratio;
-      // re-read the canonical shape (cells/pitch) — this is what "saved" means
-      const r = await api.get('/api/wall/render');
-      if (r && r.settings) {
-        renderDoc = r.settings;
-        applyFenceDoc(r.settings.fence);
-        look = r.settings.look || look;
-        if (r.online) online = r.online;
-      }
-      paintFenceFields();
-      paintPreview();
-      paintOnline();
-    } catch (err) {
-      toast(`window not saved: ${err.message}`, 'error');
-      // snap back to what the server actually holds
-      try {
-        const r = await api.get('/api/wall/render');
-        applyFenceDoc(r?.settings?.fence);
-      } catch {
-        /* keep the local rect, the toast already said it failed */
-      }
-      paintFenceFields();
-      paintPreview();
-    } finally {
-      delete previewPanel.dataset.busy;
-    }
-  }
+  /* The window is not draggable: its rect is the ratio's shape, so the pane only ever paints the
+     rect the server derived (`derivedFence`). Any gesture that used to write a fence is gone. */
 
   /* ------------------------------------------------------- apply gate writes */
 
@@ -2022,18 +1827,24 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   }
 
   async function chooseRatio(next) {
-    if (next === ratioSelection) return;
-    // the seg is never disabled: inside a forcing scene a click must still answer with why
-    const out = await cmd('ratio.toggle');
-    // the server decides: a forcing scene refuses, and its message is already on screen
-    if (out && out.ratio) {
-      ratioSelection = out.ratio === '9:16' ? '9:16' : '16:9';
-      // Name the value that actually settled, not the one that was asked for: "stayed 9:16"
-      // after clicking 9:16 inside a forcing scene reads as success.
-      if (ratioSelection !== next) toast(`ratio stayed ${ratioSelection} — ${out.note || 'the server refused'}`, 'warn');
+    const want = (next === '16:9' || next === '9:16') ? next : 'default';
+    if (want === ratioChoice) return;
+    // A forcing scene pins 16:9 in the server's watcher; say so instead of writing a value that
+    // will be overridden on the next scene edge.
+    if (ratioState.forcing && want === '9:16') {
+      toast(`ratio stays 16:9 — "${ratioState.lastScene || 'this scene'}" forces it`, 'warn');
+      return;
     }
+    ratioChoice = want;
     paintRatio();
-    paintPreview();
+    // `ratio` alone. The 9:16 window is derived from it, so there is no rect in the patch and
+    // nothing stale left in the document for the next page load to pick up.
+    const out = await patchSettings({ ratio: want });
+    if (out && out.settings) adoptSettings(out.settings);
+    if (out && out.ratio) ratioState = { ...ratioState, ...out.ratio };
+    await pull();
+    paintRatio();
+    paintFenceFields();
   }
 
   /* ---------------------------------------------------------------- data */

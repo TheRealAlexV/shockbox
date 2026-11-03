@@ -1,37 +1,37 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <base href="/mod/wall/engine/">
-<title>LED wall — 16:9</title>
-<!--
-  The one wall source OBS loads. A 1280x720 render surface; 9:16 is a fence inside it, not a
-  second source (see ENGINE-API.md §View). In ShockBox server mode the live settings come from
-  /api/wall/render and follow the control pane's snapshot frames; the query string below is
-  only the fallback look used before the first pull lands.
--->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LED wall</title>
 <style>
-  html, body { margin: 0; padding: 0; width: 1280px; height: 720px; overflow: hidden; background: #000; }
-  #wall { display: block; width: 1280px; height: 720px; }
-  #diag { position: absolute; left: 8px; top: 8px; color: #0f0; font: 11px monospace; white-space: pre; display: none; }
-  /* `?fit=portrait` only: the canvas is 9:16 at the surface's full height, centred, background black. */
-  html.fit-portrait #wall { height: 100vh; width: calc(100vh * 9 / 16); margin: 0 auto; }
+  /* A full surface, whatever the source is: the engine sizes the canvas element from the ratio
+     (see engine.js `_sizeCanvas`), so nothing here names a pixel size or an aspect. */
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  #wall { display: block; position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #diag, #bench {
+    position: absolute; left: 8px; margin: 0; padding: 4px 6px;
+    font: 11px/1.35 ui-monospace, monospace; color: #8ef; background: rgba(0,0,0,.55);
+    white-space: pre; pointer-events: none;
+  }
+  #diag { top: 8px; }
+  #bench { bottom: 8px; }
 </style>
 </head>
 <body>
-<canvas id="wall" width="1280" height="720"></canvas>
-<div id="diag"></div>
+<canvas id="wall"></canvas>
+<pre id="diag" hidden></pre>
+<pre id="bench" hidden></pre>
 <script>
-  // `?fit=portrait` — opt-in pillarbox on this 16:9 surface: the portrait wall (63x112) as a
-  // centred 9:16 column, black either side, which is the /wall/portrait composition. boot.js
-  // treats ratio 9:16 as the 9:16 page, so it lays out portrait AND skips the server's 9:16
-  // fence: a fence is a window *inside* a landscape wall, and here the whole picture already is
-  // the portrait one. Without the flag this is the landscape wall it has always been.
+  // One page, two surfaces. `/wall/portrait` is an OBS source at 720x1280: it pins 9:16 and the
+  // document cannot move it. `/wall/render` follows the `ratio` setting on every state frame, so
+  // the operator can switch 16:9 ↔ 9:16 without a reload (boot.js → engine.setRatio).
   (function () {
-    var fit = new URLSearchParams(location.search).get('fit') === 'portrait';
-    window.LEDWALL_PAGE = fit ? { ratio: '9:16', view: 'portrait' }
-                              : { ratio: '16:9', view: 'landscape' };
-    if (fit) document.documentElement.className = 'fit-portrait';
+    var portrait = /^\/wall\/portrait\/?$/.test(location.pathname);
+    window.LEDWALL_PAGE = portrait
+      ? { ratio: '9:16', view: 'portrait', forceRatio: true }
+      : { ratio: '16:9', view: 'landscape' };
   })();
 </script>
 <script src="config.js"></script>

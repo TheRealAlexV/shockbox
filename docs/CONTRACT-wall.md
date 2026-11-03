@@ -21,13 +21,20 @@ Source: `modules/wall/server.js`, `commands.mjs`, `ratio.mjs`, `module.json`, `u
   Neither is declared in `module.json`; a client asking `?channels=wall,wall-state` gets both.
 - No `order` (defaults to 100). No `settings` block in the manifest — the settings schema below is
   built in `server.js`, not by the registry.
-- **Two pages, one engine.** `/wall/render` is the 16:9 surface and `/wall/portrait` is a native
-  9:16 mount (`engine/display-portrait.html`, `LEDWALL_PAGE = {ratio:'9:16', view:'portrait'}`,
-  canvas at 100vw/100vh). The engine already handles both: `ratio` picks a 1280x720 or 720x1280
-  base (both ×scale) and the grid follows (112x63 or 63x112, same cell pitch). The 9:16 fence in
-  `settings.fence` belongs to the landscape page only — `boot.js` skips it when `RATIO === '9:16'`,
-  because that page is the window the fence describes. The old standalone
-  `pages/display-portrait.html` is gone for good: it had no route and its script paths 404'd.
+- **One page, two routes, ratio-agnostic at mount.** `/wall/render` and `/wall/portrait` both serve
+  `engine/display.html`; it has no pixel size and no aspect of its own (`html, body { width:100%;
+  height:100% }`, canvas sized by the engine), so it mounts on whatever surface OBS gives it. The
+  shape is a *setting*: `ratio` is `default` (resolve through the core-wide `ratio` key), `16:9` or
+  `9:16`. `/wall/portrait` pins 9:16 (`LEDWALL_PAGE.forceRatio`) because that source is nothing but
+  the window.
+- **The fence is derived, never stored.** For 9:16 the server computes the window from the wall's
+  own geometry — `height = canvas height`, `width = height × 9/16`, `x = (canvas − width) / 2,
+  y = 0`, snapped to whole cells — and emits it as `{cells, px, pitch, cols, rows}` on every frame.
+  `16:9` emits `fence: null`. A `fence` object in the settings document is legacy: nothing reads it.
+- **Runtime switch, no reload.** `boot.js` applies `d.ratio` from every settings frame through
+  `engine.setRatio()`: the page re-grids (112x63 ↔ 63x112) and re-lays out in place, and 9:16 on a
+  16:9 surface becomes the centred full-height column (`engine._sizeCanvas`) with the black
+  surface either side. The old `?fit=portrait` flag and `engine/display-portrait.html` are gone.
 
 ## HTTP routes (all under `/api/wall`)
 
@@ -88,8 +95,8 @@ State snapshots go out on `wall` as `emit('wall','state.snapshot', snap)` (not r
 | `preset` | string | `default` | named look preset |
 | `brightness` | number 0–2 | 1 | output brightness |
 | `speed` | number 0–4 | 1 | animation speed |
-| `ratio` | string `16:9`\|`9:16` | `16:9` | portrait mode |
-| `fence` | object `{x,y,w,h}` | `{x:880,y:0,w:1440,h:2560}` | the 9:16 window in landscape pixels |
+| `ratio` | string `default`\|`16:9`\|`9:16` | `default` | `default` resolves through the core-wide `ratio` key; `9:16` shows the derived window |
+| `fence` | object `{x,y,w,h}` \| null | `null` | legacy: the window is derived from the ratio, nothing reads this |
 | `fenceOutDim` | number 0–1 | 0.18 | dimming outside the fence |
 | `gridCols` | number 16–200 | 112 | LED columns (landscape) |
 | `gridColsPortrait` | number 16–120 | 63 | LED columns (portrait) |
@@ -125,8 +132,8 @@ ratio watcher through `ctx.core.settings` (`server.js:89`).
 
 | route | file | expects |
 |---|---|---|
-| `/wall/render` | `engine/display.html` + `engine/*.js` | the wall canvas; opens SSE `/events?channels=wall&view=<landscape\|portrait>`, posts `/api/wall/state` ≤1 per 1.5 s, reads `/api/wall/render`. `?fit=portrait` is opt-in: the page declares itself 9:16/portrait, so it lays out 63x112 in a centred 9:16 canvas full-height with black side bars, and the shared `fence` is not applied — the `/wall/portrait` composition inside a 16:9 source. Without the flag nothing changes |
-| `/wall/portrait` | `engine/display-portrait.html` + `engine/*.js` | the same canvas at 720x1280 (`LEDWALL_PAGE = {ratio:'9:16', view:'portrait'}`), for the OBS strip. Lays out 63x112 cells natively; the shared `fence` is not applied (this page *is* the 9:16 window) |
+| `/wall/render` | `engine/display.html` + `engine/*.js` | the wall canvas on a full surface; opens SSE `/events?channels=wall&view=<landscape\|portrait>`, posts `/api/wall/state` ≤1 per 1.5 s, reads `/api/wall/render`. Its shape follows the `ratio` on every settings frame: 16:9 fills the surface with 112x63 cells, 9:16 lays out 63x112 in the centred full-height column that the derived fence describes. No query flag and no fixed page size |
+| `/wall/portrait` | `engine/display.html` (same file) | the same canvas pinned to 9:16 (`LEDWALL_PAGE = {ratio:'9:16', view:'portrait', forceRatio:true}`), for the OBS strip at 720x1280. Lays out 63x112 natively and ignores the document's ratio; the derived fence is not applied (this page *is* the window) |
 
 Both pages carry `COOP: same-origin` / `COEP: require-corp` from their `pages[]` entry, and each has
 its own `<base href="/mod/wall/engine/">` so the shared classic scripts resolve.

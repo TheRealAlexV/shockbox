@@ -639,6 +639,13 @@
     this.simCur = 0;
 
     this.syncBuf = new Uint8Array(4);
+    // The page is a full surface, not a fixed bitmap: the canvas element's box follows the ratio
+    // and the surface's own aspect (`_sizeCanvas`), so an OBS source resize re-fits the wall
+    // without a reload. One listener per instance, removed with it.
+    this._onResize = this._sizeCanvas.bind(this);
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('resize', this._onResize);
+    }
     this._layout();          // canvas size, scene/bloom targets, sim targets
     this._syncDerived();     // LUT, text bitmap, pattern indices
     this._initTimerQueries();
@@ -738,6 +745,38 @@
   };
 
   /**
+   * Lay the canvas out on the page surface, from the wall's own aspect.
+   *
+   * The page is a full surface whatever its size (an OBS browser source is 1280x720 or 720x1280,
+   * and the admin pane resizes): the wall fills it when the aspects agree, and a 9:16 wall on a
+   * 16:9 surface becomes a full-height column centred in the black surface — the fence rect,
+   * drawn by the page rather than by a drag. No fixed pixel size survives here; the backing store
+   * (`W × H`) is untouched, only the CSS box is.
+   */
+  Instance.prototype._sizeCanvas = function () {
+    var el = this.canvas;
+    if (!el || !el.style) return;
+    var st = el.style;
+    st.position = 'absolute';
+    st.top = '0';
+    st.height = '100%';
+    var vw = (typeof window !== 'undefined' && window.innerWidth) || 0;
+    var vh = (typeof window !== 'undefined' && window.innerHeight) || 0;
+    if (!(vw > 0 && vh > 0)) { st.left = '0'; st.width = '100%'; st.transform = ''; return; }
+    var pageAspect = vw / vh;
+    var wallAspect = this.baseW / this.baseH;
+    if (wallAspect >= pageAspect - 0.0015) {
+      st.left = '0';
+      st.width = '100%';
+      st.transform = '';
+    } else {
+      st.left = '50%';
+      st.transform = 'translateX(-50%)';
+      st.width = (100 * wallAspect / pageAspect).toFixed(3) + '%';
+    }
+  };
+
+  /**
    * Resolve canvas size and grid, (re)allocating only what changed.
    * Called on mount and whenever settings that move the grid change.
    */
@@ -755,6 +794,8 @@
       this.canvas.height = H;
       this._allocTargets();
     }
+    // The element's box is CSS, not pixels: the backing store stays at `baseW × baseH`.
+    this._sizeCanvas();
 
     var prevKey = this.grid ? (this.grid.cols + 'x' + this.grid.rows) : '';
     this._computeGrid();
@@ -1173,6 +1214,36 @@
       this._syncDerived();
     }
     return this.getSettings();
+  };
+
+  /**
+   * Switch the wall between the whole 16:9 surface and the 9:16 window inside it, live.
+   *
+   * The ratio is a setting now, and it is the page's own geometry fact — the window is derived,
+   * never dragged. 9:16 gives the canvas the portrait base (720x1280 ×scale), so the portrait
+   * grid (63x112 by default) lays out inside the window rect with square cells, and the page
+   * centres that column on whatever surface it was given; 16:9 restores the 1280x720 base and the
+   * landscape grid (112x63) full-frame. Nothing reloads and the render loop never stops: `_layout`
+   * reallocs only what the new size needs and the next frame draws.
+   */
+  Instance.prototype.setRatio = function (ratio) {
+    var next = ratio === '9:16' ? '9:16' : '16:9';
+    var from = this.ratio;
+    if (next === from && this.grid) return { ratio: this.ratio, view: this.view, from: from, changed: false };
+    this.ratio = next;
+    this.view = next === '9:16' ? 'portrait' : 'landscape';
+    var baseW = next === '9:16' ? 720 : 1280;
+    var baseH = next === '9:16' ? 1280 : 720;
+    this.baseW = baseW * this.scale;
+    this.baseH = baseH * this.scale;
+    // A window rect belongs to a landscape surface. The page *is* the window here, so the
+    // server's derived fence (a 16:9 page's cells) is not applied twice.
+    this.fence = null;
+    this.fenceCells = null;
+    this.fenceOn = false;
+    this._layout();
+    this._syncDerived();
+    return { ratio: this.ratio, view: this.view, from: from, changed: true };
   };
 
   /**
@@ -1894,6 +1965,9 @@
   Instance.prototype.destroy = function () {
     this.destroyed = true;
     this.cancelHolds();          // a duration timer must not fire after teardown
+    if (this._onResize && typeof window !== 'undefined' && window.removeEventListener) {
+      window.removeEventListener('resize', this._onResize);
+    }
     if (this.raf) cancelAnimationFrame(this.raf);
     if (this.agent) this.agent.destroy();
     var gl = this.gl;

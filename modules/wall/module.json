@@ -22,7 +22,7 @@
     },
     {
       "route": "/wall/portrait",
-      "file": "engine/display-portrait.html",
+      "file": "engine/display.html",
       "title": "LED wall (9:16 render surface, OBS browser source at 720x1280)",
       "headers": {
         "cross-origin-opener-policy": "same-origin",
@@ -57,22 +57,20 @@
     },
     "ratio": {
       "type": "string",
-      "default": "16:9",
+      "default": "default",
       "enum": [
+        "default",
         "16:9",
         "9:16"
       ],
+      "label": "Wall ratio",
+      "note": "default follows the global core ratio; 9:16 draws the portrait window inside the full-surface 16:9 page",
       "group": "fence"
     },
     "fence": {
       "type": "object",
-      "default": {
-        "x": 880,
-        "y": 0,
-        "w": 1440,
-        "h": 2560
-      },
-      "note": "Landscape 1280x720 source at scale 2: the 9:16 window is 1440x2560 px, centred; x = (2560-1440)/2",
+      "default": null,
+      "note": "Legacy storage only: the window is derived from ratio on every frame and never read from here",
       "group": "fence"
     },
     "fenceOutDim": {
