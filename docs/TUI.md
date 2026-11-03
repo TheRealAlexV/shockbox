@@ -123,12 +123,12 @@ what the document used to say (`control.py:226-229`). With no document at all it
 
 | file | property | written by | read by |
 |---|---|---|---|
-| `supervisor.lock` | `paths.py:103-104` | held with `flock`/`LockFileEx` for the process's life (`supervisor.py:394-421`, `1040-1043`) | the next supervisor (single instance), `install.ps1:136-147` |
+| `supervisor.lock` | `paths.py:103-104` | held with `flock`/`LockFileEx` for the process's life (`supervisor.py:394-421`, `1040-1043`) | the next supervisor (single instance) |
 | `status.json` | `paths.py:107-108` | the supervisor (§3) | `Control.status()` |
 | `heartbeat` | `paths.py:111-119` | the supervisor, every write: `<counter> <iso>\n` (`supervisor.py:533`, `539`) | `Control.supervisor_responding()` / `_status_age()` (`control.py:161-173`, `196-205`) |
 | `cmd.json` | `paths.py:122-123` | `Control.send()` — temp file, fsync, `chmod 0600`, `os.replace` (`control.py:245-263`) | the supervisor's `_read_command()` (`supervisor.py:773-788`) |
-| `supervisor.pid` | `paths.py:126-127` | the supervisor once, at startup (`supervisor.py:1059`) | nothing in the repo reads it |
-| `supervisor.log` | `paths.py:130-132` | the OS: it is the supervisor's redirected stdout/stderr (`control.py:140`, `145-146`) | the operator, when the supervisor died before writing `status.json` |
+| `supervisor.pid` | `paths.py:126-127` | the supervisor once, at startup (`supervisor.py:1059`) | `install.ps1` (`Get-SupervisorState`) |
+| `supervisor.log` | `paths.py:130-132` | the supervisor: its own lifecycle lines (start, adopt/spawn, restart reason, signal, exit code) through `LogFile`, 2 MB, one rotation; stdout/stderr are appended to the same file by the launcher (`control.py:140`, `145-146`) | the operator, when the supervisor died before writing `status.json`, and for the chain of supervisors that came and went |
 
 **Why the heartbeat is a separate file.** `status.json` only changes when something changes, so
 it carries no freshness signal; the heartbeat is rewritten every cycle with a counter and a fresh
@@ -138,11 +138,14 @@ the command file disappearing, **or** the heartbeat counter advancing past the v
 the command was written — the supervisor bumps the counter on the same tick it executes a command
 (`control.py:237-239`, `265`, `278-281`; `supervisor.py:533-539`).
 
-**Arbitrary JSON in `supervisor.lock`.** `install.ps1` opens the lock file and treats every integer
-in it as a candidate supervisor pid (`deploy/install.ps1:136-147`); `uninstall.ps1` does the same
-(`deploy/uninstall.ps1:72-78`). The supervisor never writes content into the lock file
-(`supervisor.py:401`, `406`), so on this repo's code both loops match nothing. The authoritative
-pid is `supervisor_pid` in `status.json`, or `supervisor.pid`.
+**The supervisor is found by its state, never by its argv.** `install.ps1` decides "a supervisor
+is running" from a live pid — `supervisor.pid`, else `status.json`'s `supervisor_pid` — or, when
+no pid is on file, from a `heartbeat` younger than 10 s. A live pid wins over a stale heartbeat (a
+wedged supervisor still has to be stopped); a dead pid wins over a fresh heartbeat (nothing writes
+one after its writer is gone). The lock file is *not* evidence: it is 0 bytes and unreadable while
+it is held (the runtime files are read through `FileShare.ReadWrite`), and the supervisor's command
+line misses a wrapper, a relaunch, `python -m` or a renamed exe. That mismatch is how an install
+once reported "no TUI supervisor running" over a live supervisor.
 
 **Commands are discarded when old.** A `cmd.json` older than `STALE_CMD_S = 120.0 s` is unlinked
 unread (`supervisor.py:71`, `777-788`). Valid actions are `start`, `stop`, `restart`, `shutdown`

@@ -42,6 +42,7 @@ Orphans: before spawning, whoever listens on the port is inspected. If its comma
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as _dt
 import json
 import os
@@ -51,6 +52,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -421,6 +423,31 @@ def take_lock(path: Path):
     return fh
 
 
+LIFE_MAX_BYTES = 2 * 1024 * 1024  # ~2 MB per file
+LIFE_KEEP = 1  # one rotated generation: supervisor.log + supervisor.log.1
+
+def lifecycle_log(paths: Paths) -> LogFile | None:
+    """The supervisor's own history: ``runtime/supervisor.log``, 2 MB, two files.
+
+    Same file the launcher redirects our stdout/stderr into, so an OS-level crash and a
+    lifecycle line land side by side. Never raises: a supervisor that cannot log is still a
+    supervisor, and losing the log must not be the thing that takes ShockBox down.
+    """
+    try:
+        return LogFile(paths.runtime_dir, name="supervisor.log", max_bytes=LIFE_MAX_BYTES, keep=LIFE_KEEP)
+    except Exception:
+        return None
+
+def life_note(life: LogFile | None, message: str) -> None:
+    """One timestamped lifecycle line. Swallows every error, including a full disk."""
+    if life is None:
+        return
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        life.write(f"{stamp} supervisor[{os.getpid()}]: {message}")
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------------------------
 # Supervisor
 # ---------------------------------------------------------------------------------------------
@@ -460,6 +487,7 @@ class Supervisor:
         self.stop_timeout = float(stop_timeout)
 
         self.log = LogFile(paths.logs_dir)
+        self.life = lifecycle_log(paths)
         self.status: dict[str, Any] = {
             "pid": os.getpid(),
             "port": self.port,
@@ -538,20 +566,30 @@ class Supervisor:
             _atomic_write_json(self.paths.status_file, self.status)
             self.paths.heartbeat_file.write_text(f"{self._heartbeat_seq} {now_iso()}\n", encoding="ascii")
         except OSError as err:  # a full disk must not take the supervisor down
-            self.note(f"status write failed: {err}")
+            self.note(f"heartbeat failed (status.json/heartbeat not written): {err}")
         self.flush_log()  # status is current → the log lines behind it are on disk too
 
     def note(self, message: str) -> None:
-        """Supervisor line, in the same dated log as the app (prefix `launcher:`, like run.cmd)."""
+        """Supervisor line, in the same dated log as the app (prefix `launcher:`, like run.cmd).
+
+        Also mirrored to ``runtime/supervisor.log`` through :func:`life_note`, so a supervisor
+        that started, exited or was replaced leaves its own record even when the dated app log
+        was rotated away or never written.
+        """
         stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             self.log.write(f"{stamp} launcher: {message}")
         except Exception:
             pass
+        life_note(self.life, message)
 
     def flush_log(self) -> None:
-        if hasattr(self.log, "flush"):
-            self.log.flush()
+        for handle in (self.log, self.life):
+            if hasattr(handle, "flush"):
+                try:
+                    handle.flush()
+                except Exception:
+                    pass
 
     # ---- node --------------------------------------------------------------------
     def _resolve_node(self) -> str:
@@ -625,6 +663,7 @@ class Supervisor:
         self._run_started = time.monotonic()
         self._stop_intent = False
         self.status["node_pid"] = proc.pid
+        self.note(f"spawned node pid {proc.pid}")
         self.status["adopted"] = False
         self.status["last_error"] = None
         self._probed_pid = None  # probe the new pid immediately, not after the interval
@@ -657,7 +696,7 @@ class Supervisor:
         delay = self.backoff_seq[min(self._backoff_i, len(self.backoff_seq) - 1)]
         self._backoff_i += 1
         self._next_spawn_at = time.monotonic() + delay
-        self.note(f"restarting in {delay}s")
+        self.note(f"restarting in {delay}s (last exit {self.status.get('last_exit')}: {self.status.get('last_error') or 'no error recorded'})")
         self._set_state("backoff", next_restart_at=None)
 
     def _handle_exit(self, code: int | None) -> None:
@@ -868,7 +907,7 @@ class Supervisor:
     # ---- main loop ---------------------------------------------------------------
     def run(self) -> int:
         self.paths.ensure()
-        self.note(f"supervisor {os.getpid()} for {self.paths.app_dir} port {self.port}")
+        self.note(f"supervisor {os.getpid()} start for {self.paths.app_dir} port {self.port} argv={sys.argv[1:]}")
         self._install_signal_handlers()
         self._set_state("starting")
 
@@ -1037,10 +1076,20 @@ def main(argv: list[str] | None = None) -> int:
 
     paths = Paths.resolve(args.app_dir, args.runtime_dir)
     paths.ensure()
+    life = lifecycle_log(paths)
+    # Who owned this runtime before us. This is the line that names a silent replacement: a
+    # supervisor dying unnoticed now leaves "start ... previous pid N (dead)" behind it.
+    try:
+        prev = int((paths.supervisor_pid_file.read_text(encoding="ascii") or "0").strip() or 0)
+    except (OSError, ValueError):
+        prev = 0
+    prior = "none" if not prev else f"pid {prev} ({'alive' if pid_alive(prev) else 'dead'})"
     lock = take_lock(paths.lock_file)
     if lock is None:
+        life_note(life, f"start refused: supervisor.lock is held; previous={'none' if not prev else 'pid ' + str(prev)}; exiting 3")
         print(f"shockbox supervisor: another supervisor already holds {paths.lock_file} — exiting", file=sys.stderr)
         return 3
+    life_note(life, f"start port={args.port} app={paths.app_dir} previous supervisor={prior} argv={sys.argv[1:]}")
 
     sup = Supervisor(
         paths,
@@ -1059,14 +1108,25 @@ def main(argv: list[str] | None = None) -> int:
         paths.supervisor_pid_file.write_text(str(os.getpid()), encoding="ascii")
     except OSError:
         pass
+    sup.life = life  # one handle, the one that already recorded this start
+    code = -1
+
+    def _unhandled(exc_type, exc, tb):
+        life_note(life, "unhandled exception: " + "".join(traceback.format_exception(exc_type, exc, tb)).rstrip())
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _unhandled
+    atexit.register(lambda: life_note(life, f"atexit: pid {os.getpid()} interpreter shutdown, last code {code}"))
     try:
-        return sup.run()
+        code = sup.run()
+        return code
     finally:
         # A normal loop exit (shutdown, signal, startup `stop`) can still leave node alive when
         # it was adopted: stop it here, because `want_running` was already cleared by those paths.
         if sup.status.get("state") == "stopped":
             sup.cleanup()
         lock.close()
+        life_note(life, f"exit pid {os.getpid()} code {code}")
 
 
 if __name__ == "__main__":

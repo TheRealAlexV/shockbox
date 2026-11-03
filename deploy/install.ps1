@@ -80,9 +80,10 @@ if (-not (Test-Path -LiteralPath $NodeExe)) {
 # not be rewritten under a live server.
 #
 # Three things can be running the old code, and each is found by evidence:
-#   1. the TUI supervisor, by its command line or by the pid in the supervisor
-#      lock file. It is asked to shut down over its control path, not killed, so
-#      it takes its server down in order.
+#   1. the TUI supervisor, by its published state: a live `supervisor.pid` (or the
+#      `supervisor_pid` in status.json) plus a heartbeat younger than 10s. It is asked to shut
+#      down over its control path, not killed, so it takes its server down in order. Its command
+#      line is deliberately not evidence - a wrapper, a relaunch or `python -m` hides it.
 #   2. the legacy run.cmd launcher loop (cmd.exe), by command line.
 #   3. the node holding the port, only if its command line runs *our* server.mjs.
 # The supervisor may have started the server through run.cmd, so 2 and 3 run
@@ -116,36 +117,87 @@ function Get-ProcessTable {
     }
 }
 
-function Get-SupervisorPid([string]$AppDir, $Table) {
-    # Two independent pieces of evidence, because the TUI may be launched from a
-    # venv path, from `python -m shockbox_tui`, or from a wrapper nobody expected.
-    $found = @()
-    foreach ($p in $Table) {
-        if ($p.ProcessId -eq $PID) { continue }
-        if (-not $p.CommandLine) { continue }
-        $hitModule = $p.CommandLine -match 'shockbox_tui'
-        $hitLock = $p.CommandLine -match 'supervisor\.lock'
-        $hitApp = $p.CommandLine -match [regex]::Escape($AppDir)
-        # "module and this install" is the strict form; the lock holder is trusted
-        # for whichever install it names, since only that install wrote the file.
-        if (($hitModule -and $hitApp) -or $hitLock) { $found += $p.ProcessId }
+function Read-RuntimePid([string]$Path) {
+    # Tolerant read of a runtime file. This used to be `Get-Content` on supervisor.lock, which
+    # fails with "another process has locked a portion of the file" - that is why the old
+    # fallback never once produced a pid. Ask for a shareable read instead: a file the OS or an
+    # indexer holds must still yield the bytes it already contains.
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    } catch {
+        return 0
     }
+    try {
+        $reader = New-Object System.IO.StreamReader($fs)
+        $text = $reader.ReadToEnd()
+        $reader.Dispose()
+    } catch {
+        return 0
+    } finally {
+        $fs.Dispose()
+    }
+    $n = 0
+    if ([int]::TryParse(($text -replace '[^0-9]', ''), [ref]$n) -and $n -gt 0) { return $n }
+    return 0
+}
 
-    # The lock file names the owner as well; it survives a wrapper that rewrote
-    # the command line, and it is the only handle when the process is a relaunch.
-    $lock = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime\supervisor.lock'
-    if (Test-Path -LiteralPath $lock) {
-        # A try/catch is not an expression in 5.1: assign inside the branches.
-        $raw = ''
-        try { $raw = [string](Get-Content -LiteralPath $lock -Raw -ErrorAction Stop) } catch { $raw = '' }
-        foreach ($m in [regex]::Matches($raw, '\d+')) {
-            $pid2 = 0
-            if ([int]::TryParse($m.Value, [ref]$pid2) -and $pid2 -gt 0) {
-                if ($Table | Where-Object { $_.ProcessId -eq $pid2 }) { $found += $pid2 }
-            }
+function Get-SupervisorState([string]$AppDir, $Table) {
+    # Ask the live process, not its command line. Precedence, and which signal wins:
+    #   1. a pid that names a live process: supervisor.pid, then status.json's supervisor_pid
+    #      (the same value, published twice). A live pid beats a stale heartbeat - a wedged
+    #      supervisor is still a process that holds the lock and must be stopped, so calling it
+    #      "not running" would be a lie.
+    #   2. otherwise a heartbeat younger than 10s: something wrote it, so a supervisor is up
+    #      even when no pid file survived; then hunt the pid by command line, best effort.
+    #   3. otherwise not running. A dead pid beats a fresh heartbeat: nothing can write a
+    #      heartbeat after its writer is gone.
+    # A command line that does not name this app dir is *not* evidence of absence - that is the
+    # bug this replaces. A wrapper, a relaunch, `python -m`, a renamed exe and a venv path all
+    # miss it, and an install once printed "no TUI supervisor running" over a live supervisor.
+    $runtime = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime'
+    $live = @{}
+    foreach ($p in $Table) { $live[[int]$p.ProcessId] = $true }
+
+    $candidates = @()
+    $fromPid = Read-RuntimePid (Join-Path $runtime 'supervisor.pid')
+    if ($fromPid -gt 0) { $candidates += $fromPid }
+    $statusPath = Join-Path $runtime 'status.json'
+    if (Test-Path -LiteralPath $statusPath) {
+        # ConvertFrom-Json + StrictMode: a missing property is a trap, so check it exists.
+        try { $st = Get-Content -LiteralPath $statusPath -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $st = $null }
+        if ($st -and $st.PSObject.Properties['supervisor_pid']) {
+            $sp = 0
+            if ([int]::TryParse([string]$st.supervisor_pid, [ref]$sp) -and $sp -gt 0) { $candidates += $sp }
         }
     }
-    return @($found | Select-Object -Unique)
+    $age = $null
+    $hb = Join-Path $runtime 'heartbeat'
+    if (Test-Path -LiteralPath $hb) {
+        try { $age = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $hb).LastWriteTime).TotalSeconds, 1) } catch { $age = $null }
+    }
+    foreach ($c in ($candidates | Select-Object -Unique)) {
+        if ($live.ContainsKey([int]$c)) {
+            return @{ Alive = $true; Pid = [int]$c; Age = $age; Why = "supervisor.pid/status.json names live pid $c" }
+        }
+    }
+    if ($null -ne $age -and $age -le 10) {
+        # No pid on file but something is breathing. Find it: the supervisor, not the TUI that
+        # watches it (both import shockbox_tui). A Windows venv launcher runs python twice
+        # (stub -> real interpreter) and both match; the inner one holds the lock.
+        $hits = @(foreach ($p in $Table) {
+            if ($p.ProcessId -eq $PID -or -not $p.CommandLine) { continue }
+            if ($p.CommandLine -match 'shockbox_tui') { $p }
+        })
+        $strict = @($hits | Where-Object { $_.CommandLine -match 'shockbox_tui\.supervisor' })
+        if ($strict.Count -gt 0) { $hits = $strict }
+        $ids = @($hits | ForEach-Object { [int]$_.ProcessId })
+        $inner = @($hits | Where-Object { $ids -contains [int]$_.ParentProcessId })
+        $found = 0
+        if ($inner.Count -gt 0) { $found = [int]$inner[0].ProcessId }
+        elseif ($hits.Count -gt 0) { $found = [int]$hits[0].ProcessId }
+        return @{ Alive = $true; Pid = $found; Age = $age; Why = 'heartbeat is fresh, pid not published' }
+    }
+    return @{ Alive = $false; Pid = 0; Age = $age; Why = 'no live pid and the heartbeat is stale or missing' }
 }
 
 function Send-SupervisorShutdown([string]$AppDir, $Table) {
@@ -186,10 +238,21 @@ $AppDir = $Target
 if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launcher loop and the node serving the port')) {
     $table = Get-ProcessTable
 
-    # 1. the TUI supervisor: ask, then insist.
-    $sup = @(Get-SupervisorPid $AppDir $table)
+    # 1. the TUI supervisor: ask, then insist. The evidence is its published state (live pid,
+    #    fresh heartbeat), never its command line - see Get-SupervisorState.
+    $state = Get-SupervisorState $AppDir $table
+    $sup = @()
+    if ($state.Alive -and $state.Pid -gt 0) { $sup += $state.Pid }
+    if ($state.Alive) {
+        if ($sup.Count -gt 0) {
+            Note ("TUI supervisor running as pid " + ($sup -join ', ') + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
+        } else {
+            Note ("TUI supervisor running but its pid is not published (" + $state.Why + ", heartbeat $($state.Age)s old)")
+        }
+    } else {
+        Note ("no TUI supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
+    }
     if ($sup.Count -gt 0) {
-        Note ("TUI supervisor running as pid " + ($sup -join ', '))
         if (Send-SupervisorShutdown $AppDir $table) {
             Note 'asked the supervisor to shut down'
             for ($i = 0; $i -lt 20; $i++) {
@@ -207,8 +270,6 @@ if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launc
                 $stopped += "supervisor $s"
             }
         }
-    } else {
-        Note 'no TUI supervisor running'
     }
 
     # 2. the legacy launcher loop (cmd.exe) survives its parent, and its child
@@ -239,7 +300,7 @@ if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launc
     if ($stopped.Count -eq 0) { Note 'nothing was running' }
     Start-Sleep -Milliseconds 700
 } else {
-    Note 'send "shutdown" to the TUI supervisor (command line shockbox_tui, or the %LOCALAPPDATA%\ShockBox\runtime\supervisor.lock holder);'
+    Note 'send "shutdown" to the TUI supervisor (the live pid in %LOCALAPPDATA%\ShockBox\runtime\supervisor.pid with a fresh heartbeat, or the supervisor_pid in status.json);'
     Note "then stop the run.cmd launcher loop and the node serving $Port (only if its command line runs $AppDir\server.mjs)"
 }
 

@@ -123,8 +123,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install.ps1 -WhatIf
 What `install.ps1` does, in order (line ranges in `deploy/install.ps1`):
 
 1. **Stop what it is about to replace, by evidence, never by name alone** (`183-244`):
-   - the **TUI supervisor**, found by its command line (`shockbox_tui` + this app dir) or by
-     `runtime\supervisor.lock` (`119-149`); asked to shut down over a control path if one exists,
+   - the **TUI supervisor**, found by its published state: a live `supervisor.pid` (else
+     `status.json`'s `supervisor_pid`), or a `heartbeat` younger than 10 s when no pid is on file
+     (`119-206`); asked to shut down over a control path if one exists,
      then killed if it does not exit within 5 s (`151-212`);
    - the legacy **`run.cmd` loop** — `cmd.exe` whose command line runs `run.cmd` from this folder
      (`218-223`);
