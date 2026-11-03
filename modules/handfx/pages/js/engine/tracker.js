@@ -418,7 +418,7 @@ export class Tracker {
       if (this.state !== 'running' || this.source !== 'synthetic') return;
       try {
         const t = (performance.now() - this._t0) / 1000;
-        const hands = syntheticHands(t);
+        const hands = syntheticHands(t, { twoHands: this.syntheticTwoHands === true });
         countFrame(this);
         this.onFrame({ hands, width: 640, height: 480, source: 'synthetic', at: performance.now() });
       } finally {
@@ -487,7 +487,8 @@ export function handScale(lm) {
  *   18–24 one hand sliding across                     → smoke + embers
  * Unmirrored: mirroring is the renderer's job, exactly as with a camera.
  */
-export function syntheticHands(t) {
+export function syntheticHands(t, { twoHands = false } = {}) {
+  if (twoHands) return twoHandedHands(t);
   const phase = t % 24;
   if (phase < 6) {
     const k = Math.sin((phase / 6) * Math.PI);
@@ -529,6 +530,38 @@ export function syntheticHands(t) {
   const lm = makeHand({ cx: 0.15 + k * 0.7, cy: 0.72 + Math.sin(k * Math.PI * 2) * 0.04, s: 0.42, rot: 0 });
   for (const p of lm) p.z = -0.08;
   return [{ landmarks: lm, handedness: 'Left' }];
+}
+
+/**
+ * Two hands for the whole run, for the effects whose gesture needs a second hand (lightning,
+ * disco, embers, bloomlife, slime). A 12 s cycle: the arched pair, then both palms raised. The
+ * overlay asks for this while the current effect's gesture is a two-hand one, so the rig never
+ * shows one floating hand next to a gesture that cannot be made with one.
+ */
+function twoHandedHands(t) {
+  const cycle = t % 12;
+  const sway = Math.sin(t * 0.45) * 0.03;
+  if (cycle < 6) {
+    const breath = (Math.sin(t * 1.1) + 1) / 2;
+    const g = 0.11 - breath * 0.035;
+    const curl = { ring: 0.95, pinky: 0.95 };
+    const left = makeHand({ cx: 0.48 - g + sway, cy: 0.66, s: 0.24, rot: 2.9, curl });
+    const right = makeHand({ cx: 0.52 + g + sway, cy: 0.66, s: 0.24, rot: -2.9, right: true, curl });
+    const apex = Math.min(left[5].y, right[5].y) - 0.08;
+    for (const lm of [left, right]) lm[8].y = apex;
+    for (const [lm, sign] of [[left, -1], [right, 1]]) for (const p of lm) p.x += sign * g * 0.55;
+    return [
+      { landmarks: left, handedness: 'Left' },
+      { landmarks: right, handedness: 'Right' },
+    ];
+  }
+  const lift = Math.sin(((cycle - 6) / 6) * Math.PI) * 0.06;
+  const left = makeHand({ cx: 0.35 + sway, cy: 0.62 - lift, s: 0.26, rot: 0.22 });
+  const right = makeHand({ cx: 0.65 + sway, cy: 0.62 - lift, s: 0.26, rot: -0.22, right: true });
+  return [
+    { landmarks: left, handedness: 'Left' },
+    { landmarks: right, handedness: 'Right' },
+  ];
 }
 
 export { TIPS, OPEN_PALM };

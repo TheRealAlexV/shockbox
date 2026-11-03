@@ -22,12 +22,22 @@ body {
 }
 
 #fx,
+#cam,
 #stage canvas.debug {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   display: block;
+}
+
+/* The camera picture under the effects (the `underlay` setting). Off: the page stays transparent,
+   which is what an OBS browser source laid over a camera source wants. */
+#cam {
+  z-index: 0;
+}
+body[data-underlay='off'] #cam {
+  display: none;
 }
 
 /* The debug picture sits under the effects: landmarks legible, fire on top. */

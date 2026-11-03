@@ -38,6 +38,21 @@
       "help": "Off: the overlay page still tracks hands and reports gestures, but draws no effects, and the pane preview draws none either. Read by the overlay's frame loop and by the pane.",
       "group": "general"
     },
+    "trackingSource": {
+      "type": "enum",
+      "default": "auto",
+      "values": ["auto", "camera", "synthetic"],
+      "label": "Hand source: auto | camera | synthetic",
+      "help": "auto: the camera (the relayed switcher feed) when frames arrive, the synthetic rig until then and when it fails. camera: the camera only, never a synthetic frame. synthetic: the rig only, with two hands for the two-hand effects, and no camera is ever opened or requested.",
+      "group": "general"
+    },
+    "underlay": {
+      "type": "boolean",
+      "default": true,
+      "label": "Camera picture under the effects",
+      "help": "On: the overlay page draws the camera it is reading beneath the effects, so the page is the picture. Off: the effects sit on a transparent page, which is what an OBS source laid over a camera source wants. Read by the page; a preview turns it off through PATCH /api/handfx/settings.",
+      "group": "general"
+    },
     "publish": {
       "type": "enum",
       "default": "off",
@@ -182,6 +197,26 @@
     {
       "route": "/handfx",
       "title": "Hand FX overlay",
+      "file": "pages/overlay.html",
+      "headers": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Resource-Policy": "cross-origin"
+      }
+    },
+    {
+      "route": "/handfx/",
+      "title": "Hand FX overlay (trailing slash)",
+      "file": "pages/overlay.html",
+      "headers": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Resource-Policy": "cross-origin"
+      }
+    },
+    {
+      "route": "/handfx/index.html",
+      "title": "Hand FX overlay (index)",
       "file": "pages/overlay.html",
       "headers": {
         "Cross-Origin-Opener-Policy": "same-origin",

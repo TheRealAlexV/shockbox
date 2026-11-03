@@ -250,7 +250,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
 
   async function start() {
     wanted = true;
-    if (document.visibilityState === 'hidden') return false;
+    // No visibility gate: an OBS browser source reports `hidden` whenever it is not in the
+    // program, and that is exactly the page that must still open the relay — nothing here needs a
+    // click, and the server stops ffmpeg by itself when the last client leaves.
     if (ctrl) return live;
     const ac = new AbortController();
     ctrl = ac;
@@ -293,17 +295,11 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     }
   }
 
-  // A hidden document keeps no connection open: the server would only buffer frames nobody draws.
+  // A hidden document keeps its stream: an OBS browser source is hidden while its scene is not in
+  // the program, and dropping the connection there is what left the relay with 0 clients. Coming
+  // back only has to re-open what the page still wants.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-      if (ctrl) {
-        close();
-        live = false;
-        emit('idle');
-      }
-    } else if (wanted && !ctrl) {
-      void start();
-    }
+    if (wanted && !ctrl) void start();
   });
   // `pagehide` drops the connection but never forgets that the page wants frames: an OBS browser
   // source that is hidden and shown again (bfcache) reacquired on the visibilitychange above, but
@@ -311,7 +307,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
   // that is how the relay sat at 0 clients while publish still had a reader.
   window.addEventListener('pagehide', () => stop({ forget: false }));
   window.addEventListener('pageshow', () => {
-    if (wanted && !ctrl && document.visibilityState !== 'hidden') void start();
+    if (wanted && !ctrl) void start();
   });
 
   return {

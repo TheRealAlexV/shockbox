@@ -64,6 +64,11 @@ const state = {
   cameraLabel: null, // the label of the device the camera actually opened; null until one does
   // Where the frames actually come from: relay | device | synthetic | none.
   cameraSource: 'none',
+  // The persisted camera mode: auto (camera when frames arrive, synthetic otherwise), camera only,
+  // or synthetic only. Read from the settings document; no click decides it.
+  trackingSource: 'auto',
+  // The camera picture under the effects, persisted. Off leaves the page transparent for OBS.
+  underlay: true,
   // Why the relay is not the source (string or null), reported next to cameraError.
   relayError: null,
   effect: null,
@@ -152,8 +157,11 @@ function applySettings(status) {
   // `{ value }` (what server.js serves from settings.describe()). Both are the same document.
   const s = {};
   for (const [k, d] of Object.entries(status.settings || {})) s[k] = d && typeof d === 'object' && 'value' in d ? d.value : d;
+  const prevSource = state.trackingSource;
   state.settings = s;
   state.status = status;
+  state.trackingSource = s.trackingSource === 'camera' || s.trackingSource === 'synthetic' ? s.trackingSource : 'auto';
+  state.underlay = s.underlay !== false;
   fx.setSettings({
     effects: s.effects && s.effects.length ? s.effects : [],
     intensity: s.intensity || {},
@@ -178,7 +186,11 @@ function applySettings(status) {
   // The virtual camera's mode and geometry travel with the status document; nothing else tells
   // this page whether to feed it.
   publisher.fromStatus(status);
+  syncSyntheticMode();
+  applyUnderlay();
   renderState();
+  // The persisted mode changed under a running page (the pane's PATCH): switch the rig over.
+  if (prevSource !== state.trackingSource) switchTrackingSource();
 }
 
 /** The module's effect list, restricted to ids this build implements, in the served order. An id
@@ -199,7 +211,66 @@ function stepEffect(dir) {
   if (!list.length) return null;
   state.cursor = (state.cursor + dir + list.length) % list.length;
   state.effect = list[state.cursor];
+  syncSyntheticMode();
   return state.effect;
+}
+
+/**
+ * The gestures that need a second hand. The synthetic rig reads this through the current effect's
+ * registry entry, so a two-hand effect gets two hands and a one-hand effect keeps its single hand.
+ */
+const TWO_HAND_GESTURES = new Set(['bothFingertips', 'bothRaised', 'bothPalmsUp', 'palmTouch']);
+
+function syncSyntheticMode() {
+  const id = currentEffect();
+  const twoHandEffect = Boolean(id && TWO_HAND_GESTURES.has(EFFECTS[id] && EFFECTS[id].gesture));
+  // An explicit synthetic run shows a two-hand field; in auto the rig follows the current effect, so
+  // a two-hand gesture never appears next to one floating hand.
+  tracker.syntheticTwoHands = twoHandEffect || state.trackingSource === 'synthetic';
+}
+
+/** The persisted mode changed: drop what the old mode owns and start what the new one asks for. */
+function switchTrackingSource() {
+  if (state.tracking) stopTracking({ manual: false, keepView: true });
+  autoCam.attempts = 0;
+  autoCam.lastAt = 0;
+  if (state.trackingSource !== 'camera') ensureSyntheticAnchors();
+  else ack();
+  if (state.trackingSource !== 'synthetic') autoCamera().catch(() => {});
+}
+
+/* ---------------------------------------------------------------- underlay */
+
+// The camera picture under the effects. A second canvas rather than a <video>, because the relay
+// carries decoded frames and the device path a video element; both land here the same way.
+const camCanvas = $('cam');
+const camCtx = camCanvas ? camCanvas.getContext('2d') : null;
+
+function applyUnderlay() {
+  document.body.dataset.underlay = state.underlay ? 'on' : 'off';
+  if (!state.underlay && camCanvas && camCtx) camCtx.clearRect(0, 0, camCanvas.width, camCanvas.height);
+}
+
+/** One camera frame under the effects, mirrored like the effects (both live in page space). */
+function paintUnderlay(surface) {
+  if (!state.underlay || !camCtx || !surface) return;
+  const w = Math.max(1, canvas.clientWidth || 0);
+  const h = Math.max(1, canvas.clientHeight || 0);
+  if (camCanvas.width !== w || camCanvas.height !== h) {
+    camCanvas.width = w;
+    camCanvas.height = h;
+  }
+  camCtx.save();
+  if (state.settings?.mirror !== false) {
+    camCtx.translate(w, 0);
+    camCtx.scale(-1, 1);
+  }
+  try {
+    camCtx.drawImage(surface, 0, 0, w, h);
+  } catch {
+    /* a surface that is not ready yet is not an error */
+  }
+  camCtx.restore();
 }
 
 function applyBusCommand(msg) {
@@ -392,6 +463,7 @@ let camAttempted = false;
  */
 function fallBackToSynthetic() {
   if (userStopped) return false;
+  if (state.trackingSource === 'camera') return false; // camera only: a blank page beats a fake one
   if (state.tracking && !state.synthetic) return false; // another camera session owns the view
   const drew = ensureSyntheticAnchors();
   if (drew) {
@@ -413,8 +485,11 @@ const AUTO_CAM_GAP = 5000;
 const autoCam = { attempts: 0, lastAt: 0, busy: false };
 
 async function autoCamera() {
+  if (state.trackingSource === 'synthetic') return false; // the operator asked for synthetic only
   if (autoCam.busy || autoCam.attempts >= AUTO_CAM_ATTEMPTS) return false;
-  if (document.visibilityState !== 'visible') return false;
+  // No visibility gate: an OBS browser source reports `hidden` while it is not in the program, and
+  // the relay needs neither a gesture nor permission, so waiting for "visible" is exactly the
+  // click-free page that never starts. The server stops ffmpeg on its own when no client reads.
   if (state.tracking && !state.synthetic) return false; // a camera already owns the page
   const now = Date.now();
   if (autoCam.lastAt && now - autoCam.lastAt < AUTO_CAM_GAP) return false;
@@ -491,12 +566,15 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
   if (state.tracking && !state.synthetic) return;
   if (state.tracking) stopTracking({ manual: false, keepView: true });
   userStopped = false;
-  if (fromBus && !canStartFromBus()) {
+  // The persisted mode wins over the button and the bus: `synthetic` never opens a camera, and
+  // needs no gesture to do it. `camera` never draws a synthetic frame.
+  const wantSynthetic = synthetic || state.trackingSource === 'synthetic';
+  if (fromBus && !canStartFromBus() && !wantSynthetic) {
     setBanner('Camera not started: press Start once in this page (a browser only opens a camera from a real click).', 'warn');
     renderState();
     return;
   }
-  state.synthetic = synthetic;
+  state.synthetic = wantSynthetic;
   state.camera = 'asking';
   renderState();
   const status = await loadStatus().catch(() => null);
@@ -508,7 +586,9 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
     modelLocal: Boolean(status && status.model && status.model.local),
     modelUrl: status && status.model ? status.model.url : undefined,
   };
-  if (synthetic) {
+  syncSyntheticMode();
+  if (wantSynthetic) {
+    if (synthetic) tracker.syntheticTwoHands = true; // the button asks for the synthetic field
     tracker.startSynthetic();
     return;
   }
@@ -558,6 +638,7 @@ function stopTracking({ manual = true, keepView = false } = {}) {
  * and on /ack as `synthetic`, never claimed to be camera input. Returns whether it drew.
  */
 function ensureSyntheticAnchors() {
+  if (state.trackingSource === 'camera') return false; // camera only: never draw a synthetic frame
   if (state.tracking && !state.synthetic) return false; // a camera session owns the view
   // Ask the tracker, never a remembered flag: a camera attempt (and a Stop) closes the rig's frame
   // loop, and `state.synthetic` stayed true across it — the rig was then never restarted, so no
@@ -568,7 +649,13 @@ function ensureSyntheticAnchors() {
   state.cameraSource = 'synthetic';
   // Fill the view in this same tick, so a command fired now draws on the very next frame instead
   // of on the first frame of the synthetic loop.
-  onFrame({ hands: syntheticHands(performance.now() / 1000), width: 640, height: 480, source: 'synthetic', at: performance.now() });
+  onFrame({
+    hands: syntheticHands(performance.now() / 1000, { twoHands: tracker.syntheticTwoHands === true }),
+    width: 640,
+    height: 480,
+    source: 'synthetic',
+    at: performance.now(),
+  });
   return true;
 }
 
@@ -850,6 +937,8 @@ function renderState(now = performance.now()) {
   setBadge(`${label} · ${bits.join(' · ')}`, state.tracking ? (state.synthetic ? 'warn' : 'ok') : 'idle');
   document.body.dataset.tracking = state.tracking ? 'true' : 'false';
   document.body.dataset.synthetic = state.synthetic ? 'true' : 'false';
+  document.body.dataset.source = state.cameraSource;
+  document.body.dataset.underlay = state.underlay ? 'on' : 'off';
   document.body.dataset.cursor = String(state.cursor);
   for (const b of startButtons) b.dataset.state = state.tracking ? 'on' : 'off';
 }
@@ -912,6 +1001,12 @@ function loop(now) {
     if (now - bodyTickAt > 500) {
       bodyTickAt = now;
       tickBody();
+    }
+    // The camera picture under the effects: the same surface the tracker is reading (the relay's
+    // frame canvas or the device's video element), so underlay never adds a second decode. Painted
+    // even when the effects are off: the underlay is the camera, not an effect.
+    if (state.underlay && state.tracking && !state.synthetic && tracker.state === 'running') {
+      paintUnderlay(tracker.frameSurface());
     }
     if (state.settings && state.settings.enabled !== false && state.settings.obsHandFx !== false) {
       // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
@@ -996,12 +1091,13 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   // server is left stale on purpose, so the first tick starts recovering.
   if (heard) watchdog.ok();
   renderState();
-  // Never a blank page, not even for one frame: the synthetic rig draws now, and the camera
-  // attempt replaces it the moment a real track runs (onTrackerState → running, source camera).
+  // Never a blank page, not even for one frame: unless the mode is camera-only, the synthetic rig
+  // draws now and the camera attempt replaces it the moment a real track runs (onTrackerState →
+  // running, source camera). In `synthetic` the camera is never asked for at all.
   ensureSyntheticAnchors();
   requestAnimationFrame(loop);
   // The load attempt, without a gesture: an OBS browser source is never clicked, so a camera only
-  // opens here if this page asks for it itself. One retry waits for the page to be shown again.
+  // opens here if this page asks for it itself (`auto` and `camera`; `synthetic` skips it).
   autoCamera().catch(() => {});
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
