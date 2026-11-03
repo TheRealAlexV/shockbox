@@ -202,6 +202,10 @@ function build(ctx) {
   // device it did open, which pipe is carrying frames (relay | device | synthetic | none) and why
   // the relay is not it. Reported on /ack, read back on /status; never a frame.
   const camera = { error: null, label: null, source: null, relayError: null };
+  // The page's per-frame publish cost, reported on /ack and read back on /status: numbers, never
+  // frames. It is what says whether `publish.frames` is short of `cameraFeed.frames` because the
+  // page is slow to read back, to convert, or to upload.
+  const publishTiming = { at: 0, composeMs: 0, readMs: 0, convertMs: 0, sendMs: 0, totalMs: 0 };
   // The ShockBox Virtual Camera pipe (publish-pipe.mjs). `off` opens nothing at all: no listener,
   // no buffer, no conversion. The pane's select is the only writer; the page sends the pictures.
   const pipe = createPublisher({ log });
@@ -262,7 +266,7 @@ function build(ctx) {
       relayError: camera.relayError,
       // The virtual camera's truth: off | waiting (no consumer, or connected and silent) | live
       // (a consumer is reading frames), plus the counters and the geometry both sides agreed on.
-      publish: pipe.status(),
+      publish: { ...pipe.status(), timing: publishTiming.at ? publishTiming : null },
       cameraFeed: relay.status(),
       runtime: {
         vendored: fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')),
@@ -450,6 +454,18 @@ function build(ctx) {
           // browser source freezes it; this stamp keeps "ticking but not painting" readable from
           // /status instead of looking like a dead page next to live camera frames.
           draw.lastAckAt = Date.now();
+          // Per-frame publish cost, as the page measured it: readback, conversion, upload and the
+          // round trip. Clamped numbers only, so /status cannot carry a page's stray strings.
+          if (bodyIn.publishTiming && typeof bodyIn.publishTiming === 'object') {
+            const t = bodyIn.publishTiming;
+            const ms = (v) => (Number.isFinite(v) && v >= 0 && v < 60000 ? Math.round(v * 100) / 100 : 0);
+            publishTiming.composeMs = ms(t.composeMs);
+            publishTiming.readMs = ms(t.readMs);
+            publishTiming.convertMs = ms(t.convertMs);
+            publishTiming.sendMs = ms(t.sendMs);
+            publishTiming.totalMs = ms(t.totalMs);
+            publishTiming.at = Date.now();
+          }
           // The camera's failure reason and the device that opened. The object is the page's; the
           // shape and the stage vocabulary are this server's, so a client cannot inject anything
           // but the fields /status promises.
@@ -501,8 +517,23 @@ function build(ctx) {
         rawLimit: 32 * 1024 * 1024,
         handler: (req, res, url, body) => {
           const kind = url.searchParams.get('kind');
+          const format = url.searchParams.get('format') === 'nv12' ? 'nv12' : 'rgba';
           pipe.setMode(settings.get('publish'));
-          const out = pipe.publish(body, kind === 'raw' || kind === 'effects' ? kind : null);
+          const g = pipe.status().geometry;
+          // Geometry travels in the query string so a page converting to NV12 is provably
+          // converting the picture the pipe wants; size alone cannot tell portrait from landscape.
+          const w = Number(url.searchParams.get('w'));
+          const h = Number(url.searchParams.get('h'));
+          if (g && Number.isFinite(w) && Number.isFinite(h) && (w !== g.width || h !== g.height)) {
+            return send(res, 409, {
+              ok: false,
+              error: 'frame size does not match the camera',
+              expected: { width: g.width, height: g.height },
+              got: { width: w, height: h },
+              geometry: g,
+            });
+          }
+          const out = pipe.publish(body, kind === 'raw' || kind === 'effects' ? kind : null, format);
           if (out.ok) {
             return send(res, 200, { ok: true, stage: out.stage, sent: out.sent || 0, converted: out.converted === true });
           }

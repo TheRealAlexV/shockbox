@@ -26,6 +26,11 @@
 
 import fs from 'node:fs';
 import net from 'node:net';
+// The same converter the page runs before it uploads: one implementation, so the pipe receives
+// identical bytes whether the page sent RGBA or NV12.
+import { nv12Into } from './pages/js/nv12.js';
+
+export { nv12Into };
 
 export const PIPE_NAME = '\\\\.\\pipe\\WebcamSwitcher.Frames.v1.shockbox';
 export const FORMAT_INI = 'C:\\ProgramData\\WebcamSwitcher\\format.ini';
@@ -70,44 +75,6 @@ export function readGeometry(iniPath = process.env.SHOCKBOX_VPIPE_INI || FORMAT_
   fmt.height &= ~1;
   if (fmt.width < 16 || fmt.height < 16) return { width: 1920, height: 1080, fpsNum: 30, fpsDen: 1 };
   return fmt;
-}
-
-/**
- * RGBA → NV12 into `out` (which must hold width*height*3/2 bytes at pixel offset 0).
- * BT.601 studio swing (the source advertises MFNominalRange_16_235): Y 16..235, U/V 16..240.
- * Integer only and no clamping: the formulas are bounded by 16..235 / 16..240 for 8-bit input.
- */
-export function nv12Into(rgba, width, height, out) {
-  const w = width;
-  const h = height;
-  const ySize = w * h;
-  let y = 0;
-  let s = 0;
-  for (let row = 0; row < h; row++) {
-    const rowEnd = s + w * 4;
-    while (s < rowEnd) {
-      // Y = ((66R + 129G + 25B + 128) >> 8) + 16
-      out[y++] = ((66 * rgba[s] + 129 * rgba[s + 1] + 25 * rgba[s + 2] + 128) >> 8) + 16;
-      s += 4;
-    }
-  }
-  // One chroma sample per 2x2 block, interleaved U then V.
-  let uv = ySize;
-  for (let row = 0; row < h; row += 2) {
-    const rowA = row * w * 4;
-    const rowB = rowA + w * 4;
-    for (let col = 0; col < w; col += 2) {
-      const a = rowA + col * 4;
-      const b = rowB + col * 4;
-      const r = rgba[a] + rgba[a + 4] + rgba[b] + rgba[b + 4];
-      const g = rgba[a + 1] + rgba[a + 5] + rgba[b + 1] + rgba[b + 5];
-      const bl = rgba[a + 2] + rgba[a + 6] + rgba[b + 2] + rgba[b + 6];
-      // U = ((-38R - 74G + 112B) >> 8) + 128, V = ((112R - 94G - 18B) >> 8) + 128,
-      // on the 4-pixel sum, hence the extra >> 2.
-      out[uv++] = ((-38 * r - 74 * g + 112 * bl) >> 10) + 128;
-      out[uv++] = ((112 * r - 94 * g - 18 * bl) >> 10) + 128;
-    }
-  }
 }
 
 function configMsg(geom) {
@@ -243,17 +210,22 @@ export function createPublisher({ log = console, pipeName = process.env.SHOCKBOX
   }
 
   /**
-   * Hand one picture to the pipe. `rgba` is width*height*4 bytes at the geometry the status
-   * reports; `kind` must match the mode. Returns what happened, for the route's answer.
-   * Nothing is converted while no consumer is connected: an absent camera costs zero CPU.
+   * Hand one picture to the pipe. `bytes` is width*height*4 RGBA by default, or width*height*3/2
+   * NV12 when `format` is `'nv12'`: the page converts, so a 1280x720 frame crosses the socket as
+   * 1.38 MB instead of 3.7 MB and the server copies instead of converting. `kind` must match the
+   * mode. Returns what happened, for the route's answer. Nothing is converted while no consumer is
+   * connected: an absent camera costs zero CPU.
    */
-  function publish(rgba, kind) {
+  function publish(bytes, kind, format = 'rgba') {
     if (mode === 'off') return { ok: false, reason: 'off' };
     if (kind !== mode) return { ok: false, reason: 'mode', mode };
     if (!geom) return { ok: false, reason: 'not-open' };
     if (!clients.size) return { ok: true, stage: 'waiting', converted: false };
-    const want = geom.width * geom.height * 4;
-    if (!rgba || rgba.length !== want) return { ok: false, reason: 'size', expected: want, got: rgba ? rgba.length : 0 };
+    const ySize = geom.width * geom.height;
+    const nv12Bytes = (ySize * 3) >> 1;
+    const isNv12 = format === 'nv12';
+    const want = isNv12 ? nv12Bytes : ySize * 4;
+    if (!bytes || bytes.length !== want) return { ok: false, reason: 'size', expected: want, got: bytes ? bytes.length : 0 };
 
     const slot = pool.find((b) => b.pending === 0);
     if (!slot) {
@@ -261,20 +233,21 @@ export function createPublisher({ log = console, pipeName = process.env.SHOCKBOX
       stat.dropped++;
       return { ok: true, stage: stage(), converted: false, reason: 'busy' };
     }
-    const ySize = geom.width * geom.height;
-    nv12Into(rgba, geom.width, geom.height, slot.subarray(HDR + INFO, HDR + INFO + ((ySize * 3) >> 1)));
+    const payload = slot.subarray(HDR + INFO, HDR + INFO + nv12Bytes);
+    if (isNv12) payload.set(bytes);
+    else nv12Into(bytes, geom.width, geom.height, payload);
     // Header + info describe this message; the payload follows at HDR + INFO.
     slot.writeUInt32LE(MAGIC, 0);
     slot.writeUInt16LE(VERSION, 4);
     slot.writeUInt16LE(TYPE_FRAME, 6);
-    slot.writeUInt32LE(INFO + ((ySize * 3) >> 1), 8);
+    slot.writeUInt32LE(INFO + nv12Bytes, 8);
     slot.writeBigUInt64LE(BigInt(sequence++), HDR);
     slot.writeBigUInt64LE(process.hrtime.bigint() / 100n, HDR + 8); // 100-ns units, like QPC
     slot.writeUInt32LE(geom.width, HDR + 16);
     slot.writeUInt32LE(geom.height, HDR + 20);
     slot.writeUInt32LE(geom.width, HDR + 24);
     slot.writeUInt32LE(FORMAT_NV12, HDR + 28);
-    slot.writeUInt32LE((ySize * 3) >> 1, HDR + 32);
+    slot.writeUInt32LE(nv12Bytes, HDR + 32);
     slot.writeUInt32LE(FLAG_NONE, HDR + 36);
 
     let wrote = 0;
@@ -305,7 +278,7 @@ export function createPublisher({ log = console, pipeName = process.env.SHOCKBOX
     }
     stat.frames += wrote;
     stat.lastFrameAt = Date.now();
-    return { ok: true, stage: stage(), converted: true, sent: wrote };
+    return { ok: true, stage: stage(), converted: !isNv12, sent: wrote };
   }
 
   function setMode(next) {

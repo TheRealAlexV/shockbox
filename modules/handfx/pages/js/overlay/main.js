@@ -20,6 +20,7 @@
 import { Tracker, syntheticHands } from '../engine/tracker.js';
 import { createPublisher } from './publish.js';
 import { createRelay } from './relay.js';
+import { createWatchdog } from './watchdog.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
 import { FxRenderer, EFFECTS, anchorsFrom } from '../engine/fx.js';
 
@@ -265,6 +266,7 @@ function scheduleRefresh() {
 
 function connectBus() {
   const es = new EventSource('/events');
+  bus = es;
   let retry = 250;
   es.addEventListener('handfx', (ev) => {
     retry = 250;
@@ -288,6 +290,71 @@ function connectBus() {
   };
   return es;
 }
+
+/** The page's EventSource, kept so recovery can drop the dead one and make a fresh connection. */
+let bus = null;
+/** A recovery is in flight: one at a time, and no re-entry from a second stale tick. */
+let recovering = false;
+
+/**
+ * Re-arm the whole overlay path after the server comes back: a new bus connection, the current
+ * settings (which carry the publish mode and the pipe geometry), a fresh relay reader and a fresh
+ * tracker. The relay reader is torn down first: after a server restart it holds a stream that will
+ * never deliver again, and `relay.start()` is a no-op while one is live.
+ */
+async function recoverOverlay(status) {
+  if (recovering) return;
+  recovering = true;
+  try {
+    try {
+      bus?.close();
+    } catch {
+      /* already closed */
+    }
+    bus = null;
+    connectBus();
+    applySettings(status && status.settings ? status : await loadStatus());
+    // A server restart is the server's failure, not this page's second camera failure: the check
+    // that a machine has no camera at all must run again from zero.
+    autoCam.attempts = 0;
+    autoCam.lastAt = 0;
+    if (!userStopped && document.visibilityState === 'visible' && (camAttempted || state.tracking)) {
+      relay.stop();
+      tracker.stop();
+      await startTracking({});
+    }
+    publisher.kick();
+    // A forced status line: `ack` is rate limited to 2/s and the recovery may have been silent.
+    state.lastAck = 0;
+    ack();
+  } finally {
+    recovering = false;
+  }
+}
+
+/**
+ * The connection watchdog. `ok()` is called by every successful /ack; when 5 s pass without one,
+ * `probe` reads /status with capped exponential backoff (0.5 s doubling to 10 s), and the first
+ * answer re-arms the page. Forty probes per page life: a server that never returns costs 40
+ * requests, not a storm.
+ */
+const watchdog = createWatchdog({
+  now: () => performance.now(),
+  probe: loadStatus,
+  recover: recoverOverlay,
+  onState: (s) => {
+    if (s.state === 'gave-up') setBanner('server is not back — reload this browser source when it is', 'bad');
+    else if (s.state === 'stale') setBadge('bus offline — reconnecting', 'warn');
+  },
+});
+
+/** The 1 s liveness beat. A hidden source has nothing to recover (its render loop is paused, so
+ *  its acks stop too) and a tab coming back fires `visibilitychange`, which re-runs autoCamera. */
+let booted = false;
+setInterval(() => {
+  if (!booted || document.visibilityState === 'hidden') return;
+  void watchdog.tick();
+}, 1000);
 
 /* ---------------------------------------------------------------- camera + tracking */
 
@@ -745,8 +812,16 @@ function ack(now = performance.now()) {
       draws: state.draws,
       anchors: state.anchors,
       lastDrawAt: state.lastDrawAt,
+      // Where a slow publish frame goes: compose, readback, NV12 conversion, upload. Numbers only.
+      publishTiming: publisher.timing(),
     }),
-  }).catch(() => {});
+  })
+    .then((res) => {
+      // A failed ack is not page state, but a successful one is the liveness proof the watchdog
+      // waits for: no ack for 5 s means this page's own connection is gone.
+      if (res.ok) watchdog.ok();
+    })
+    .catch(() => {});
 }
 
 let statePaint = 0;
@@ -899,14 +974,20 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   }
   const ok = fx.init();
   if (!ok) setBanner(fx.error, 'bad');
+  let heard = false;
   try {
     const status = await loadStatus();
     applySettings(status);
+    heard = true;
     if (!status.runtime || !status.runtime.vendored) setBanner('MediaPipe runtime is not vendored — run the vendor copy step (modules/handfx/vendor/README.md).', 'bad');
   } catch (err) {
     setBanner(`Cannot read /api/handfx/status: ${err.message}`, 'bad');
   }
   connectBus();
+  // The page has just heard from the server: the watchdog starts healthy rather than counting a
+  // stale 0 as a failed connection in its first second. A page whose boot could not reach the
+  // server is left stale on purpose, so the first tick starts recovering.
+  if (heard) watchdog.ok();
   renderState();
   // Never a blank page, not even for one frame: the synthetic rig draws now, and the camera
   // attempt replaces it the moment a real track runs (onTrackerState → running, source camera).
@@ -916,8 +997,12 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   // opens here if this page asks for it itself. One retry waits for the page to be shown again.
   autoCamera().catch(() => {});
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') autoCamera().catch(() => {});
+    if (document.visibilityState === 'visible') {
+      autoCamera().catch(() => {});
+      void watchdog.tick();
+    }
   });
+  booted = true;
   // Test hook: the browser test drives the page through this, not through the DOM.
   window.__handfx = {
     state,

@@ -3,12 +3,16 @@
 //
 // Who owns what: the server owns the pipe and the geometry (it reads the same format.ini the
 // virtual-camera source advertises, and reports it on /status as `publish.geometry`); this file
-// only turns the page's picture into the size the server asks for and POSTs the RGBA bytes. The
-// server converts to NV12 — doing it here would cost the page more than the transfer saves.
+// turns the page's picture into the size the server asks for, converts it to NV12 and POSTs the
+// bytes. Conversion lives here because the upload is the expensive half of the round trip: RGBA at
+// 1280x720 is 3.7 MB per frame and NV12 is 1.38 MB, so converting first is ~30 ms saved against
+// ~3 ms spent, and the server only copies into the pipe.
 //
 // Off by default and free when off: no canvas, no timer, no fetch until the mode is not `off`.
 // The picture never leaves the machine, is never stored, and is dropped by the server when no
 // consumer is reading the pipe.
+
+import { nv12Into, nv12Size } from '../nv12.js';
 
 /**
  * @param {object} opts
@@ -22,11 +26,33 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
   let geom = null; // { width, height, fps } — the server's, not ours
   let surface = null; // offscreen 2D canvas, one per geometry
   let ctx = null;
+  let nv12 = null; // one reusable NV12 frame buffer per geometry: no per-frame allocation
   let inflight = false;
   let last = 0;
   let timer = null; // the publish clock; see arm()
   let timerFps = 0;
   const sent = { ok: 0, failed: 0, skipped: 0 };
+  // Per-frame cost of the last 30 frames: [compose, readback, convert, round trip, total]. Read by
+  // /ack and shown on /status as publish.timing — the only way to say where a slow frame goes.
+  const frameTimes = [];
+  function sample(composeAt, readAt, convertAt, sendAt, doneAt) {
+    frameTimes.push([readAt - composeAt, convertAt - readAt, sendAt - convertAt, doneAt - sendAt, doneAt - composeAt]);
+    if (frameTimes.length > 30) frameTimes.shift();
+  }
+  function timing() {
+    if (!frameTimes.length) return null;
+    const sum = [0, 0, 0, 0, 0];
+    for (const f of frameTimes) for (let i = 0; i < 5; i++) sum[i] += f[i];
+    const avg = (i) => +(sum[i] / frameTimes.length).toFixed(2);
+    return {
+      samples: frameTimes.length,
+      composeMs: avg(0),
+      readMs: avg(1),
+      convertMs: avg(2),
+      sendMs: avg(3),
+      totalMs: avg(4),
+    };
+  }
 
   /**
    * The publish clock. `setInterval`, not `requestAnimationFrame`: rAF only runs while the browser
@@ -61,11 +87,13 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
       geom = null;
       surface = null;
       ctx = null;
+      nv12 = null;
       arm();
       return;
     }
     if (!geom || geom.width !== g.width || geom.height !== g.height || geom.fps !== g.fps) {
       geom = { width: g.width, height: g.height, fps: g.fps || 30 };
+      nv12 = new Uint8Array(nv12Size(geom.width, geom.height));
       surface = document.createElement('canvas');
       surface.width = geom.width;
       surface.height = geom.height;
@@ -119,11 +147,13 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
     if (mode === 'off' || !ctx || inflight) return;
     const period = 1000 / (geom.fps || 30);
     if (now - last < period - 2) return;
+    last = now;
+    const t0 = performance.now();
     if (!compose()) {
       sent.skipped++;
       return;
     }
-    last = now;
+    const t1 = performance.now();
     let data;
     try {
       data = ctx.getImageData(0, 0, geom.width, geom.height).data;
@@ -131,15 +161,20 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
       log('publish: readback failed', err && err.message);
       return;
     }
+    const t2 = performance.now();
+    // Convert in the page, into the buffer allocated once per geometry: the upload is the
+    // expensive half of the round trip, and NV12 is 1.38 MB where RGBA is 3.7 MB.
+    nv12Into(data, geom.width, geom.height, nv12);
+    const t3 = performance.now();
     inflight = true;
-    fetch(`/api/handfx/frame?kind=${mode}`, {
+    fetch(`/api/handfx/frame?kind=${mode}&format=nv12&w=${geom.width}&h=${geom.height}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/octet-stream' },
-      body: data,
+      headers: { 'content-type': 'application/x-nv12' },
+      body: nv12,
       cache: 'no-store',
-      // The page is being torn down or the camera changed: a failed POST is not page state.
     })
       .then((res) => {
+        sample(t0, t1, t2, t3, performance.now());
         if (res.ok) sent.ok++;
         else sent.failed++;
       })
@@ -148,6 +183,10 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
       })
       .finally(() => {
         inflight = false;
+        // The slot is free: if the picture took longer than one period, send the newest one now
+        // rather than idling until the next clock tick. One request stays in flight either way;
+        // the timer is still the pace when frames are cheaper than the period.
+        if (mode !== 'off') tick(performance.now());
       });
   }
 
@@ -160,5 +199,11 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
     tick(performance.now());
   }
 
-  return { fromStatus, tick, kick, stats: () => ({ ...sent, mode, clock: timer ? 'timer' : 'off' }) };
+  return {
+    fromStatus,
+    tick,
+    kick,
+    timing,
+    stats: () => ({ ...sent, mode, clock: timer ? 'timer' : 'off' }),
+  };
 }
