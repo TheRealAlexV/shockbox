@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createPublisher } from './publish-pipe.mjs';
+import { BOUNDARY, createCameraRelay } from './camera-relay.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -197,12 +198,29 @@ function build(ctx) {
   // The overlay's draw truth, reported on /ack: how many frames it rendered, where the anchors came
   // from, and when the last frame landed. Counters and a name, never a frame.
   const draw = { draws: 0, anchors: 'none', lastDrawAt: 0 };
-  // Why the overlay's camera did not open (the page's own diagnostic object) and the label of the
-  // device it did open. Reported on /ack, read back on /status; never a frame.
-  const camera = { error: null, label: null };
+  // Why the overlay's camera did not open (the page's own diagnostic object), the label of the
+  // device it did open, which pipe is carrying frames (relay | device | synthetic | none) and why
+  // the relay is not it. Reported on /ack, read back on /status; never a frame.
+  const camera = { error: null, label: null, source: null, relayError: null };
   // The ShockBox Virtual Camera pipe (publish-pipe.mjs). `off` opens nothing at all: no listener,
   // no buffer, no conversion. The pane's select is the only writer; the page sends the pictures.
   const pipe = createPublisher({ log });
+  // The camera feed the overlay page cannot open itself: ffmpeg reads the device WebcamSwitcher
+  // holds and this relays JPEG frames over multipart. Nothing spawns until a client asks for the
+  // stream, and `cameraRelay: off` never spawns at all.
+  const relay = createCameraRelay({
+    log,
+    read: () => ({
+      enabled: settings.get('cameraRelay') !== 'off',
+      source: settings.get('cameraRelaySource'),
+      fps: settings.get('cameraRelayFps'),
+      size: settings.get('cameraRelaySize'),
+      ffmpegPath: settings.get('ffmpegPath'),
+    }),
+  });
+  const unsubRelay = settings.subscribe((changed) => {
+    if (changed.some((k) => k.startsWith('cameraRelay') || k === 'ffmpegPath')) relay.sync();
+  });
 
   function publish(cmd, args) {
     // The replay stamp lives on its own key: `args.id` belongs to the caller (it is the effect id
@@ -218,6 +236,9 @@ function build(ctx) {
     // belong to an instance nobody serves from. Sync here instead: the pane and the overlay both
     // read this document, so the setting takes effect at the first read, and `off` costs a compare.
     pipe.setMode(settings.get('publish'));
+    // Same reasoning for the relay: off costs a compare, on applies any changed device/size, and
+    // a client still connected is restarted onto the new settings.
+    relay.sync();
     const s = settings.all();
     const model = findModel();
     return {
@@ -234,9 +255,12 @@ function build(ctx) {
       // The overlay's camera answer: why it did not open (object or null) and what it did open.
       cameraError: camera.error,
       cameraLabel: camera.label,
+      cameraSource: camera.source,
+      relayError: camera.relayError,
       // The virtual camera's truth: off | waiting (no consumer, or connected and silent) | live
       // (a consumer is reading frames), plus the counters and the geometry both sides agreed on.
       publish: pipe.status(),
+      cameraFeed: relay.status(),
       runtime: {
         vendored: fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')),
         simdWasm: fs.existsSync(path.join(VENDOR, 'vision', 'simd-wasm', 'vision_wasm_internal.wasm')),
@@ -268,6 +292,39 @@ function build(ctx) {
         path: '/effects',
         method: 'GET',
         handler: (req, res) => send(res, 200, EFFECTS.map((e) => e.id)),
+      },
+      // The camera relay, for a page that cannot open a camera itself: one response that never
+      // ends, parts delimited by `--framebound`, each an image/jpeg with its own Content-Length.
+      // The handler keeps the socket until the client leaves; core must not answer for it.
+      {
+        path: '/camera/stream',
+        method: 'GET',
+        handler: (req, res) => {
+          relay.sync();
+          if (!relay.enabled()) return send(res, 503, { ok: false, error: 'camera relay is off' });
+          res.writeHead(200, {
+            'content-type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`,
+            'cache-control': 'no-store',
+          });
+          relay.addClient(res);
+          return new Promise((resolve) => res.on('close', resolve));
+        },
+      },
+      // The newest single frame, for a page that only wants a picture (and for curl).
+      {
+        path: '/camera/latest.jpg',
+        method: 'GET',
+        handler: (req, res) => {
+          relay.sync();
+          const frame = relay.latest();
+          if (!frame) return send(res, 503, { ok: false, error: 'no camera frame yet' });
+          res.writeHead(200, {
+            'content-type': 'image/jpeg',
+            'cache-control': 'no-store',
+            'content-length': frame.length,
+          });
+          res.end(frame);
+        },
       },
       {
         path: '/settings',
@@ -404,6 +461,11 @@ function build(ctx) {
           }
           if (bodyIn.cameraLabel === null) camera.label = null;
           else if (typeof bodyIn.cameraLabel === 'string' && bodyIn.cameraLabel) camera.label = bodyIn.cameraLabel.slice(0, 120);
+          // Which pipe carries the frames, and why the relay is not it. A fixed vocabulary, so a
+          // client reading /status cannot be handed a word it does not know.
+          if (['relay', 'device', 'synthetic', 'none'].includes(bodyIn.cameraSource)) camera.source = bodyIn.cameraSource;
+          if (bodyIn.relayError === null) camera.relayError = null;
+          else if (typeof bodyIn.relayError === 'string' && bodyIn.relayError) camera.relayError = bodyIn.relayError.slice(0, 240);
           events.emit('handfx', 'page', {
             effect: typeof bodyIn.effect === 'string' ? bodyIn.effect : null,
             tracking: bodyIn.tracking === true,
@@ -507,6 +569,8 @@ function build(ctx) {
     },
 
     dispose() {
+      unsubRelay();
+      relay.dispose();
       pipe.dispose();
       settings.flush();
     },

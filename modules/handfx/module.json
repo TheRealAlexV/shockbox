@@ -46,6 +46,48 @@
       "help": "Feeds the 'ShockBox Virtual Camera' slot in WebcamSwitcher. raw sends the camera picture, effects sends the camera with the effects burned in; both are written to the frame pipe at the size format.ini advertises (1280x720 NV12 by default) and only while the overlay page is open. off opens no pipe and converts nothing, which leaves that camera slot black.",
       "group": "general"
     },
+    "cameraRelay": {
+      "type": "enum",
+      "default": "on",
+      "values": ["off", "on"],
+      "label": "Relay the switcher camera to the page: off | on",
+      "help": "On: the server runs ffmpeg against the camera below and streams JPEG frames to the overlay page, which cannot open a virtual device itself. It starts on the first page that connects and stops five seconds after the last one leaves. Off: ffmpeg is never started.",
+      "group": "general"
+    },
+    "cameraRelaySource": {
+      "type": "string",
+      "default": "WebcamSwitcher Virtual Camera",
+      "maxLength": 200,
+      "label": "Camera relay source (ffmpeg dshow device name)",
+      "help": "The DirectShow device name ffmpeg opens. WebcamSwitcher's virtual camera works while the app holds the physical camera; a real camera name works only when nothing else has it open.",
+      "group": "general"
+    },
+    "cameraRelayFps": {
+      "type": "number",
+      "default": 30,
+      "min": 1,
+      "max": 60,
+      "integer": true,
+      "label": "Camera relay frame rate",
+      "help": "Frames ffmpeg produces per second. The page draws the newest frame it has; it never queues.",
+      "group": "general"
+    },
+    "cameraRelaySize": {
+      "type": "enum",
+      "default": "960x540",
+      "values": ["640x360", "960x540", "1280x720"],
+      "label": "Camera relay size",
+      "help": "The size ffmpeg scales to before encoding MJPEG. Smaller is cheaper to decode in the page.",
+      "group": "general"
+    },
+    "ffmpegPath": {
+      "type": "string",
+      "default": "ffmpeg",
+      "maxLength": 260,
+      "label": "ffmpeg executable (name on PATH, or a full path)",
+      "help": "Only used by the camera relay. A bare name is looked up on PATH; if it is not found the relay reports that on /api/handfx/status instead of failing the module.",
+      "group": "general"
+    },
     "sensitivity": {
       "type": "number",
       "default": 1,
