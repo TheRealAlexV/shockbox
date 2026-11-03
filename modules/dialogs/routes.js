@@ -46,7 +46,7 @@ export default {
 
   init(ctx) {
     this.ctx = ctx;
-    this.state = createDialogState({ settings: ctx.settings, log: ctx.log });
+    this.state = createDialogState({ settings: ctx.settings, core: ctx.core, log: ctx.log });
     this.settings = ctx.settings;
     this.pool = ctx.pool;
     this.events = ctx.events;
@@ -94,6 +94,16 @@ export default {
     return normalizeConfig(this.settings.get('randomConfig'));
   },
 
+  /**
+   * The settings document plus the one derived value a page needs: `ratio` is declared as
+   * `default`, but the stage must know whether that resolved to 16:9 or 9:16 right now.
+   */
+  settingsPayload() {
+    const out = this.settings.describe();
+    if (out.ratio) out.ratio.effective = this.state.effectiveRatio();
+    return out;
+  },
+
   pickEligible() {
     const list = matchingMessages(this.pool.eligible('dialog'), this.randomConfig());
     if (!list.length) return null;
@@ -129,7 +139,7 @@ export default {
         method: 'GET',
         path: '/live',
         handler() {
-          return { ok: true, ...mod.state.snapshot('read'), settings: S().describe() };
+          return { ok: true, ...mod.state.snapshot('read'), settings: mod.settingsPayload() };
         },
       },
       {
@@ -207,8 +217,8 @@ export default {
         method: 'PATCH',
         path: '/live',
         handler(req, res, url, body) {
-          // Where the alert sits on the phone strip. The show preview drags it, and the position
-          // is this state — no second store, and the OBS overlay draws the same numbers.
+          // The preview pane's record of where the operator dropped the card. The overlay
+          // ignores x/y and centres in the stage, so a ratio change can never strand it.
           const id = (body && body.id) || url.searchParams.get('id');
           if (!id) throw new HttpError(400, 'move: id required');
           const moved = mod.state.move(id, body && body.x, body && body.y);
@@ -229,7 +239,7 @@ export default {
             mod.push('control');
             mod.events.emit('dialogs', 'relayout', mod.state.snapshot('settings'));
           }
-          return { ok: true, changed, settings: S().describe() };
+          return { ok: true, changed, settings: mod.settingsPayload(), ratio: mod.state.effectiveRatio() };
         },
       },
     ];

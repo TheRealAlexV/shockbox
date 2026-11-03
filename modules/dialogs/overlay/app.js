@@ -1,17 +1,19 @@
-// Alert overlay — fake OS dialogs on the 405×720 phone strip (`V: Main Live`).
+// Alert overlay — fake OS dialogs on the full 16:9 surface, with an optional 9:16 stage.
 //
-// Four skins, ported from error-popups: win95 (boxed, bevelled), win11 (flat, 8 px radius,
-// accent primary button), macos (no title bar, centred heading, hairline-separated buttons) and
-// ios (no title bar, no icon, one centred glass card with stacked full-width actions).
-// Placement is server-side; the page reports its measured box back so the server can centre
-// against the real height instead of a guess.
+// Four skins, ported from error-popups: win95 (boxed, bevelled), win11 (square, Segoe UI,
+// accent primary button), macos (real icon + title, hairline-separated inline buttons) and ios
+// (no icon, no titlebar, one centred card with stacked full-width actions).
+// The page fills whatever OBS gives it. A ratio of 9:16 centres a portrait stage of width
+// height × 9/16 inside that frame; 16:9 is the whole frame. Dialogs are centred by the stage,
+// never by an invented server offset.
 
 import { createPlayer, DEFAULT_DIALOG_TONE } from '/mod/notifications/sound.mjs';
 
-const root = document.getElementById('desk');
+const root = document.getElementById('stage');
 const els = new Map(); // id -> element
 const sizeSent = new Map(); // id -> "w:h"
 let theme = 'win11';
+let ratio = '16:9';
 
 // The tone. One player per page, from the notifications module's authored asset: both popup
 // modules present the same behaviour, and neither page has to know the other one exists.
@@ -114,18 +116,23 @@ function build(entity) {
 
   const body = document.createElement('div');
   body.className = 'body';
+  const copy = document.createElement('div');
+  copy.className = 'copy';
   if ((theme === 'macos' || theme === 'ios') && entity.title) {
     const head = document.createElement('div');
     head.className = 'mtitle';
     head.textContent = entity.title;
-    body.appendChild(head);
+    copy.appendChild(head);
   }
-  const icon = iconEl(entity.icon);
+  // iOS alerts carry no app icon at all. Not hidden by CSS: the node is never built, so no
+  // empty flex slot or decorative circle can leak back in through a later skin rule.
+  const icon = theme === 'ios' ? null : iconEl(entity.icon);
   const msg = document.createElement('div');
   msg.className = 'msg';
   msg.textContent = entity.text;
+  copy.appendChild(msg);
   if (icon) body.appendChild(icon);
-  body.appendChild(msg);
+  body.appendChild(copy);
   box.appendChild(body);
 
   const row = document.createElement('div');
@@ -135,7 +142,10 @@ function build(entity) {
   buttons.forEach((b, i) => {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = `btn${i === pi ? ' primary' : ''}`;
+    // A label like Delete/Remove reads as the destructive choice on iOS and macOS, so the
+    // renderer flags it once here instead of every skin guessing from the button order.
+    const danger = /^(delete|remove|discard|erase|close all)\b/i.test(b.label || '');
+    btn.className = `btn${i === pi ? ' primary' : ''}${danger ? ' danger' : ''}`;
     btn.textContent = b.label || 'OK';
     btn.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -148,8 +158,8 @@ function build(entity) {
 }
 
 function place(el, entity) {
-  el.style.left = `${entity.x}px`;
-  el.style.top = `${entity.y}px`;
+  // The stage is the only layout authority: it centres the alert and clips it in 9:16. The
+  // server's x/y stays on the record for the preview pane, never as a pixel offset here.
   el.style.width = `${entity.w}px`;
 }
 
@@ -174,6 +184,13 @@ let firstPaint = true;
 
 function apply(snap) {
   const tone = snap.settings ? syncSound(snap.settings) : undefined;
+  // The stage ratio is resolved server-side (default follows the global wall ratio). Applying it
+  // to the document re-centres and re-clips existing alerts on the next layout — no reload.
+  const nextRatio = snap.ratio === '9:16' ? '9:16' : '16:9';
+  if (nextRatio !== ratio) {
+    ratio = nextRatio;
+    document.documentElement.dataset.ratio = ratio;
+  }
   if (snap.settings && snap.settings.theme) {
     const next = snap.settings.theme.value || 'win11';
     if (next !== theme) {

@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "order": 30,
   "icon": "window",
-  "description": "Fake error dialogs that cascade over the phone strip: title bar, icon, message, buttons. Messages come from the shared pool.",
+  "description": "Fake OS error dialogs on the 16:9 surface, with a centred 9:16 stage: title bar, icon, message, buttons. Messages come from the shared pool.",
   "channels": ["dialogs"],
   "mount": "routes.js",
   "ui": {
@@ -12,6 +12,14 @@
     "style": "ui/pane.css"
   },
   "settings": {
+    "ratio": {
+      "type": "enum",
+      "default": "default",
+      "values": ["default", "16:9", "9:16"],
+      "label": "Stage ratio",
+      "group": "ratio",
+      "help": "default follows the global wall ratio. 9:16 draws the centred portrait window inside the 16:9 page; 16:9 uses the whole frame."
+    },
     "theme": { "type": "enum", "default": "win11", "values": ["win95", "win11", "macos", "ios"], "label": "Window theme" },
     "scale": { "type": "number", "default": 0.7, "min": 0.5, "max": 1.2, "label": "Scale" },
     "sound": { "type": "boolean", "default": true, "label": "Sound", "group": "sound", "help": "Play a tone for each newly shown alert" },

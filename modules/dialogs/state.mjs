@@ -1,9 +1,10 @@
-// Alerts (dialogs) entity state: the fake Windows/macOS dialogs that cascade on the phone strip.
+// Alerts (dialogs) entity state: the fake Windows/macOS dialogs drawn on the 16:9 surface.
 //
 // Ported from error-popups' dialog branch. Sizes and positions are in the 405×720 canvas;
 // the client may report its measured size back (POST /live/measure) and the placement is
 // recomputed from that, exactly as before — the old estimate of 300×105 was only ever a
-// placeholder until the page measured itself.
+// placeholder until the page measured itself. Positions are the record the preview pane
+// reads; the overlay centres its own dialogs in the stage and never invents an offset.
 
 import { num } from '../../core/id.mjs';
 
@@ -14,8 +15,6 @@ const DEFAULT_W = 300; // authentic 430 × 0.7
 const DEFAULT_H = 105; // authentic 150 × 0.7 — placement estimate until a client reports
 const MIN_W = 220;
 const MAX_W = 385;
-const CASCADE_DX = 26;
-const CASCADE_DY = 22;
 export const MAX_DIALOGS = 80;
 // A dialog nobody dismisses must not live until the cap. The request may override this, and
 // `autoCloseMs: 0` is the deliberate permanent alert.
@@ -33,23 +32,27 @@ function clamp(v, min, max) {
   return v < min ? min : v > max ? max : v;
 }
 
-export function createDialogState({ settings, log }) {
+export function createDialogState({ settings, core, log }) {
   /** id -> entity */
   const live = new Map();
   let rev = 0;
   let spawned = 0;
-  let cascadeStep = 0;
+
+  /**
+   * The ratio the page draws: `default` follows the show-wide wall ratio, exactly like the wall
+   * module, so the deck's ratio key moves both surfaces. Resolved per frame, never stored.
+   */
+  function effectiveRatio() {
+    const own = settings && typeof settings.get === 'function' ? settings.get('ratio') : 'default';
+    if (own === '9:16' || own === '16:9') return own;
+    const global = core && core.settings && typeof core.settings.get === 'function' ? core.settings.get('ratio') : null;
+    return global === '9:16' ? '9:16' : '16:9';
+  }
 
   function place(w, h) {
-    // Cascade from the top-left, wrapping back when the next step would leave the canvas.
-    const col = cascadeStep % 4;
-    const row = Math.floor(cascadeStep / 4) % 5;
-    let x = 8 + col * CASCADE_DX;
-    let y = 12 + row * CASCADE_DY;
-    cascadeStep = (cascadeStep + 1) % 20;
-    x = clamp(x, 0, Math.max(0, CANVAS_W - w));
-    y = clamp(y, 0, Math.max(0, CANVAS_H - h));
-    return { x, y };
+    // One deterministic centre: the preview pane still reads x/y, and no skin gets an invented
+    // cascade offset that a later ratio change puts off the stage.
+    return { x: Math.round((CANVAS_W - w) / 2), y: Math.round((CANVAS_H - h) / 2) };
   }
 
   function spawn(spec, origin = 'server') {
@@ -98,8 +101,8 @@ export function createDialogState({ settings, log }) {
   }
 
   /**
-   * Where the operator put it: an alert drags in the show preview, and the position it lands on
-   * is this state. Clamped to the desk so a drag cannot put an alert off the phone strip.
+   * Where the operator dropped it in the show preview: a record for that pane only. The overlay
+   * centres in the stage and ignores x/y, so a drag cannot fight the deterministic centre.
    */
   function move(id, x, y) {
     const e = live.get(id);
@@ -144,8 +147,11 @@ export function createDialogState({ settings, log }) {
       count: live.size,
       capacity: MAX_DIALOGS,
       origin,
+      // The stage ratio travels with every frame, resolved (never the raw `default`), so a page
+      // that reconnects into a 9:16 show does not have to re-read the settings document.
+      ratio: effectiveRatio(),
     };
   }
 
-  return { live, spawn, measure, move, close, closeAll, sweep, snapshot, get rev() { return rev; } };
+  return { live, spawn, measure, move, close, closeAll, sweep, snapshot, effectiveRatio, get rev() { return rev; } };
 }

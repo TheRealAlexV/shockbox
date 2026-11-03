@@ -11,6 +11,7 @@ body {
   overflow: hidden;
   background: transparent;
   --scale: 0.7;
+  --stage-scrim: rgba(0, 0, 0, 0.22);
   font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   user-select: none;
@@ -22,20 +23,52 @@ body {
   inset: 0;
 }
 
-.dialog {
+/* The stage is the only layout authority. 16:9 is the whole frame; 9:16 is the centred
+ * portrait window of width height × 9/16. Anything drawn inside it (dialogs, their shadows,
+ * and the scrim) is clipped by it, so a wide frame never leaks a portrait-only layer. */
+#stage {
   position: absolute;
-  left: 0;
   top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 100%;
+  transform: translateX(-50%);
   display: flex;
   flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  overflow: hidden;
+}
+
+html[data-ratio='9:16'] #stage {
+  width: calc(100vh * 0.5625);
+}
+
+/* Dims the surface behind the alert so the card reads on any footage. It is a child of the
+ * stage, so 9:16 clips it to the portrait window and 16:9 lets it cover the whole frame. */
+.stage-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: var(--stage-scrim);
+  pointer-events: none;
+}
+
+.dialog {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
   overflow: hidden;
   opacity: 0;
   transform: translateY(4px) scale(0.985);
   transition:
     opacity 120ms ease,
-    transform 140ms cubic-bezier(0.2, 0.9, 0.2, 1),
-    left 140ms ease,
-    top 140ms ease;
+    transform 140ms cubic-bezier(0.2, 0.9, 0.2, 1);
 }
 
 .dialog.in {
@@ -54,7 +87,7 @@ body {
   gap: 8px;
   height: 26px;
   min-height: 26px;
-  padding: 0 6px 0 9px;
+  padding: 0 0 0 9px;
 }
 
 .ttitle {
@@ -112,6 +145,11 @@ body {
   min-height: 0;
 }
 
+.copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .icon {
   flex: 0 0 auto;
   width: 26px;
@@ -151,23 +189,77 @@ body {
   cursor: default;
 }
 
+.btn:focus-visible,
+.tclose:focus-visible {
+  outline: 2px solid #0a84ff;
+  outline-offset: 2px;
+}
+
 /* ============================== win11 ================================= */
 
+.skin-win11 {
+  font-family: 'Segoe UI', 'Segoe UI Variable Text', system-ui, -apple-system, sans-serif;
+}
+
+/* Square corners and a real title-bar target: the whole 46×32 corner closes the window, not
+ * just the 20 px glyph. Buttons sit flush with the panel's bottom padding. */
 .skin-win11 .dialog {
   background: #f3f3f3;
   color: #1a1a1a;
   border: 1px solid #e5e5e5;
-  border-radius: 8px;
+  border-radius: 0;
   box-shadow:
     0 8px 24px rgba(0, 0, 0, 0.2),
-    0 2px 6px rgba(0, 0, 0, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.85);
+    0 2px 6px rgba(0, 0, 0, 0.1);
+}
+
+.skin-win11 .titlebar {
+  height: 32px;
+  min-height: 32px;
+  padding: 0 0 0 12px;
+}
+
+.skin-win11 .ttitle {
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.skin-win11 .tclose {
+  width: 46px;
+  height: 32px;
+  opacity: 0.9;
+}
+
+.skin-win11 .tclose::before,
+.skin-win11 .tclose::after {
+  left: 17px;
+  right: 17px;
+  top: 15px;
+  height: 1px;
+}
+
+.skin-win11 .tclose:hover {
+  background: #c42b1c;
+  color: #fff;
+  opacity: 1;
+}
+
+.skin-win11 .body {
+  padding: 4px 16px 8px;
+}
+
+.skin-win11 .buttons {
+  padding: 8px 16px 14px;
+  gap: 8px;
 }
 
 .skin-win11 .btn {
+  min-width: 78px;
+  padding: 5px 14px;
   color: #1f1f1f;
   background: #fbfbfb;
   border: 1px solid #d7d7d7;
+  border-radius: 4px;
 }
 
 .skin-win11 .btn:hover {
@@ -272,28 +364,39 @@ body {
 
 /* ============================== macos ================================= */
 
+/* No fake traffic lights, no window chrome: a 10 px panel with the real alert icon, a
+ * left-aligned title/message pair, and a right-aligned hairline-split button row. */
+.skin-macos {
+  font-family: -apple-system, 'SF Pro Text', 'Helvetica Neue', 'Segoe UI', sans-serif;
+}
+
 .skin-macos .dialog {
   background: #f6f6f6;
   color: #1d1d1f;
-  border: 1px solid rgba(0, 0, 0, 0.13);
-  border-radius: 12px;
+  border: 0;
+  border-radius: 10px;
   box-shadow:
     0 14px 34px rgba(0, 0, 0, 0.26),
-    0 3px 8px rgba(0, 0, 0, 0.14),
-    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    0 3px 8px rgba(0, 0, 0, 0.14);
 }
 
 .skin-macos .body {
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-  padding: 14px 16px 10px;
+  flex-direction: row;
+  align-items: flex-start;
+  text-align: left;
+  padding: 16px 18px 14px;
+  gap: 12px;
+}
+
+.skin-macos .icon {
+  width: 44px;
+  height: 44px;
 }
 
 .skin-macos .mtitle {
   font-size: 13px;
   font-weight: 700;
-  margin-bottom: 4px;
+  margin-bottom: 3px;
 }
 
 .skin-macos .msg {
@@ -301,132 +404,140 @@ body {
   line-height: 1.35;
   color: #3a3a3c;
   display: block;
+  -webkit-line-clamp: unset;
 }
 
 .skin-macos .buttons {
+  justify-content: flex-end;
   padding: 0;
   gap: 0;
-  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  border-top: 1px solid rgba(0, 0, 0, 0.12);
 }
 
 .skin-macos .btn {
-  flex: 1 1 0;
-  padding: 8px 6px;
+  flex: 0 0 auto;
+  padding: 8px 18px;
   border: 0;
   border-radius: 0;
   background: transparent;
-  color: #007aff;
-  font-size: 12px;
-  min-height: 32px;
+  color: #0a84ff;
+  font-size: 12.5px;
 }
 
 .skin-macos .btn + .btn {
-  border-left: 1px solid rgba(0, 0, 0, 0.1);
+  border-left: 1px solid rgba(0, 0, 0, 0.12);
 }
 
 .skin-macos .btn.primary {
-  font-weight: 700;
+  font-weight: 600;
 }
 
-.skin-macos .btn:last-child {
-  border-bottom-right-radius: 12px;
+.skin-macos .btn:hover {
+  background: rgba(0, 0, 0, 0.04);
 }
 
-.skin-macos .btn:first-child {
-  border-bottom-left-radius: 12px;
+.skin-macos .btn:active {
+  background: rgba(0, 0, 0, 0.08);
 }
 
 /* ================================= ios ================================= */
-/* A real iOS alert: one centred 270 px card of translucent light material, 17 px semibold
-   heading, 13 px body, and full-width actions stacked behind a hairline. The server cascades
-   dialogs with inline left/top/width, so the skin takes the geometry back for the single card. */
+
+/* No icon, no titlebar, no close X: a 14 px card, a 17 px centred title, a 13 px centred
+ * message, and full-width action rows split by 1 px hairlines. Fade + settle, no slide. */
+.skin-ios {
+  font-family: -apple-system, 'SF Pro Text', 'Helvetica Neue', 'Segoe UI', sans-serif;
+}
 
 .skin-ios .dialog {
-  left: 50% !important;
-  top: 50% !important;
-  width: 270px !important;
-  max-width: calc(100vw - 32px);
+  background: rgba(242, 242, 247, 0.94);
+  color: #000;
+  border: 0;
   border-radius: 14px;
-  background: rgba(242, 242, 247, 0.82);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.3);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   backdrop-filter: blur(20px) saturate(180%);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
-  color: #000;
-  transform: translate(-50%, -50%) scale(0.985);
+  transform: scale(1.06);
+  transition:
+    opacity 250ms ease,
+    transform 250ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .skin-ios .dialog.in {
-  transform: translate(-50%, -50%);
+  opacity: 1;
+  transform: scale(1);
 }
 
-/* No icon: an iOS alert is text only. */
-.skin-ios .icon {
-  display: none;
+.skin-ios .dialog.leaving {
+  opacity: 0;
+  transform: scale(1.03);
 }
 
 .skin-ios .body {
   flex-direction: column;
   align-items: center;
   text-align: center;
-  gap: 3px;
   padding: 19px 16px 15px;
+  gap: 0;
 }
 
 .skin-ios .mtitle {
   font-size: 17px;
   font-weight: 600;
-  line-height: 22px;
-  letter-spacing: -0.4px;
+  line-height: 1.25;
+  margin-bottom: 4px;
 }
 
 .skin-ios .msg {
-  display: block;
   font-size: 13px;
-  line-height: 18px;
-  color: #3c3c43;
+  line-height: 1.35;
+  color: #000;
+  display: block;
+  -webkit-line-clamp: unset;
 }
 
 .skin-ios .buttons {
   flex-direction: column;
+  align-items: stretch;
   gap: 0;
   padding: 0;
-  border-top: 0.5px solid rgba(60, 60, 67, 0.29);
+  border-top: 1px solid rgba(60, 60, 67, 0.29);
 }
 
 .skin-ios .btn {
   width: 100%;
-  min-height: 44px;
-  padding: 8px 6px;
+  padding: 11px 12px;
   border: 0;
   border-radius: 0;
   background: transparent;
   color: #0a84ff;
   font-size: 17px;
-  font-weight: 400;
+  line-height: 1.2;
 }
 
 .skin-ios .btn + .btn {
-  border-top: 0.5px solid rgba(60, 60, 67, 0.29);
+  border-top: 1px solid rgba(60, 60, 67, 0.29);
 }
 
 .skin-ios .btn.primary {
   font-weight: 600;
 }
 
-.skin-ios .btn:hover {
-  background: rgba(120, 120, 128, 0.12);
+.skin-ios .btn.danger {
+  color: #ff3b30;
+}
+
+.skin-ios .btn:active {
+  background: rgba(120, 120, 128, 0.16);
 }
 
 /* The stage pointer from the show preview: an annotation on the stream, not part of the alert,
-   so it sits above the dialog layer and never takes a click. */
+ * so it stays out of the stage's clipping and never takes a click. */
 .stage-pointer {
-  position: fixed;
-  top: 0;
+  position: absolute;
   left: 0;
-  z-index: 2147483647;
-  pointer-events: none;
+  top: 0;
+  z-index: 5;
   opacity: 0;
-  transition: opacity 220ms ease;
-  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.5));
-  will-change: transform, opacity;
+  transition: opacity 180ms ease;
+  pointer-events: none;
 }
