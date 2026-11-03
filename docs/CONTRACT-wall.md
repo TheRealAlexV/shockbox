@@ -125,7 +125,7 @@ ratio watcher through `ctx.core.settings` (`server.js:89`).
 
 | route | file | expects |
 |---|---|---|
-| `/wall/render` | `engine/display.html` + `engine/*.js` | the wall canvas; opens SSE `/events?channels=wall&view=<landscape\|portrait>`, posts `/api/wall/state` ≤1 per 1.5 s, reads `/api/wall/render` |
+| `/wall/render` | `engine/display.html` + `engine/*.js` | the wall canvas; opens SSE `/events?channels=wall&view=<landscape\|portrait>`, posts `/api/wall/state` ≤1 per 1.5 s, reads `/api/wall/render`. `?fit=portrait` is opt-in: the page declares itself 9:16/portrait, so it lays out 63x112 in a centred 9:16 canvas full-height with black side bars, and the shared `fence` is not applied — the `/wall/portrait` composition inside a 16:9 source. Without the flag nothing changes |
 | `/wall/portrait` | `engine/display-portrait.html` + `engine/*.js` | the same canvas at 720x1280 (`LEDWALL_PAGE = {ratio:'9:16', view:'portrait'}`), for the OBS strip. Lays out 63x112 cells natively; the shared `fence` is not applied (this page *is* the 9:16 window) |
 
 Both pages carry `COOP: same-origin` / `COEP: require-corp` from their `pages[]` entry, and each has

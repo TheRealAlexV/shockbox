@@ -14,12 +14,26 @@
   html, body { margin: 0; padding: 0; width: 1280px; height: 720px; overflow: hidden; background: #000; }
   #wall { display: block; width: 1280px; height: 720px; }
   #diag { position: absolute; left: 8px; top: 8px; color: #0f0; font: 11px monospace; white-space: pre; display: none; }
+  /* `?fit=portrait` only: the canvas is 9:16 at the surface's full height, centred, background black. */
+  html.fit-portrait #wall { height: 100vh; width: calc(100vh * 9 / 16); margin: 0 auto; }
 </style>
 </head>
 <body>
 <canvas id="wall" width="1280" height="720"></canvas>
 <div id="diag"></div>
-<script>window.LEDWALL_PAGE = { ratio: '16:9', view: 'landscape' };</script>
+<script>
+  // `?fit=portrait` — opt-in pillarbox on this 16:9 surface: the portrait wall (63x112) as a
+  // centred 9:16 column, black either side, which is the /wall/portrait composition. boot.js
+  // treats ratio 9:16 as the 9:16 page, so it lays out portrait AND skips the server's 9:16
+  // fence: a fence is a window *inside* a landscape wall, and here the whole picture already is
+  // the portrait one. Without the flag this is the landscape wall it has always been.
+  (function () {
+    var fit = new URLSearchParams(location.search).get('fit') === 'portrait';
+    window.LEDWALL_PAGE = fit ? { ratio: '9:16', view: 'portrait' }
+                              : { ratio: '16:9', view: 'landscape' };
+    if (fit) document.documentElement.className = 'fit-portrait';
+  })();
+</script>
 <script src="config.js"></script>
 <script src="sim.js"></script>
 <script src="grade.js"></script>
