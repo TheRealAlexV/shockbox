@@ -12,6 +12,7 @@
 // Exits non-zero on the first failed check.
 
 import { createWatchdog } from '../modules/handfx/pages/js/overlay/watchdog.js';
+import { cameraWanted, rearmCamera } from '../modules/handfx/pages/js/overlay/rearm.js';
 
 let failures = 0;
 function check(name, ok, detail = '') {
@@ -151,6 +152,150 @@ check('the hard cap is honoured', deadProbes.length === end.maxAttempts, `${dead
 check('after the cap the page stops probing (no storm)', deadProbes.at(-1) < 600000 - 60000, `last probe at ${deadProbes.at(-1)}`);
 check('a dead server never runs a recovery', pageDead.recoveries === 0 && end.state === 'gave-up');
 check('the page does not claim a camera it does not have', pageDead.cameraSource === 'none' && pageDead.anchors === 'none');
+
+/* ---------------------------------------------------------------- recovery re-arms the camera */
+
+// The rig's defect: the server restarted, the relay was already dead (so `camAttempted` was false
+// and tracking was stopped), and recovery skipped the camera for ever. These two scenarios drive
+// the real `rearmCamera` against a stub server that counts `/camera/stream` requests and the
+// `cameraFeed.clients` the page would report on /status.
+
+/** The server's camera feed: one request per relay reader, and the client count it exposes. */
+function makeServer() {
+  return {
+    up: true,
+    clients: 0,
+    streamRequests: [],
+    async stream() {
+      this.streamRequests.push(this.streamRequests.length + 1);
+      if (!this.up) throw new Error('ECONNREFUSED');
+      this.clients = 1; // the relay's reader is attached
+      return { ok: true };
+    },
+    close() {
+      this.clients = 0;
+    },
+  };
+}
+
+/** relay.js: `start()` is one `/camera/stream` fetch; a frame is what makes the source a camera. */
+function makeRelay(server, state, { deliversFrames = true } = {}) {
+  return {
+    live: false,
+    async start() {
+      if (this.live) return true;
+      try {
+        await server.stream();
+      } catch {
+        return false;
+      }
+      this.live = true;
+      if (deliversFrames) {
+        state.cameraSource = 'relay';
+        state.anchors = 'camera';
+      }
+      return true;
+    },
+    stop() {
+      this.live = false;
+      server.close();
+    },
+  };
+}
+
+/** tracker.js: `stop()` clears the synthetic rig with the tracker. */
+function makeTracker(state) {
+  return {
+    stop() {
+      state.tracking = false;
+      state.synthetic = false;
+    },
+  };
+}
+
+/** autoCamera from main.js, with its bounded retry: 2 attempts, relay first, synthetic last. */
+function makeAutoCamera(state, relay, { budget = 2 } = {}) {
+  const cam = { attempts: 0 };
+  const auto = async () => {
+    if (cam.attempts >= budget) return false;
+    cam.attempts += 1;
+    if (await relay.start()) {
+      state.tracking = true;
+      state.synthetic = false;
+      return true;
+    }
+    return false; // main.js calls fallBackToSynthetic(); the view keeps the synthetic anchors
+  };
+  auto.cam = cam;
+  return auto;
+}
+
+/** The state a dead relay leaves behind: fallBackToSynthetic() ran, the camera is not tracking. */
+function afterRelayDeath() {
+  return { cameraSource: 'synthetic', anchors: 'synthetic', tracking: false, synthetic: true };
+}
+
+console.log('scenario 3: server dies while the relay was live, then returns');
+
+const s3 = makeServer();
+const st3 = { ...afterRelayDeath(), settings: { cameraRelay: 'on' } };
+const relay3 = makeRelay(s3, st3);
+const tracker3 = makeTracker(st3);
+const auto3 = makeAutoCamera(st3, relay3);
+await relay3.start(); // the page was watching the relay before the restart
+check('the relay was live before the restart', s3.clients === 1 && st3.cameraSource === 'relay');
+s3.up = false;
+relay3.stop(); // the reader hits ECONNREFUSED and ends
+st3.cameraSource = 'synthetic'; // fallBackToSynthetic() took the view back
+st3.anchors = 'synthetic';
+const sent3 = s3.streamRequests.length;
+s3.up = true; // the server comes back
+const armed3 = await rearmCamera({
+  state: st3,
+  relay: relay3,
+  tracker: tracker3,
+  autoCamera: auto3,
+  userStopped: false,
+  visible: true,
+});
+check('recovery re-arms the camera the settings ask for', armed3 === true);
+check('a fresh /camera/stream request is issued', s3.streamRequests.length === sent3 + 1, `${s3.streamRequests.length - sent3} new`);
+check('the retry budget is not spent in a loop', auto3.cam.attempts === 1, `${auto3.cam.attempts} attempts`);
+check('/status shows cameraFeed.clients: 1', s3.clients === 1, `clients ${s3.clients}`);
+check('the camera claim follows the frames', st3.cameraSource === 'relay' && st3.anchors === 'camera');
+
+console.log('scenario 4: the camera is off in settings, and a stub relay that never delivers');
+
+const s4 = makeServer();
+const st4 = { ...afterRelayDeath(), settings: { cameraRelay: 'off' } };
+const relay4 = makeRelay(s4, st4);
+const auto4 = makeAutoCamera(st4, relay4);
+const sent4 = s4.streamRequests.length;
+const armed4 = await rearmCamera({
+  state: st4,
+  relay: relay4,
+  tracker: makeTracker(st4),
+  autoCamera: auto4,
+  userStopped: false,
+  visible: true,
+});
+check('camera off in settings: recovery does not start it', armed4 === false && s4.streamRequests.length === sent4);
+check('camera off in settings: no stream client is attached', s4.clients === 0 && st4.cameraSource === 'synthetic');
+check('camera wanted is a settings read, not the last attempt', cameraWanted({ cameraRelay: 'on' }) && !cameraWanted({ cameraRelay: 'off' }) && cameraWanted(null));
+
+const s5 = makeServer();
+const st5 = { ...afterRelayDeath(), settings: { cameraRelay: 'on' } };
+const relay5 = makeRelay(s5, st5, { deliversFrames: false }); // request accepted, no frame ever
+const armed5 = await rearmCamera({
+  state: st5,
+  relay: relay5,
+  tracker: makeTracker(st5),
+  autoCamera: makeAutoCamera(st5, relay5),
+  userStopped: false,
+  visible: true,
+});
+check('a relay that never delivers keeps the page on synthetic', armed5 === false || st5.cameraSource !== 'relay', `cameraSource ${st5.cameraSource}`);
+check('a stopped page is not re-armed', (await rearmCamera({ state: st5, relay: relay5, tracker: makeTracker(st5), autoCamera: makeAutoCamera(st5, relay5), userStopped: true, visible: true })) === false);
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
 process.exitCode = failures ? 1 : 0;

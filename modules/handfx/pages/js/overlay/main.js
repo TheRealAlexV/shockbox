@@ -20,6 +20,7 @@
 import { Tracker, syntheticHands } from '../engine/tracker.js';
 import { createPublisher } from './publish.js';
 import { createRelay } from './relay.js';
+import { rearmCamera } from './rearm.js';
 import { createWatchdog } from './watchdog.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
 import { FxRenderer, EFFECTS, anchorsFrom } from '../engine/fx.js';
@@ -318,11 +319,17 @@ async function recoverOverlay(status) {
     // that a machine has no camera at all must run again from zero.
     autoCam.attempts = 0;
     autoCam.lastAt = 0;
-    if (!userStopped && document.visibilityState === 'visible' && (camAttempted || state.tracking)) {
-      relay.stop();
-      tracker.stop();
-      await startTracking({});
-    }
+    // Re-arm the camera the settings ask for, not the one that last failed: a dead relay has
+    // already set `camAttempted = false` and stopped tracking, so keying this on that state left
+    // the page on synthetic hands until someone clicked Start.
+    await rearmCamera({
+      state,
+      relay,
+      tracker,
+      autoCamera,
+      userStopped,
+      visible: document.visibilityState === 'visible',
+    });
     publisher.kick();
     // A forced status line: `ack` is rate limited to 2/s and the recovery may have been silent.
     state.lastAck = 0;
