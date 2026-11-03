@@ -6,9 +6,10 @@
 
 .DESCRIPTION
   Stops the TUI supervisor (and, through it or after it, the server on the port)
-  using the same evidence rules as install.ps1: the supervisor is found by its
-  command line or its lock file, and the port's listener only if its command
-  line runs *this* install's server.mjs. It never kills an unrelated process.
+  using the same evidence rules as install.ps1: a live pid from supervisor.pid or
+  status.json, else a heartbeat younger than 10s. Its command line is never
+  evidence of absence. The port's listener is stopped only if its command line
+  runs *this* install's server.mjs. It never kills an unrelated process.
 
   Every other task on the host - ErrorPopups-Server, LedWallAgent, anything else -
   is left alone. The installed folder is kept: state, logs, the copied tree and
@@ -59,41 +60,84 @@ function Test-IsOurs([int]$ProcId, [string]$AppDir) {
     return ($p.CommandLine -match 'server\.mjs' -and $p.CommandLine -match [regex]::Escape($AppDir))
 }
 
-function Get-SupervisorPid([string]$AppDir) {
-    $table = try { @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { @() }
-    $found = @()
-    foreach ($p in $table) {
-        if ($p.ProcessId -eq $PID) { continue }
-        if (-not $p.CommandLine) { continue }
-        if (($p.CommandLine -match 'shockbox_tui' -and $p.CommandLine -match [regex]::Escape($AppDir)) -or ($p.CommandLine -match 'supervisor\.lock')) {
-            $found += $p.ProcessId
+function Read-RuntimePid([string]$Path) {
+    # Same rule as install.ps1: never Get-Content on a file another process may hold. The lock is
+    # 0 bytes and cannot carry a pid either way - a supervisor publishes it in supervisor.pid.
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    } catch {
+        return 0
+    }
+    try {
+        $reader = New-Object System.IO.StreamReader($fs)
+        $text = $reader.ReadToEnd()
+        $reader.Dispose()
+    } catch {
+        return 0
+    } finally {
+        $fs.Dispose()
+    }
+    $n = 0
+    if ([int]::TryParse(($text -replace '[^0-9]', ''), [ref]$n) -and $n -gt 0) { return $n }
+    return 0
+}
+
+function Get-SupervisorState {
+    # Ask the live process, not its command line - the rule install.ps1 uses (see
+    # Get-SupervisorState there for the full rationale):
+    #   1. a live pid (supervisor.pid, then status.json's supervisor_pid) is the supervisor,
+    #      even with a stale heartbeat: a wedged process still holds the lock and must be stopped;
+    #   2. otherwise a heartbeat younger than 10s means one is up and did not publish a pid;
+    #   3. otherwise nothing. A dead pid beats a fresh heartbeat.
+    # A command line that does not name this app dir is NOT evidence of absence. The old test
+    # here matched `shockbox_tui` to the app dir, so a supervisor launched with a relative path,
+    # a wrapper, or a venv-shimmed python was invisible and the uninstall said "no TUI supervisor
+    # running" over a live one.
+    $runtime = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime'
+    $live = @{}
+    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $live[[int]$p.ProcessId] = $true }
+
+    $candidates = @()
+    $fromPid = Read-RuntimePid (Join-Path $runtime 'supervisor.pid')
+    if ($fromPid -gt 0) { $candidates += $fromPid }
+    $statusPath = Join-Path $runtime 'status.json'
+    if (Test-Path -LiteralPath $statusPath) {
+        try { $st = Get-Content -LiteralPath $statusPath -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $st = $null }
+        if ($st -and $st.PSObject.Properties['supervisor_pid']) {
+            $sp = 0
+            if ([int]::TryParse([string]$st.supervisor_pid, [ref]$sp) -and $sp -gt 0) { $candidates += $sp }
         }
     }
-    $lock = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime\supervisor.lock'
-    if (Test-Path -LiteralPath $lock) {
-        $raw = [string](Get-Content -LiteralPath $lock -Raw -ErrorAction SilentlyContinue)
-        foreach ($m in [regex]::Matches($raw, '\d+')) {
-            $candidate = 0
-            if ([int]::TryParse($m.Value, [ref]$candidate) -and ($table | Where-Object { $_.ProcessId -eq $candidate })) { $found += $candidate }
+    $age = $null
+    $hb = Join-Path $runtime 'heartbeat'
+    if (Test-Path -LiteralPath $hb) {
+        try { $age = [math]::Round(((Get-Date) - (Get-Item -LiteralPath $hb).LastWriteTime).TotalSeconds, 1) } catch { $age = $null }
+    }
+    foreach ($c in ($candidates | Select-Object -Unique)) {
+        if ($live.ContainsKey([int]$c)) {
+            return @{ Alive = $true; Pid = [int]$c; Age = $age; Why = "published pid $c is alive" }
         }
     }
-    return @($found | Select-Object -Unique)
+    if ($age -ne $null -and $age -le 10) {
+        return @{ Alive = $true; Pid = 0; Age = $age; Why = 'heartbeat is fresh, pid not published' }
+    }
+    return @{ Alive = $false; Pid = 0; Age = $age; Why = 'no live pid and the heartbeat is stale or missing' }
 }
 
 # ---- 1. stop the supervisor and the server ----------------------------------
 Step 'stop'
 if ($PSCmdlet.ShouldProcess($Target, 'stop the TUI supervisor and the server it runs')) {
-    $sup = @(Get-SupervisorPid $Target)
-    if ($sup.Count -gt 0) {
-        foreach ($s in $sup) {
-            # The supervisor stops its own server. A force kill is the fallback:
-            # the server's listener is handled below either way.
-            Stop-Process -Id $s -Force -ErrorAction SilentlyContinue
-            Note "stopped TUI supervisor pid $s"
+    $state = Get-SupervisorState
+    if ($state.Alive) {
+        if ($state.Pid -gt 0) {
+            Stop-Process -Id $state.Pid -Force -ErrorAction SilentlyContinue
+            Note ("stopped TUI supervisor pid " + $state.Pid + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
+        } else {
+            Write-Warning ("a TUI supervisor is running but published no pid (" + $state.Why + ", heartbeat $($state.Age)s old); stop it from the TUI or Task Manager")
         }
         Start-Sleep -Milliseconds 700
     } else {
-        Note 'no TUI supervisor running'
+        Note ("no TUI supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
     }
 
     $loops = @(Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue |
@@ -115,9 +159,9 @@ if ($PSCmdlet.ShouldProcess($Target, 'stop the TUI supervisor and the server it 
             Write-Warning "port $Port is held by pid $listener which is not this install - leaving it"
         }
     }
-    if ($sup.Count -eq 0 -and $loops.Count -eq 0 -and $killPort -eq 0) { Note 'nothing was running' }
+    if ($state.Alive -or $loops.Count -gt 0 -or $killPort -gt 0) { Note 'stopped what was running' } else { Note 'nothing was running' }
 } else {
-    Note "stop the TUI supervisor (shockbox_tui, or the supervisor.lock holder), the run.cmd launcher, and the node serving $Port if it runs $Target\server.mjs"
+    Note "stop the TUI supervisor (a live supervisor.pid or status.json supervisor_pid, or a heartbeat younger than 10s), the run.cmd launcher, and the node serving $Port if it runs $Target\server.mjs"
 }
 
 # ---- 2. the old scheduled task, if a previous install left one ---------------

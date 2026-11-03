@@ -120,16 +120,46 @@ class Control:
         return flags
 
     def ensure_supervisor(self, timeout: float = ACTION_TIMEOUT_S) -> bool:
-        """Start the supervisor if it is not alive. True when it is (now) up.
+        """Start the supervisor unless one is *provably* alive. True when it is (now) up.
+
+        Proof of life is a live pid **and** a fresh heartbeat, never the absence of an error.
+        A heartbeat alone lies for ``STATUS_STALE_S`` seconds: a supervisor SIGKILLed 8s ago
+        still looks fresh, and adopting it leaves the window attached to nothing — the
+        02:46:34 relaunch. So a dead pid, a stale heartbeat, or a fresh heartbeat with no live
+        pid all mean spawn.
 
         Two TUI instances racing here is harmless: the supervisor's OS lock lets exactly one
         win, and the loser exits immediately.
         """
-        if self.supervisor_responding():
-            return True
         self.paths.ensure()
-        # A supervisor that died hard may have left a status.json claiming "running"; start()
-        # would then wait on a lie. Remove both files so the only evidence is the new one's.
+        pid = self.supervisor_pid()
+        fresh = self.supervisor_responding()
+        if pid and fresh:
+            self._life_note(f"adopt: supervisor pid {pid} alive, heartbeat {self._status_age():.1f}s old")
+            return True
+        if pid or fresh:
+            # Something looks alive but not both halves of the proof: recover, loudly.
+            self._life_note(
+                f"recover: supervisor not provably alive (live pid={pid}, fresh heartbeat={fresh}): replacing"
+            )
+        ok = self._spawn_supervisor(timeout)
+        if not ok and not pid:
+            # One retry, never a loop. A lock whose owner has just died can refuse the newcomer
+            # for a tick; the kernel drops that lock, and clearing the dead owner's files makes
+            # the second attempt independent of whatever the old process left behind.
+            self._life_note("recover: spawn did not prove life; clearing a dead owner's state and retrying once")
+            self._clear_stale_lock()
+            ok = self._spawn_supervisor(timeout)
+        if ok:
+            self._life_note(f"spawn: supervisor pid {self.supervisor_pid()} alive, heartbeat fresh")
+        else:
+            self._life_note("fail: no supervisor after two spawn attempts — the window opens attached to nothing")
+        return ok
+
+    def _spawn_supervisor(self, timeout: float) -> bool:
+        """Popen a detached supervisor and wait until it proves itself alive (pid + heartbeat)."""
+        # A supervisor that died hard may have left a status.json claiming "running"; the wait
+        # below would then read a lie. Remove both files so the only evidence is the new one's.
         for path in (self.paths.status_file, self.paths.heartbeat_file):
             try:
                 path.unlink()
@@ -156,7 +186,38 @@ class Control:
             subprocess.Popen([self.python, "-m", "shockbox_tui.supervisor", *self.supervisor_argv()[3:]], **popen_kwargs)
         finally:
             log_handle.close()
-        return self._wait(lambda: self.supervisor_responding(), timeout)
+        return self._wait(lambda: self.supervisor_pid() is not None and self.supervisor_responding(), timeout)
+
+    def _clear_stale_lock(self) -> bool:
+        """Remove ``supervisor.lock`` when the pid it belongs to is provably gone.
+
+        The OS drops a held lock when its process dies, so this is belt and braces for a lock
+        file left behind on a platform that cannot (Windows). It must never remove a lock of a
+        live supervisor: that would let two run at once.
+        """
+        owner = self.supervisor_pid()
+        if owner is None:
+            try:
+                owner = int(self.paths.supervisor_pid_file.read_text(encoding="ascii").strip() or "0") or None
+            except (OSError, ValueError):
+                owner = None
+        if owner is None or _alive(owner):
+            # No named owner: the lock may be held by a live process we cannot name. Leave it.
+            return False
+        try:
+            self.paths.lock_file.unlink()
+            return True
+        except OSError:
+            return False
+
+    def _life_note(self, message: str) -> None:
+        """One timestamped line in ``runtime/supervisor.log`` — the file the supervisor writes too."""
+        try:
+            stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.paths.startup_log, "a", encoding="utf-8") as fh:
+                fh.write(f"{stamp} tui[{os.getpid()}]: {message}\n")
+        except OSError:
+            pass
 
     def supervisor_responding(self) -> bool:
         """Alive if its heartbeat is fresh.
