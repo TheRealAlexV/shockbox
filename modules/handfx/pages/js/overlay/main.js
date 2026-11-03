@@ -89,11 +89,18 @@ const relay = createRelay({
   onState: (s) => {
     state.relayError = s.error || null;
     renderState();
+    if (s.state !== 'error' || state.cameraSource !== 'relay') return;
+    // The relayed camera went away (EOF or a read error). Hand the view back the way a device
+    // track ending does — tracker to idle, then fallBackToSynthetic — and make the page's one
+    // bounded retry, which the 5 s gap and the attempt cap already limit. No reconnect loop.
+    state.cameraSource = 'none';
+    tracker.stop();
+    void autoCamera();
   },
 });
 // The virtual camera's feed: only runs when the server says `publish` is not `off`.
 const publisher = createPublisher({
-  video: () => tracker.video,
+  source: () => tracker.frameSurface() || tracker.video,
   fx: () => canvas,
   settings: () => state.settings || {},
   log: (msg) => console.warn(msg),

@@ -12,11 +12,12 @@
 
 /**
  * @param {object} opts
- * @param {() => HTMLVideoElement|null} opts.video  the tracker's camera element (never in the DOM)
+ * @param {() => (HTMLVideoElement|HTMLCanvasElement|null)} opts.source  what to send: the camera
+ *   element (never in the DOM), or the relay's frame canvas
  * @param {() => HTMLCanvasElement|null} opts.fx    the effects canvas to burn in
  * @param {() => object} opts.settings              the page's copy of the settings document
  */
-export function createPublisher({ video, fx, settings, log = () => {} }) {
+export function createPublisher({ source, fx, settings, log = () => {} }) {
   let mode = 'off';
   let geom = null; // { width, height, fps } — the server's, not ours
   let surface = null; // offscreen 2D canvas, one per geometry
@@ -52,10 +53,21 @@ export function createPublisher({ video, fx, settings, log = () => {} }) {
     }
   }
 
+  /**
+   * Anything with a picture in it: a playing <video> (readyState and videoWidth), or a source that
+   * carries its own size (a canvas, an ImageBitmap). One predicate, because the relay path hands
+   * over its frame canvas and the device path its video element.
+   */
+  function drawable(el) {
+    if (!el) return false;
+    if (el.readyState !== undefined) return el.readyState >= 2 && el.videoWidth > 0;
+    return el.width > 0 && el.height > 0;
+  }
+
   /** Compose one frame. Returns false when there is no picture to send (camera not running). */
   function compose() {
-    const el = video();
-    if (!el || el.readyState < 2 || !el.videoWidth) return false;
+    const el = source();
+    if (!drawable(el)) return false;
     const { width: w, height: h } = geom;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);

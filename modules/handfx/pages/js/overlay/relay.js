@@ -128,6 +128,23 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     }
   }
 
+  /**
+   * The stream is gone — a clean EOF or a read error, they are the same event to this page. Drop
+   * the connection, the held frame and the claim that anything is live, so the page stops drawing
+   * a frozen picture and its fallback path can run.
+   */
+  function fail(message) {
+    close();
+    live = false;
+    latest = null;
+    error = message;
+    if (current) {
+      current.close();
+      current = null;
+    }
+    emit('error');
+  }
+
   function stop({ forget = true } = {}) {
     if (forget) wanted = false;
     close();
@@ -145,6 +162,11 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
 
   async function decode(bytes) {
     const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+    if (!ctrl) {
+      // The stream died while this was decoding: drawing it now would revive the frozen frame.
+      bitmap.close();
+      return;
+    }
     const prev = current;
     current = bitmap;
     frames += 1;
@@ -177,18 +199,13 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
         }
       }
     } catch (err) {
-      if (ctrl) {
-        close();
-        live = false;
-        error = `relay: ${err && err.message ? err.message : err}`;
-        emit('error');
-      }
+      if (ctrl) fail(`relay: ${err && err.message ? err.message : err}`);
     } finally {
       decoding = false;
     }
   }
 
-  async function read(res) {
+  async function read(res, ac) {
     const reader = res.body.getReader();
     const parser = new MultipartFrames();
     for (;;) {
@@ -200,6 +217,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
         if (!decoding) void drain();
       }
     }
+    // A clean EOF is the camera going away too: without this the page kept the last frame and
+    // went on reporting itself live forever.
+    if (!ac.signal.aborted && ctrl) fail('relay: stream ended');
   }
 
   async function start() {
@@ -219,12 +239,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       const type = res.headers.get('content-type') || '';
       if (!/multipart\/x-mixed-replace/i.test(type)) throw new Error(`unexpected content-type ${type || '(missing)'}`);
       // Losing the connection after the first frame is a state change, not a start failure.
-      void read(res).catch((err) => {
-        if (ac.signal.aborted) return;
-        close();
-        live = false;
-        error = `relay: ${err && err.message ? err.message : err}`;
-        emit('error');
+      void read(res, ac).catch((err) => {
+        if (ac.signal.aborted || !ctrl) return;
+        fail(`relay: ${err && err.message ? err.message : err}`);
       });
       const got = await new Promise((resolve) => {
         firstWaiter = resolve;
