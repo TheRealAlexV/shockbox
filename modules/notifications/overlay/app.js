@@ -68,29 +68,25 @@ function render(entity) {
   box.style.left = `${entity.x}px`;
   box.style.top = `${entity.y}px`;
 
-  const left = el('div', 'lead');
-  left.appendChild(glyph(entity.style));
-  box.appendChild(left);
+  // Header row: the app mark, then the label the OS prints beside it. The strip has no
+  // app-name field, so the notification type stands in (Android and Windows hide it).
+  const head = el('div', 'head');
+  const lead = el('div', 'lead');
+  lead.appendChild(glyph(entity.style));
+  head.appendChild(lead);
+  head.appendChild(el('span', 'app', entity.type || 'Notification'));
+  box.appendChild(head);
 
-  const body = el('div', 'body');
-  if (entity.title) body.appendChild(el('div', 'title', entity.title));
-  body.appendChild(el('div', 'text', entity.text));
-  box.appendChild(body);
+  if (entity.title) box.appendChild(el('div', 'title', entity.title));
+  box.appendChild(el('div', 'text', entity.text));
 
-  // No action buttons: real OS toasts have none. Whatever `entity.buttons` carries is ignored.
-  box.addEventListener('click', () => dismiss(entity.id, 'close'));
+  // Notifications never carry actions: no button row is built and `entity.buttons` is ignored.
+  box.addEventListener('click', () => dismiss(entity.id));
   return box;
 }
 
-function dismiss(id, action) {
-  // Local close, then tell the server so the panel and other pages agree. A 'none' action is
-  // a no-op button by design (a decoy).
-  if (action === 'none') return;
-  if (action === 'closeAll') {
-    for (const [, view] of seen) view.el.classList.add('leaving');
-    setTimeout(() => fetch('/api/notifications/live', { method: 'DELETE' }).catch(() => {}), 180);
-    return;
-  }
+function dismiss(id) {
+  // Local close, then tell the server so the panel and other pages agree.
   const view = seen.get(id);
   if (view) {
     view.el.classList.add('leaving');
