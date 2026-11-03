@@ -38,7 +38,9 @@ export function normalizeConfig(raw) {
   const fps = Math.round(Number(c.fps));
   return {
     enabled: c.enabled !== false,
-    source: String(c.source || 'WebcamSwitcher Virtual Camera'),
+    // The exact DirectShow friendly name: dshow rejects the short form with "Could not find
+    // video device", so the fallback must be the same string the setting ships.
+    source: String(c.source || 'WebcamSwitcher Virtual Camera (Windows Virtual Camera)'),
     fps: Number.isFinite(fps) ? Math.min(60, Math.max(1, fps)) : 30,
     size: SIZES.includes(c.size) ? c.size : '960x540',
     ffmpegPath: String(c.ffmpegPath || 'ffmpeg'),
@@ -94,6 +96,24 @@ export function resolveBinary(name, env = process.env, platform = process.platfo
     for (const candidate of candidates) {
       const full = path.join(dir, candidate);
       if (fileExists(full)) return full;
+    }
+  }
+  // An installer does not always touch PATH (WinGet links, scoop shims, a hand unpack into
+  // C:\ffmpeg). A fresh install must not need a hand-edited setting just to find the binary, so
+  // the usual homes are tried before this reports nothing.
+  if (platform === 'win32') {
+    const homes = [
+      env.ProgramFiles && path.join(env.ProgramFiles, 'ffmpeg', 'bin'),
+      env['ProgramFiles(x86)'] && path.join(env['ProgramFiles(x86)'], 'ffmpeg', 'bin'),
+      'C:\\ffmpeg\\bin',
+      env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links'),
+      env.USERPROFILE && path.join(env.USERPROFILE, 'scoop', 'shims'),
+    ].filter(Boolean);
+    for (const dir of homes) {
+      for (const candidate of candidates) {
+        const full = path.join(dir, candidate);
+        if (fileExists(full)) return full;
+      }
     }
   }
   return null;
@@ -295,14 +315,17 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     clearRestart();
     const bin = resolveBinary(cfg.ffmpegPath);
     if (!bin) {
-      fail(`ffmpeg not found: "${cfg.ffmpegPath}" (looked on PATH)`);
+      // Name what was asked for, so a wrong path is unmistakably a binary problem and never a
+      // broken camera: the relay's error is the only thing the operator has to go on.
+      const where = process.platform === 'win32' ? 'PATH and the usual Windows install folders' : 'PATH';
+      fail(`ffmpeg not found: "${cfg.ffmpegPath}" (looked on ${where})`);
       return;
     }
     let proc;
     try {
       proc = spawn(bin, ffmpegArgs(cfg), { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (err) {
-      fail(`ffmpeg failed to start: ${err.message}`);
+      fail(`ffmpeg failed to start: "${bin}" (${err.code || err.message})`);
       return;
     }
     child = proc;
@@ -318,7 +341,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     proc.on('error', (err) => {
       if (child !== proc) return;
       child = null;
-      fail(`ffmpeg failed to start: ${err.message}`);
+      fail(`ffmpeg failed to start: "${bin}" (${err.code || err.message})`);
     });
     proc.on('exit', (code, signal) => {
       if (child !== proc) return;

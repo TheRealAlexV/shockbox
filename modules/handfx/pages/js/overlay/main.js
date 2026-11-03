@@ -844,6 +844,13 @@ function loop(now) {
     // Runs straight after the effects pass, while the canvas still holds this frame's pixels.
     // Publishes nothing unless the server says `publish` is raw or effects.
     publisher.tick(now);
+    // The draw truth rides the render loop, not the tracker's frame callback. On the device path
+    // `onFrame` was driven by this page's own rAF, so its `/ack` beat came free; a relayed frame
+    // instead arrives from the stream reader (relay.js `drain`), and a reader that stalls (or a
+    // throw inside `onFrame` before its own ack) left the loop drawing and counting while
+    // `/ack` went quiet, so `/status` showed a frozen `draws` next to a live `publish`. The loop
+    // is what counts draws, so the loop reports them; ack() still throttles to 2/s.
+    ack(now);
   } finally {
     requestAnimationFrame(loop);
   }

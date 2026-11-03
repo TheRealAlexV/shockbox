@@ -56,10 +56,10 @@
     },
     "cameraRelaySource": {
       "type": "string",
-      "default": "WebcamSwitcher Virtual Camera",
+      "default": "WebcamSwitcher Virtual Camera (Windows Virtual Camera)",
       "maxLength": 200,
       "label": "Camera relay source (ffmpeg dshow device name)",
-      "help": "The DirectShow device name ffmpeg opens. WebcamSwitcher's virtual camera works while the app holds the physical camera; a real camera name works only when nothing else has it open.",
+      "help": "The DirectShow friendly name ffmpeg opens, exactly as dshow lists it. WebcamSwitcher's virtual camera works while the app holds the physical camera; a real camera name works only when nothing else has it open. The short name fails with \"Could not find video device\".",
       "group": "general"
     },
     "cameraRelayFps": {
@@ -85,7 +85,7 @@
       "default": "ffmpeg",
       "maxLength": 260,
       "label": "ffmpeg executable (name on PATH, or a full path)",
-      "help": "Only used by the camera relay. A bare name is looked up on PATH; if it is not found the relay reports that on /api/handfx/status instead of failing the module.",
+      "help": "Only used by the camera relay. A bare name is looked up on PATH, then in the usual Windows install folders (Program Files\\ffmpeg\\bin, C:\\ffmpeg\\bin, the WinGet links and scoop shims). If it is still not found the relay reports that, with the paths it tried, on /api/handfx/status instead of failing the module.",
       "group": "general"
     },
     "sensitivity": {
