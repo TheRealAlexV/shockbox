@@ -1,4 +1,4 @@
-"""Thin HTTP client for ShockBox's own API. Stdlib only (``urllib``), no requests.
+"""Thin HTTP client for ShockBox's own API. Stdlib only (``http.client``), no requests.
 
 Endpoints this speaks (shapes taken from ``core/server-http.mjs``, ``core/pool.mjs`` and the
 module route files, not guessed):
@@ -19,13 +19,17 @@ code and ``error`` field; connection failures raise ``ApiUnreachable`` (a normal
 
 from __future__ import annotations
 
+import http.client
 import json
-import socket
-import urllib.error
-import urllib.request
+import threading
 from typing import Any
 
 DEFAULT_TIMEOUT = 3.0
+
+# Verbs safe to replay when a *reused* socket turns out to be dead. A dead socket is not
+# evidence that the server is down, so these retry once on a fresh connection; anything that
+# changes state is never retried, because it may have been delivered before the socket broke.
+_IDEMPOTENT = frozenset({"GET", "HEAD"})
 
 
 class ApiError(Exception):
@@ -47,30 +51,73 @@ class ApiClient:
         self.port = int(port)
         self.host = host
         self.timeout = float(timeout)
+        # One keep-alive connection, kept across calls. The supervisor polls /health every two
+        # seconds for as long as the rig is up; a fresh TCP connect per poll is pure syscall cost
+        # (it showed up as ~30 ms of CPU per minute of idle, a third of the whole tick budget).
+        self._conn: http.client.HTTPConnection | None = None
+        self._lock = threading.Lock()
 
     # ---- plumbing ---------------------------------------------------------------
     @property
     def base(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    def close(self) -> None:
+        """Drop the keep-alive socket (the server is stopping, or this client is done)."""
+        with self._lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # a socket already gone is the normal case here
+                pass
+
+    def _connection_locked(self) -> tuple[http.client.HTTPConnection, bool]:
+        """``(connection, reused)``. ``reused`` tells the caller a failure may just be staleness."""
+        conn = self._conn
+        if conn is not None:
+            return conn, True
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        self._conn = conn
+        return conn, False
+
     def _request(self, method: str, path: str, body: Any = None) -> Any:
+        method = method.upper()
         data = None
-        headers = {"accept": "application/json"}
+        headers = {"accept": "application/json", "connection": "keep-alive"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["content-type"] = "application/json"
-        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as res:
-                raw = res.read()
-        except urllib.error.HTTPError as err:
-            raw = err.read() if hasattr(err, "read") else b""
+        replay = method in _IDEMPOTENT
+        timeout = self.timeout
+        with self._lock:
+            for attempt in (0, 1):
+                conn, reused = self._connection_locked()
+                try:
+                    conn.request(method, path, body=data, headers=headers)
+                    res = conn.getresponse()
+                    raw = res.read()
+                except (http.client.HTTPException, OSError) as err:
+                    # A socket the server dropped while idle raises here. That is not the server
+                    # being down, so a reused connection is retried once; a failure on a *fresh*
+                    # connect (refused, timed out) is real and must stay ApiUnreachable.
+                    self._close_locked()
+                    if attempt == 0 and reused and replay:
+                        continue
+                    reason = getattr(err, "reason", None) or err
+                    if isinstance(err, TimeoutError) or "timed out" in str(reason):
+                        reason = f"timed out after {timeout:g}s"
+                    raise ApiUnreachable(str(reason)) from None
+                if res.status >= 400 or res.will_close:
+                    self._close_locked()
+                break
+        if res.status >= 400:
             payload = _maybe_json(raw)
-            message = (payload or {}).get("error") if isinstance(payload, dict) else None
-            raise ApiError(err.code, message or err.reason or "request failed", payload) from None
-        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as err:
-            reason = getattr(err, "reason", err)
-            raise ApiUnreachable(str(reason)) from None
+            message = payload.get("error") if isinstance(payload, dict) else None
+            raise ApiError(res.status, message or res.reason or "request failed", payload)
         payload = _maybe_json(raw)
         if payload is None:
             raise ApiError(200, f"non-JSON body from {path}", raw[:200])
