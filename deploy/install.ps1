@@ -519,12 +519,12 @@ if (Test-Path -LiteralPath $Launcher) {
         $lnk.WorkingDirectory = $Target
         $lnk.IconLocation = $IconTarget
         $lnk.Description = 'ShockBox - TUI supervisor'
-        $lnk.WindowStyle = 7
+        $lnk.WindowStyle = 1
         $lnk.Save()
         Note "created $LnkPath"
         Note "         -> $Launcher"
     } else {
-        Note "`$s = New-Object -ComObject WScript.Shell; `$l = `$s.CreateShortcut('$LnkPath'); `$l.TargetPath='$Launcher'; `$l.WorkingDirectory='$Target'; `$l.IconLocation='$IconTarget'; `$l.WindowStyle=7; `$l.Save()"
+        Note "`$s = New-Object -ComObject WScript.Shell; `$l = `$s.CreateShortcut('$LnkPath'); `$l.TargetPath='$Launcher'; `$l.WorkingDirectory='$Target'; `$l.IconLocation='$IconTarget'; `$l.WindowStyle=1; `$l.Save()"
     }
 } else {
     Write-Warning "launcher not found: $Launcher - no shortcut created; re-run the installer from a checkout that has deploy\ShockBox-TUI.cmd"
