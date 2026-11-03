@@ -1,22 +1,72 @@
-// Notification overlay — the phone strip. Runs as the page behind the 405×720 "Notifications"
-// browser source (`V: Main Live`).
+// Notification overlay — toasts on the full 16:9 surface, with an optional 9:16 stage. Runs as
+// the page behind the "Notifications" browser source.
 //
 // Contract with the server: one SSE stream on `notifications`. Every `snapshot` frame carries
 // the full live stack, so the page never has to merge deltas — it re-renders the difference.
-// Positions are server coordinates (x, y, w in the 405-wide canvas); the page scales by the
-// actual element size so a resolution change needs no code change.
+// The server records the column in a 405×720 reference canvas (x/y/w/h); this page scales that
+// record to the live stage box, so any surface size works and no fixed width survives here.
+// A 9:16 ratio narrows the stage in CSS to the centred height × 9/16 window, and the column
+// follows it on the same settings frame — live cards re-place, no reload.
 
 import { createPlayer, DEFAULT_NOTIFY_TONE } from '/mod/notifications/sound.mjs';
 
-const CANVAS_W = 405;
+// The canvas the server's records are expressed in. Only its height matters: every length on
+// the page is the record scaled by (live stage height / REF_H).
+const REF_H = 720;
 
 const root = document.getElementById('stage');
-const seen = new Map(); // id -> {el, view}
+const seen = new Map(); // id -> {el, sig, entity}
 let settings = { style: 'ios' };
+let ratio = '16:9';
 
 // The tone. One player per page, built from the notifications module's authored asset (so the
 // dialogs overlay shares the same code without either module naming the other's page).
 const player = createPlayer({ instrument: true });
+
+/* ---------------------------------------------------------------- stage geometry */
+
+// One measurement authority: the stage box OBS actually paints into. The 16:9 stage is the
+// whole surface; the 9:16 stage is the centred portrait window the CSS narrows it to, so the
+// same arithmetic lands the column inside that window with no special case here.
+function stageBox() {
+  const r = root.getBoundingClientRect();
+  return { w: r.width, h: r.height, s: r.height > 0 ? r.height / REF_H : 1 };
+}
+
+// Column geometry from the box, never from the viewport: the card keeps the reference band's
+// 12px side margin (381 of 405 wide) scaled to the surface height, capped by the stage width.
+function geometry(entity, box) {
+  const s = box.s;
+  const margin = 12 * s;
+  const w = Math.max(0, Math.min(381 * s, box.w - margin * 2));
+  return {
+    x: (box.w - w) / 2,
+    y: entity.y * s,
+    w,
+    h: Math.max(0, entity.h * s),
+  };
+}
+
+function place(view, box) {
+  const g = geometry(view.entity, box);
+  const st = view.el.style;
+  st.left = `${g.x}px`;
+  st.top = `${g.y}px`;
+  st.width = `${g.w}px`;
+  st.height = `${g.h}px`;
+}
+
+// The stage box changes on a surface resize and on a ratio flip (its CSS width is derived from
+// the height), so one observer covers both and re-places the live cards.
+function relayout() {
+  const box = stageBox();
+  if (!box.w || !box.h) return;
+  document.documentElement.style.setProperty('--scale', String(box.s));
+  for (const view of seen.values()) place(view, box);
+}
+
+const observer = new ResizeObserver(relayout);
+observer.observe(root);
 
 /** Settings document → player: on/off, volume, and the one clip to preload. */
 function syncSound(snapSettings) {
@@ -63,10 +113,6 @@ function glyph(style) {
 function render(entity) {
   const box = el('div', `toast ${CSS[entity.style] || 't-ios'}`);
   box.dataset.id = entity.id;
-  box.style.width = `${entity.w}px`;
-  box.style.height = `${entity.h}px`;
-  box.style.left = `${entity.x}px`;
-  box.style.top = `${entity.y}px`;
 
   // Header row: the app mark, then the label the OS prints beside it. The strip has no
   // app-name field, so the notification type stands in (Android and Windows hide it).
@@ -100,6 +146,15 @@ function apply(snap) {
   if (snap.stack) document.documentElement.style.setProperty('--row-h', `${snap.stack.height}px`);
   if (snap.settings) settings = snap.settings;
   if (snap.settings) syncSound(snap.settings);
+
+  // The ratio is resolved server-side (`default` follows the global wall ratio). Flipping it
+  // only changes the stage's width, which the observer turns into a re-place of every live card.
+  const nextRatio = snap.ratio === '9:16' ? '9:16' : '16:9';
+  if (nextRatio !== ratio) {
+    ratio = nextRatio;
+    document.documentElement.dataset.ratio = ratio;
+  }
+
   const live = new Map();
   for (const entity of snap.live || []) live.set(entity.id, entity);
 
@@ -117,8 +172,9 @@ function apply(snap) {
   for (const [id, entity] of live) {
     let view = seen.get(id);
     if (!view) {
-      view = { el: render(entity), sig: '' };
+      view = { el: render(entity), sig: '', entity };
       root.appendChild(view.el);
+      place(view, stageBox());
       player.sync([{ id, sound: 'notify', tone: settings && settings.tone }]);
       // Force layout before the enter class so the slide-in transition runs.
       void view.el.offsetWidth;
@@ -128,9 +184,8 @@ function apply(snap) {
     const sig = JSON.stringify([entity.text, entity.type, entity.title, entity.h, entity.w, entity.y, entity.style]);
     if (view.sig !== sig) {
       view.sig = sig;
-      view.el.style.top = `${entity.y}px`;
-      view.el.style.height = `${entity.h}px`;
-      view.el.style.width = `${entity.w}px`;
+      view.entity = entity;
+      place(view, stageBox());
       view.el.className = `toast ${CSS[entity.style] || 't-ios'} in`;
     }
   }

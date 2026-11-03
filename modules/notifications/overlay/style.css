@@ -18,10 +18,21 @@ body {
 
 #stage {
   position: absolute;
-  inset: 0;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 100%;
+  transform: translateX(-50%);
   overflow: hidden;
-  /* The stack is clamped server-side now; nothing may scroll inside the phone strip. */
+  /* The stack is clamped server-side now; nothing may scroll inside the strip. */
   pointer-events: none;
+}
+
+/* The stage is the only layout authority: 16:9 is the whole surface, 9:16 is the centred
+   portrait window of width height × 9/16. Toasts are clipped by it, so a wide frame never
+   leaks a portrait-only card. app.js measures this box and scales the column to it. */
+html[data-ratio='9:16'] #stage {
+  width: calc(100vh * 0.5625);
 }
 
 /* A toast is a two-column grid so both banner families are one DOM shape: iOS and macOS stack
@@ -31,6 +42,9 @@ body {
 .toast {
   position: absolute;
   display: grid;
+  /* Everything inside the card is sized in em of this one value, so the whole banner —
+     type, padding, icon, radius — scales with the surface instead of staying phone-sized. */
+  font-size: calc(13px * var(--scale, 1));
   grid-template-columns: auto minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr);
   grid-template-areas:
@@ -38,9 +52,9 @@ body {
     'title title'
     'text text';
   row-gap: 2px;
-  column-gap: 10px;
-  padding: 9px 12px;
-  border-radius: 16px;
+  column-gap: 0.77em;
+  padding: 0.69em 0.92em;
+  border-radius: 1.23em;
   overflow: hidden;
   pointer-events: auto;
   opacity: 0;
@@ -68,7 +82,7 @@ body {
   grid-area: head;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 0.54em;
   min-width: 0;
 }
 
@@ -77,20 +91,20 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
+  width: 1.69em;
+  height: 1.69em;
+  border-radius: 0.46em;
 }
 
 .glyph {
-  width: 14px;
-  height: 14px;
+  width: 1.08em;
+  height: 1.08em;
   fill: currentColor;
 }
 
 .app {
   min-width: 0;
-  font-size: 11px;
+  font-size: 0.85em;
   font-weight: 500;
   letter-spacing: 0.01em;
   opacity: 0.62;
@@ -101,7 +115,7 @@ body {
 
 .title {
   grid-area: title;
-  font-size: 13px;
+  font-size: 1em;
   line-height: 1.2;
   font-weight: 600;
   letter-spacing: 0.005em;
@@ -113,7 +127,7 @@ body {
 .text {
   grid-area: text;
   min-height: 0;
-  font-size: 12.5px;
+  font-size: 0.96em;
   line-height: 1.3;
   /* Long messages clamp rather than resize the row: the height comes from the server. */
   display: -webkit-box;
@@ -135,8 +149,8 @@ body {
     'text text';
   background: rgba(249, 249, 251, 0.94);
   color: #0b0b0d;
-  border-radius: 20px;
-  padding: 9px 13px;
+  border-radius: 1.54em;
+  padding: 0.69em 1em;
   font-family: -apple-system, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
   -webkit-backdrop-filter: blur(22px) saturate(180%);
   backdrop-filter: blur(22px) saturate(180%);
@@ -162,25 +176,25 @@ body {
 }
 
 .t-ios .lead {
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
+  width: 1.54em;
+  height: 1.54em;
+  border-radius: 0.46em;
   background: linear-gradient(160deg, #6fc4ff, #0a7cff);
   color: #fff;
 }
 
 .t-ios .glyph {
-  width: 12px;
-  height: 12px;
+  width: 0.92em;
+  height: 0.92em;
 }
 
 .t-ios .app {
-  font-size: 10.5px;
+  font-size: 0.81em;
   opacity: 0.58;
 }
 
 .t-ios .title {
-  font-size: 13.5px;
+  font-size: 1.04em;
   font-weight: 700;
 }
 
@@ -197,8 +211,8 @@ body {
     'head text';
   background: #f1ecf6;
   color: #1d1b20;
-  border-radius: 16px;
-  padding: 10px 12px;
+  border-radius: 1.23em;
+  padding: 0.77em 0.92em;
   font-family: Roboto, 'Segoe UI', system-ui, sans-serif;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.16);
 }
@@ -212,8 +226,8 @@ body {
 }
 
 .t-android .lead {
-  width: 24px;
-  height: 24px;
+  width: 1.85em;
+  height: 1.85em;
   border-radius: 50%;
   background: #e8def8;
   color: #4a4459;
@@ -221,7 +235,7 @@ body {
 
 .t-android .title {
   font-weight: 500;
-  font-size: 13px;
+  font-size: 1em;
 }
 
 .t-android .text {
@@ -238,8 +252,8 @@ body {
   background: rgba(243, 243, 243, 0.78);
   color: #1a1a1a;
   border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 8px;
-  padding: 10px 12px;
+  border-radius: 0.62em;
+  padding: 0.77em 0.92em;
   font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
   -webkit-backdrop-filter: blur(30px) saturate(150%);
   backdrop-filter: blur(30px) saturate(150%);
@@ -257,9 +271,9 @@ body {
 }
 
 .t-win11 .lead {
-  width: 22px;
-  height: 22px;
-  border-radius: 4px;
+  width: 1.69em;
+  height: 1.69em;
+  border-radius: 0.31em;
   background: transparent;
   color: #0067c0;
 }
@@ -276,8 +290,8 @@ body {
 .t-macos {
   background: rgba(246, 246, 248, 0.88);
   color: #141416;
-  border-radius: 16px;
-  padding: 9px 13px;
+  border-radius: 1.23em;
+  padding: 0.69em 1em;
   font-family: -apple-system, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
   -webkit-backdrop-filter: blur(26px) saturate(180%);
   backdrop-filter: blur(26px) saturate(180%);
@@ -288,20 +302,20 @@ body {
 }
 
 .t-macos .lead {
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
+  width: 1.54em;
+  height: 1.54em;
+  border-radius: 0.46em;
   background: linear-gradient(160deg, #ffd08a, #ff8a3d);
   color: #fff;
 }
 
 .t-macos .glyph {
-  width: 12px;
-  height: 12px;
+  width: 0.92em;
+  height: 0.92em;
 }
 
 .t-macos .app {
-  font-size: 10.5px;
+  font-size: 0.81em;
   opacity: 0.6;
 }
 

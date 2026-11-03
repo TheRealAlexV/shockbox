@@ -1,13 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-ratio="16:9">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=405, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ShockBox · Notifications</title>
     <link rel="stylesheet" href="/notify/style.css" />
     <style>
-      /* OBS renders this page at exactly the browser source size (405×720 at 1:1). No body
-         background: the strip must be transparent so only the toasts show. */
+      /* OBS renders this page at whatever size the browser source is given, so the viewport is
+         never pinned to a phone canvas. No body background: the surface stays transparent and
+         only the toasts show. The stage centres itself for a 9:16 ratio. */
       body {
         background: transparent;
       }

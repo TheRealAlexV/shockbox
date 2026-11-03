@@ -7,7 +7,7 @@ import { DEFAULT_NOTIFY_TONE } from './sound.mjs';
 // Notifications module — the toast side of the popup feature.
 //
 // Scope (deliberately narrow):
-//   • spawn / auto-close / clear the notification stack on the phone strip
+//   • spawn / auto-close / clear the notification stack on the toast surface
 //   • storm (fill or random) over notification messages that the pool marks `storm`
 //   • its own look: style, height, auto-close, sound
 // Everything about messages (ids, text, tags, eligibility) belongs to core/pool.mjs, which the
@@ -63,7 +63,7 @@ export default {
 
   init(ctx) {
     this.ctx = ctx;
-    this.state = createNotifyState({ settings: ctx.settings, log: ctx.log });
+    this.state = createNotifyState({ settings: ctx.settings, core: ctx.core, fs: ctx.fs, log: ctx.log });
     this.settings = ctx.settings;
     this.pool = ctx.pool;
     this.events = ctx.events;
@@ -113,6 +113,16 @@ export default {
     return normalizeConfig(this.settings.get('randomConfig'));
   },
 
+  /**
+   * The settings document plus the one derived value a page needs: `ratio` is declared as
+   * `default`, but the stage has to know whether that resolved to 16:9 or 9:16 right now.
+   */
+  settingsPayload() {
+    const out = this.settings.describe();
+    if (out.ratio) out.ratio.effective = this.state.effectiveRatio();
+    return out;
+  },
+
   pickEligible() {
     const list = matchingMessages(this.pool.eligible('notification'), this.randomConfig());
     if (!list.length) return null;
@@ -134,7 +144,7 @@ export default {
         method: 'GET',
         path: '/live',
         handler() {
-          return { ok: true, ...mod.state.snapshot('read'), settings: S().describe() };
+          return { ok: true, ...mod.state.snapshot('read'), settings: mod.settingsPayload() };
         },
       },
       {
@@ -223,12 +233,12 @@ export default {
           const changed = S().patch(body || {});
           if (changed.length) {
             mod.push('control');
-            // Height changes reflow the stack.
-            if (changed.includes('height') || changed.includes('style')) {
+            // Height and stage changes reflow the stack (and move the 9:16 window).
+            if (changed.includes('height') || changed.includes('style') || changed.includes('ratio')) {
               mod.events.emit('notifications', 'relayout', mod.state.snapshot('settings'));
             }
           }
-          return { ok: true, changed, settings: S().describe() };
+          return { ok: true, changed, settings: mod.settingsPayload(), ratio: mod.state.effectiveRatio() };
         },
       },
     ];

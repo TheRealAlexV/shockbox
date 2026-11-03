@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "order": 20,
   "icon": "bell",
-  "description": "Toasts on the phone strip: stack from the top, slide in, auto-close. Messages come from the shared pool.",
+  "description": "Toasts on the 16:9 surface, with a centred 9:16 stage: stack from the top, slide in, auto-close. Messages come from the shared pool.",
   "channels": ["notifications"],
   "mount": "routes.js",
   "ui": {
@@ -12,6 +12,14 @@
     "style": "ui/pane.css"
   },
   "settings": {
+    "ratio": {
+      "type": "enum",
+      "default": "default",
+      "values": ["default", "16:9", "9:16"],
+      "label": "Stage ratio",
+      "group": "ratio",
+      "help": "default follows the global wall ratio. 9:16 draws the centred portrait window inside the 16:9 page; 16:9 uses the whole frame."
+    },
     "style": { "type": "enum", "default": "ios", "values": ["ios", "android", "win11", "macos"], "label": "Look" },
     "height": { "type": "number", "default": 76, "min": 48, "max": 160, "integer": true, "label": "Height (px)" },
     "autoCloseMs": { "type": "number", "default": 12000, "min": 0, "max": 120000, "integer": true, "label": "Auto-close (ms, 0 = never)" },
