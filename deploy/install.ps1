@@ -23,7 +23,10 @@
   Install directory. Default C:\OBS\ShockBox.
 
 .PARAMETER Source
-  Repo checkout to copy from. Default: the parent of this script's folder.
+  Repo checkout to copy from. Default: the parent of this script's folder. A
+  \\wsl.localhost (or \\wsl$) path is fine: it is normalised, and the tree is
+  copied with Copy-Item instead of robocopy, which rejects the WSL share's
+  provider-qualified form with exit 16.
 
 .PARAMETER PythonExe
   Interpreter used to create the TUI virtualenv. Default: auto-detect py -3, then
@@ -31,8 +34,9 @@
 
 .PARAMETER WhatIf
   Print every write, copy and COM call without doing any of them. The read-only
-  actions it still takes are checking that node.exe exists and probing for a
-  Python to report.
+  actions it still takes are checking that node.exe exists, probing for a Python
+  to report, and surveying the running processes it would stop - the survey names
+  each matched pid and command line, so this is a real dry run.
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install.ps1 -WhatIf
@@ -52,12 +56,59 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# The survey below runs even under -WhatIf, so CimCmdlets gets autoloaded inside a WhatIf
+# scope: Import-Module then reports creating each of its gcim/scim aliases, 13 lines of noise
+# in the middle of the dry run. Load it once with WhatIf off; the cmdlets stay available.
+if ($WhatIfPreference) {
+    $WhatIfPreference = $false
+    Import-Module CimCmdlets -ErrorAction SilentlyContinue
+    Import-Module NetTCPIP -ErrorAction SilentlyContinue
+    $WhatIfPreference = $true
+}
+
 function Step([string]$Message) { Write-Host "==> $Message" }
 function Note([string]$Message) { Write-Host "    $Message" }
 
+function Resolve-SourcePath([string]$Path) {
+    # Resolve-Path on a UNC path hands back a provider-qualified string
+    # ('Microsoft.PowerShell.Core\FileSystem::\\wsl.localhost\...'), and robocopy rejects that
+    # with exit 16, "The specified path is invalid", copying nothing. FullName never carries
+    # the provider prefix; the replace also cleans a path pasted back out of an error message.
+    $resolved = $Path
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($item) { $resolved = $item.FullName }
+    return ($resolved -replace '^Microsoft\.PowerShell\.Core\\FileSystem::', '')
+}
+
+function Test-WslUncPath([string]$Path) {
+    # A WSL share (\\wsl.localhost\Ubuntu, \\wsl$, \\wsl) is not a real SMB share: robocopy
+    # only ever saw it in the provider-qualified form that it rejects with exit 16. So a WSL
+    # source takes the Copy-Item path, which goes through the ordinary Win32 file API - see
+    # Copy-TreeFallback.
+    return ($Path -match '^\\\\wsl(\$|\.localhost)?\\')
+}
+
+function Copy-TreeFallback([string]$From, [string]$To, [string[]]$SkipDirs, [string[]]$SkipFiles) {
+    # The robocopy line, without robocopy: same excluded directories and files, recursion done
+    # here because Copy-Item -Recurse cannot filter what it descends into (a nested .venv would
+    # be copied and its Linux symlinks fail on Windows). Never a mirror: nothing in the target
+    # is deleted.
+    if (-not (Test-Path -LiteralPath $To)) { New-Item -ItemType Directory -Force -Path $To | Out-Null }
+    foreach ($child in @(Get-ChildItem -LiteralPath $From -Force)) {
+        $name = $child.Name
+        if ($child.PSIsContainer) {
+            if ($SkipDirs -contains $name) { continue }
+            Copy-TreeFallback -From $child.FullName -To (Join-Path $To $name) -SkipDirs $SkipDirs -SkipFiles $SkipFiles
+        } else {
+            if (@($SkipFiles | Where-Object { $name -like $_ }).Count -gt 0) { continue }
+            Copy-Item -LiteralPath $child.FullName -Destination (Join-Path $To $name) -Force
+        }
+    }
+}
+
 # ---- resolve the source tree -------------------------------------------------
 if (-not $Source) { $Source = Split-Path -Parent $PSScriptRoot }
-$Source = (Resolve-Path -LiteralPath $Source).Path
+$Source = Resolve-SourcePath $Source
 if (-not (Test-Path -LiteralPath (Join-Path $Source 'server.mjs'))) {
     throw "Not a ShockBox checkout: $Source has no server.mjs"
 }
@@ -79,14 +130,16 @@ if (-not (Test-Path -LiteralPath $NodeExe)) {
 # TUI's job now, but a stop still belongs here, before the copy: the tree must
 # not be rewritten under a live server.
 #
-# Three things can be running the old code, and each is found by evidence:
+# Four things can be running the old code, and each is found by evidence:
 #   1. the TUI supervisor, by its published state: a live `supervisor.pid` (or the
 #      `supervisor_pid` in status.json) plus a heartbeat younger than 10s. It is asked to shut
 #      down over its control path, not killed, so it takes its server down in order. Its command
 #      line is deliberately not evidence - a wrapper, a relaunch or `python -m` hides it.
 #   2. the legacy run.cmd launcher loop (cmd.exe), by command line.
 #   3. the node holding the port, only if its command line runs *our* server.mjs.
-# The supervisor may have started the server through run.cmd, so 2 and 3 run
+#   4. the same node found by command line alone, for the rig where the listener's owning pid
+#      is reported as 0 and the server's own command line says `server.mjs`, not its full path.
+# The supervisor may have started the server through run.cmd, so 2 to 4 run
 # after 1 either way - killing a child before its parent spares nothing.
 function Get-ListenerPid([int]$Port) {
     try {
@@ -115,6 +168,22 @@ function Get-ProcessTable {
     } catch {
         return @()
     }
+}
+
+function Get-NodeProcess([string]$AppDir, [int]$Port, $Table) {
+    # The port's owning pid is not evidence on this rig: netstat -ano and Get-NetTCPConnection
+    # both report the 8972 listener as pid 0, so Test-IsOurs declines. The server is started
+    # with a bare relative 'server.mjs', so its command line does not name the script either -
+    # it names the install dir in --state/--log-dir instead. That, or this port, is the rule:
+    # a process is stopped only when its own command line claims this install or this port.
+    $dir = [regex]::Escape($AppDir.TrimEnd('\')) + '(?=[\\"\s]|$)'
+    $portArg = '--port(=|\s+)"?' + $Port + '\b'
+    return @(foreach ($p in $Table) {
+        if ($p.Name -ne 'node.exe') { continue }
+        if (-not $p.CommandLine) { continue }
+        if ([int]$p.ProcessId -eq $PID) { continue }
+        if ($p.CommandLine -match $dir -or $p.CommandLine -match $portArg) { $p }
+    })
 }
 
 function Read-RuntimePid([string]$Path) {
@@ -246,26 +315,68 @@ function Send-SupervisorShutdown([string]$AppDir, $Table) {
 Step 'stop'
 $stopped = @()
 $AppDir = $Target
-if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launcher loop and the node serving the port')) {
-    $table = Get-ProcessTable
 
-    # 1. the TUI supervisor: ask, then insist. The evidence is its published state (live pid,
-    #    fresh heartbeat); a command line is used only to reject a pid that was reused, never to
-    #    require one - see Get-SupervisorState.
-    $state = Get-SupervisorState $AppDir $table
-    $sup = @()
-    if ($state.Alive -and $state.Pid -gt 0) { $sup += $state.Pid }
-    if ($state.Alive) {
-        if ($sup.Count -gt 0) {
-            Note ("TUI supervisor running as pid " + ($sup -join ', ') + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
-        } else {
-            Note ("TUI supervisor running but its pid is not published (" + $state.Why + ", heartbeat $($state.Age)s old)")
-        }
+# Everything above the ShouldProcess guard only reads: it works out what is running and prints
+# the pids and command lines it would stop. That is what makes -WhatIf a real dry run, and it
+# is why the survey is out here instead of inside the guard.
+$table = Get-ProcessTable
+
+# 1. the TUI supervisor: ask, then insist. The evidence is its published state (live pid,
+#    fresh heartbeat); a command line is used only to reject a pid that was reused, never to
+#    require one - see Get-SupervisorState.
+$state = Get-SupervisorState $AppDir $table
+$sup = @()
+if ($state.Alive -and $state.Pid -gt 0) { $sup += $state.Pid }
+if ($state.Alive) {
+    if ($sup.Count -gt 0) {
+        Note ("TUI supervisor running as pid " + ($sup -join ', ') + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
     } else {
-        Note ("no TUI supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
+        Note ("TUI supervisor running but its pid is not published (" + $state.Why + ", heartbeat $($state.Age)s old)")
     }
+} else {
+    Note ("no TUI supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
+}
+
+# 2. the legacy launcher loop (cmd.exe) survives its parent, and its child
+# node is the process holding the port. Kill the loop first, or node comes
+# back. Lazily-evaluated because the target's cmd may run from a copied folder
+# whose path differs only by case (it does: 'shockbox' vs 'ShockBox').
+$loops = @($table | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -and $_.CommandLine -match 'run\.cmd' -and $_.CommandLine -match [regex]::Escape($AppDir) })
+foreach ($loop in $loops) { Note "launcher pid $($loop.ProcessId): $($loop.CommandLine)" }
+
+# 3. the port's listener, under the evidence rule. On this rig both netstat -ano and
+# Get-NetTCPConnection report the port's owner as pid 0, so this finds nothing and 4 does the
+# work; it still catches a foreign process that does name itself.
+$listeners = @(Get-ListenerPid $Port)
+$oursOnPort = @()
+foreach ($listener in $listeners) {
+    if ($listener -le 0) { continue }
+    if (Test-IsOurs $listener $AppDir) {
+        $oursOnPort += $listener
+        Note "server pid $listener listens on port $Port"
+    } elseif ($listener -eq 4) {
+        Write-Warning "port $Port is held by the HTTP.sys service (pid 4), not ShockBox - leaving it"
+    } else {
+        $line = ($table | Where-Object { $_.ProcessId -eq $listener }).CommandLine
+        Write-Warning "port $Port is held by pid $listener which is not this install ($line) - leaving it; the next start will report EADDRINUSE"
+    }
+}
+if ($listeners.Count -gt 0 -and @($listeners | Where-Object { $_ -gt 0 }).Count -eq 0) {
+    Note "port $Port listener reports pid 0 (owner not published) - matching node.exe by command line"
+}
+
+# 4. node.exe by command line. The listener's pid is not evidence here, and the server is
+# started with a bare relative 'server.mjs', so Test-IsOurs cannot see it either. A process is
+# ours when its own command line names this install dir or this port. Nothing else is stopped.
+$nodes = @(Get-NodeProcess $AppDir $Port $table)
+foreach ($n in $nodes) { Note ("node.exe pid " + $n.ProcessId + ": " + $n.CommandLine) }
+if ($nodes.Count -eq 0) { Note "no node.exe names $AppDir or --port $Port" }
+
+if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launcher loop and the node serving the port')) {
+    $asked = $false
     if ($sup.Count -gt 0) {
         if (Send-SupervisorShutdown $AppDir $table) {
+            $asked = $true
             Note 'asked the supervisor to shut down'
             for ($i = 0; $i -lt 20; $i++) {
                 if (-not ($sup | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })) { break }
@@ -284,36 +395,59 @@ if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launc
         }
     }
 
-    # 2. the legacy launcher loop (cmd.exe) survives its parent, and its child
-    # node is the process holding the port. Kill the loop first, or node comes
-    # back. Lazily-evaluated because the target's cmd may run from a copied folder
-    # whose path differs only by case (it does: 'shockbox' vs 'ShockBox').
-    $loops = @(Get-ProcessTable | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -and $_.CommandLine -match 'run\.cmd' -and $_.CommandLine -match [regex]::Escape($AppDir) })
     foreach ($loop in $loops) {
         Stop-Process -Id $loop.ProcessId -Force -ErrorAction SilentlyContinue
         Note "stopped launcher pid $($loop.ProcessId)"
         $stopped += "launcher $($loop.ProcessId)"
     }
 
-    # 3. the port's listener, under the evidence rule.
-    foreach ($listener in @(Get-ListenerPid $Port)) {
-        if (Test-IsOurs $listener $AppDir) {
-            Stop-Process -Id $listener -Force -ErrorAction SilentlyContinue
-            Note "stopped server pid $listener (port $Port)"
-            $stopped += "server $listener"
-        } elseif ($listener -eq 4) {
-            Write-Warning "port $Port is held by the HTTP.sys service (pid 4), not ShockBox - leaving it"
-        } else {
-            $line = (Get-CimInstance Win32_Process -Filter "ProcessId = $listener" -ErrorAction SilentlyContinue).CommandLine
-            Write-Warning "port $Port is held by pid $listener which is not this install ($line) - leaving it; the next start will report EADDRINUSE"
+    foreach ($listener in @($oursOnPort | Where-Object { $nodes.ProcessId -notcontains $_ })) {
+        Stop-Process -Id $listener -Force -ErrorAction SilentlyContinue
+        Note "stopped server pid $listener (port $Port)"
+        $stopped += "server $listener"
+    }
+
+    if ($nodes.Count -gt 0) {
+        # Politeness first: a supervisor that was not already asked above may still be the
+        # parent, and its shutdown takes the server down in order rather than yanking it.
+        if (-not $asked -and (Send-SupervisorShutdown $AppDir $table)) {
+            Note 'asked the supervisor to shut down'
+            Start-Sleep -Milliseconds 500
+        }
+        $ids = @($nodes | ForEach-Object { [int]$_.ProcessId })
+        $left = @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($left.Count -gt 0) {
+            Stop-Process -Id $left -ErrorAction SilentlyContinue
+            # Bounded wait: five seconds, a look every 150ms. A hung server must not keep the
+            # tree open while it is rewritten, so survivors are forced at the end.
+            $deadline = (Get-Date).AddSeconds(5)
+            while ($left.Count -gt 0 -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 150
+                $left = @($left | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+            }
+        }
+        if ($left.Count -gt 0) {
+            Stop-Process -Id $left -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 300
+        }
+        foreach ($id in $ids) {
+            if (Get-Process -Id $id -ErrorAction SilentlyContinue) {
+                Write-Warning "node.exe pid $id survived Stop-Process -Force"
+            } else {
+                $how = if ($left -contains $id) { ' (forced)' } else { '' }
+                Note "stopped server pid $id$how"
+                $stopped += "server $id"
+            }
         }
     }
 
+    # A pid can be both the published listener and a command-line match; report it once.
+    $stopped = @($stopped | Select-Object -Unique)
     if ($stopped.Count -eq 0) { Note 'nothing was running' }
     Start-Sleep -Milliseconds 700
 } else {
-    Note 'send "shutdown" to the TUI supervisor (the live pid in %LOCALAPPDATA%\ShockBox\runtime\supervisor.pid with a fresh heartbeat, or the supervisor_pid in status.json);'
-    Note "then stop the run.cmd launcher loop and the node serving $Port (only if its command line runs $AppDir\server.mjs)"
+    Note 'nothing was stopped (WhatIf)'
+    Note 'to do it by hand: send "shutdown" to the live supervisor, end the run.cmd loop, then stop the node whose command line names this install dir or this port'
 }
 
 # ---- 1. directories ----------------------------------------------------------
@@ -331,28 +465,44 @@ foreach ($sub in @('', 'state', 'logs', 'backups')) {
 # exit codes (0-7 = success; 8+ = failure). NOT /MIR: mirrors would delete the
 # live state and logs sitting in the target. .tui-venv is excluded on the source
 # side so a checkout that has one never copies its absolute paths onto the rig.
-$excludedDirs = @('.git', 'state-dev', 'node_modules', 'backups', '.cocoindex_code', '.openchamber', '.opencode', '.cortexkit', 'captures', '.tui-venv')
+# A \\wsl... source is the exception: Copy-Item, see Test-WslUncPath.
+$excludedDirs = @('.git', 'state-dev', 'node_modules', 'backups', '.cocoindex_code', '.openchamber', '.opencode', '.cortexkit', 'captures', '.tui-venv', '.venv')
 $excludedFiles = @('*.log', '*.log.1', 'config.json', 'config.local.json')
 
 # One /XD and one /XF, each followed by its own list: repeated switches re-parse
 # differently from run to run, a single switch with a list is stable. The source's
 # .git and the target's state/logs are separate /XD lists, chained by name too.
-$roboArgs = @(
-    $Source, $Target,
-    '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:2', '/W:2', '/NJH', '/NJS', '/NP', '/NDL', '/XJ',
-    '/XF') + $excludedFiles
-$roboArgs += @('/XD') + ($excludedDirs | ForEach-Object { Join-Path $Source $_ }) +
-             @((Join-Path $Target 'state'), (Join-Path $Target 'logs'), (Join-Path $Target 'backups'))
+$useCopyItem = Test-WslUncPath $Source
+if (-not $useCopyItem) {
+    $roboArgs = @(
+        $Source, $Target,
+        '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:2', '/W:2', '/NJH', '/NJS', '/NP', '/NDL', '/XJ',
+        '/XF') + $excludedFiles
+    $roboArgs += @('/XD') + ($excludedDirs | ForEach-Object { Join-Path $Source $_ }) +
+                 @((Join-Path $Target 'state'), (Join-Path $Target 'logs'), (Join-Path $Target 'backups'))
+}
 
-if ($PSCmdlet.ShouldProcess($Target, 'copy the tree (robocopy /E, excluding .git state-dev node_modules backups .tui-venv)')) {
+if ($PSCmdlet.ShouldProcess($Target, 'copy the tree (excluding .git state-dev node_modules backups .tui-venv .venv)')) {
     Step 'copy'
-    & robocopy.exe @roboArgs | Out-Null
-    $code = $LASTEXITCODE
-    if ($code -ge 8) { throw "robocopy failed with exit code $code" }
-    Note "robocopy exit $code"
+    if ($useCopyItem) {
+        # \\wsl... sources: Copy-Item. Same exclusions, by name, and the target's own state,
+        # logs and backups are skipped too so a dev checkout's working state never lands on
+        # the rig's live one.
+        Copy-TreeFallback -From $Source -To $Target -SkipDirs ($excludedDirs + @('state', 'logs')) -SkipFiles $excludedFiles
+        Note 'copied with Copy-Item (WSL share)'
+    } else {
+        & robocopy.exe @roboArgs | Out-Null
+        $code = $LASTEXITCODE
+        if ($code -ge 8) { throw "robocopy failed with exit code $code" }
+        Note "robocopy exit $code"
+    }
 } else {
     Step 'copy (WhatIf)'
-    Note ("robocopy " + ($roboArgs -join ' '))
+    if ($useCopyItem) {
+        Note ("copy $Source -> $Target with Copy-Item (WSL share; skipping " + (($excludedDirs + @('state', 'logs')) -join ' ') + ")")
+    } else {
+        Note ("robocopy " + ($roboArgs -join ' '))
+    }
 }
 
 # ---- 3. migrate off the scheduled task ---------------------------------------
