@@ -19,6 +19,7 @@
 
 import { Tracker, syntheticHands } from '../engine/tracker.js';
 import { createPublisher } from './publish.js';
+import { createRelay } from './relay.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
 import { FxRenderer, EFFECTS, anchorsFrom } from '../engine/fx.js';
 
@@ -59,6 +60,10 @@ const state = {
   // enumerate | getUserMedia | track | timeout. Cleared the moment a camera track runs.
   cameraError: null,
   cameraLabel: null, // the label of the device the camera actually opened; null until one does
+  // Where the frames actually come from: relay | device | synthetic | none.
+  cameraSource: 'none',
+  // Why the relay is not the source (string or null), reported next to cameraError.
+  relayError: null,
   effect: null,
   model: 'idle',
   hands: 0,
@@ -76,6 +81,16 @@ const state = {
 
 const fx = new FxRenderer(canvas, { onError: (msg) => setBanner(`Effects unavailable: ${msg}`, 'bad') });
 const tracker = new Tracker({ onFrame: onFrame, onState: onTrackerState });
+// The relayed camera: the server's ffmpeg feed of the WebcamSwitcher virtual camera. The page
+// cannot open that device itself (WebcamSwitcher holds it), so it reads the MJPEG stream instead
+// and feeds each decoded frame to the tracker's own detect path.
+const relay = createRelay({
+  onFrame: (bitmap) => tracker.pushFrame(bitmap),
+  onState: (s) => {
+    state.relayError = s.error || null;
+    renderState();
+  },
+});
 // The virtual camera's feed: only runs when the server says `publish` is not `off`.
 const publisher = createPublisher({
   video: () => tracker.video,
@@ -304,9 +319,10 @@ function fallBackToSynthetic() {
 
 /**
  * The load attempt, and the one retry when the page is shown again. No gesture, no click: a page
- * nobody can click (an OBS browser source) still asks for the camera. Enumerate first, so a
- * machine with no video input is reported as such instead of prompting for a device it lacks.
- * Two attempts at most, at least 5 s apart, never in a loop.
+ * nobody can click (an OBS browser source) still asks for the camera. `startTracking` tries the
+ * server's relay first and enumerates only for the device path, so a machine whose camera belongs
+ * to another app is never reported as having none. Two attempts at most, at least 5 s apart, never
+ * in a loop.
  */
 const AUTO_CAM_ATTEMPTS = 2;
 const AUTO_CAM_GAP = 5000;
@@ -316,29 +332,14 @@ async function autoCamera() {
   if (autoCam.busy || autoCam.attempts >= AUTO_CAM_ATTEMPTS) return false;
   if (document.visibilityState !== 'visible') return false;
   if (state.tracking && !state.synthetic) return false; // a camera already owns the page
-  // Nowhere for a camera to open: boot already said why, and asking would only relabel it.
-  if (!window.isSecureContext || !navigator.mediaDevices?.enumerateDevices) return false;
   const now = Date.now();
   if (autoCam.lastAt && now - autoCam.lastAt < AUTO_CAM_GAP) return false;
   autoCam.attempts += 1;
   autoCam.lastAt = now;
   autoCam.busy = true;
   try {
-    let devices = [];
-    try {
-      devices = (await navigator.mediaDevices.enumerateDevices()) || [];
-    } catch (err) {
-      setCameraError('enumerate', err && err.name, err && err.message);
-    }
-    if (!devices.some((d) => d.kind === 'videoinput')) {
-      if (!state.cameraError) {
-        setCameraError('enumerate', 'NoCamera', 'No video input device is present — drawing on synthetic hands.');
-        setBanner('No camera device — drawing on synthetic hands', 'warn');
-      }
-      return false;
-    }
     userStopped = false;
-    camAttempted = true;
+    // Relay first, device second, synthetic last: all of it inside startTracking/openDevice.
     await startTracking();
     if (state.tracking && !state.synthetic) return true;
     fallBackToSynthetic();
@@ -348,6 +349,56 @@ async function autoCamera() {
     renderState();
     ack();
   }
+}
+
+/**
+ * The relayed camera, tried before the device: the one camera on this machine belongs to
+ * WebcamSwitcher, and getUserMedia here only ever fails. `true` means either relay frames are
+ * tracking, or the relay is up and its failure is the model's — a device attempt cannot help
+ * with either, so the caller must not make one.
+ */
+async function startRelay(opts) {
+  camAttempted = true; // a relay failure is a camera failure: the synthetic rig gets the view back
+  const live = await relay.start();
+  if (!live) {
+    state.relayError = relay.reason() || 'relay: no frames';
+    if (state.cameraSource === 'relay') state.cameraSource = 'none';
+    return false;
+  }
+  const snap = await tracker.startRelay(opts);
+  if (snap.state !== 'running') {
+    state.relayError = snap.error || 'relay: tracking did not start';
+    state.error = snap.error;
+    state.camera = 'error';
+    return true;
+  }
+  state.relayError = null;
+  state.error = null;
+  state.cameraSource = 'relay';
+  return true;
+}
+
+/**
+ * The device path, unchanged in behaviour: one enumerate so a machine with no video input is
+ * reported as such instead of prompting for a device it lacks, then the tracker's getUserMedia.
+ * Only reached when the relay is unavailable.
+ */
+async function openDevice(opts) {
+  let devices = [];
+  try {
+    devices = (await navigator.mediaDevices?.enumerateDevices?.()) || [];
+  } catch (err) {
+    setCameraError('enumerate', err && err.name, err && err.message);
+  }
+  if (navigator.mediaDevices && !devices.some((d) => d.kind === 'videoinput')) {
+    if (!state.cameraError) {
+      setCameraError('enumerate', 'NoCamera', 'No video input device is present — drawing on synthetic hands.');
+      setBanner('No camera device — drawing on synthetic hands', 'warn');
+    }
+    return null;
+  }
+  camAttempted = true;
+  return tracker.start(opts);
 }
 
 async function startTracking({ fromBus = false, synthetic = false } = {}) {
@@ -377,8 +428,14 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
     tracker.startSynthetic();
     return;
   }
-  camAttempted = true;
-  const snap = await tracker.start(opts);
+  // Relay first: on the rig the camera belongs to WebcamSwitcher, so it cannot be opened here.
+  if (await startRelay(opts)) return;
+  const snap = await openDevice(opts);
+  if (!snap) {
+    state.camera = state.cameraError ? 'error' : 'off';
+    renderState();
+    return;
+  }
   if (snap.state === 'error') {
     state.camera = snap.error && /denied/i.test(snap.error) ? 'denied' : 'error';
     state.error = snap.error;
@@ -387,6 +444,7 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
   } else if (snap.state === 'running' && snap.source === 'camera') {
     // The device this page actually opened, not the one the settings asked for.
     state.cameraLabel = snap.deviceLabel || null;
+    state.cameraSource = 'device';
   }
 }
 
@@ -394,6 +452,8 @@ function stopTracking({ manual = true, keepView = false } = {}) {
   if (manual) userStopped = true;
   camWasLive = false;
   tracker.stop();
+  relay.stop();
+  state.cameraSource = 'none';
   state.tracking = false;
   state.synthetic = false; // the rig's frame loop is gone with the tracker; the flag goes with it
   state.camera = 'off';
@@ -421,6 +481,7 @@ function ensureSyntheticAnchors() {
   if (tracker.state !== 'running' || tracker.source !== 'synthetic') tracker.startSynthetic();
   state.synthetic = true;
   state.tracking = true;
+  state.cameraSource = 'synthetic';
   // Fill the view in this same tick, so a command fired now draws on the very next frame instead
   // of on the first frame of the synthetic loop.
   onFrame({ hands: syntheticHands(performance.now() / 1000), width: 640, height: 480, source: 'synthetic', at: performance.now() });
@@ -433,6 +494,10 @@ function onTrackerState(snap) {
   // Where the frames come from, taken from the tracker rather than remembered: a stopped tracker
   // is a stopped rig, and treating it as running is how the page went quiet while it still drew.
   state.synthetic = snap.state === 'running' && snap.source === 'synthetic';
+  // Relay and device both report camera anchors; the feed says which pipe carried them.
+  if (snap.state === 'running' && snap.source === 'camera') {
+    state.cameraSource = snap.feed === 'relay' ? 'relay' : 'device';
+  }
   // The overlay's start is the operator's action for the bus: a deck key may start a session the
   // operator has just opened this page for, and may never open a camera on its own. The synthetic
   // rig is not a start — it runs from load and must not arm the bus.
@@ -652,6 +717,10 @@ function ack(now = performance.now()) {
       // Why the camera did not open (object or null) and the label it did open (string or null).
       cameraError: state.cameraError,
       cameraLabel: state.cameraLabel,
+      // Which pipe is carrying the frames (relay | device | synthetic | none) and why the relay is
+      // not it (string or null). Both are status, not frame data.
+      cameraSource: state.cameraSource,
+      relayError: state.relayError,
       // The mask's receipt time, so the server's status can say "mask arriving" without a frame
       // ever leaving this page. `body` also lets the pane name the body effects honestly.
       maskAt: state.bodySeen ? state.bodyAt : 0,
@@ -672,7 +741,7 @@ function renderState(now = performance.now()) {
   const bits = [];
   if (state.settings?.enabled === false) bits.push('effects off');
   if (state.synthetic) bits.push('SYNTHETIC replay — no camera, not tracking');
-  else if (state.tracking) bits.push(`tracking · ${state.hands} hand${state.hands === 1 ? '' : 's'}`);
+  else if (state.tracking) bits.push(`tracking${state.cameraSource === 'relay' ? ' · relay' : ''} · ${state.hands} hand${state.hands === 1 ? '' : 's'}`);
   else if (state.camera === 'asking') bits.push('starting camera…');
   else if (state.camera === 'denied') bits.push('camera denied');
   else if (state.camera === 'error') bits.push('camera error');
@@ -831,6 +900,7 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
     state,
     fx,
     tracker,
+    relay,
     classify,
     syntheticHands,
     stepEffect,

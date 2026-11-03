@@ -1,0 +1,272 @@
+// The overlay's camera, relayed.
+//
+// On the rig every physical camera is held by WebcamSwitcher, and Chromium hands out no usable
+// `deviceId` before a successful grant, so `getUserMedia` on this page always fails with
+// NotReadableError. The server therefore runs ffmpeg on the `WebcamSwitcher Virtual Camera` and
+// serves the result as multipart MJPEG; the page reads that stream instead of fighting for the
+// device.
+//
+// Frames are parsed here rather than handed to an <img>, because they have to reach a canvas (the
+// tracker draws them at its own size and runs the same detect call as the device path). Only the
+// newest frame is decoded: a JPEG that arrives while the decoder is busy is dropped, and every
+// replaced ImageBitmap is closed, so a long session leaks no memory.
+//
+// Pausing is dropping the connection: the server then writes to nobody, which is also what makes
+// a `pagehide` cheap. Resume is one more `fetch` — no state to repair.
+
+const BOUNDARY = '--framebound';
+const HEADERS_END = Uint8Array.of(13, 10, 13, 10);
+const ACQUIRE_TIMEOUT = 10000;
+const MAX_HEADER = 8192;
+
+function indexOf(hay, needle, from = 0) {
+  const last = hay.length - needle.length;
+  outer: for (let i = from; i <= last; i += 1) {
+    for (let j = 0; j < needle.length; j += 1) if (hay[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * A multipart/x-mixed-replace reader that speaks this server's framing:
+ *
+ *   --framebound CRLF
+ *   Content-Type: image/jpeg CRLF
+ *   Content-Length: <N> CRLF
+ *   CRLF
+ *   <N bytes of JPEG> CRLF
+ *
+ * The framing rule: the boundary is a marker, the header block ends at the first CRLFCRLF, and
+ * `Content-Length` is the only thing that says where the image ends — never a scan for the next
+ * boundary, because JPEG bytes may contain anything. A part with no length is unframeable and is
+ * skipped to the next marker. Anything before the first marker (a preamble) is discarded.
+ */
+export class MultipartFrames {
+  constructor(boundary = BOUNDARY) {
+    this.marker = new TextEncoder().encode(boundary);
+    this.buf = new Uint8Array(0);
+    this.inPart = false;
+  }
+
+  push(chunk) {
+    if (!chunk || !chunk.length) return [];
+    const buf = new Uint8Array(this.buf.length + chunk.length);
+    buf.set(this.buf, 0);
+    buf.set(chunk, this.buf.length);
+    this.buf = buf;
+    const out = [];
+    for (;;) {
+      if (!this.inPart) {
+        const at = indexOf(this.buf, this.marker, 0);
+        if (at < 0) {
+          // Keep only as much tail as a marker split across two chunks could need.
+          if (this.buf.length > this.marker.length) this.buf = this.buf.slice(this.buf.length - this.marker.length + 1);
+          return out;
+        }
+        this.buf = this.buf.subarray(at + this.marker.length);
+        this.inPart = true;
+      }
+      const head = indexOf(this.buf, HEADERS_END, 0);
+      if (head < 0) {
+        if (this.buf.length > MAX_HEADER) throw new Error('malformed part: header block never ended');
+        return out;
+      }
+      const headers = new TextDecoder('latin1').decode(this.buf.subarray(0, head));
+      const len = /content-length:\s*(\d+)/i.exec(headers);
+      const start = head + HEADERS_END.length;
+      if (!len) {
+        // No length: this part cannot be framed. Resync on the next marker.
+        this.buf = this.buf.subarray(start);
+        this.inPart = false;
+        continue;
+      }
+      const size = Number(len[1]);
+      if (this.buf.length < start + size) return out; // wait for the rest of the image
+      out.push(this.buf.slice(start, start + size));
+      let next = start + size;
+      // The CRLF that closes the part is framing, not image data.
+      if (this.buf[next] === 13 && this.buf[next + 1] === 10) next += 2;
+      this.buf = this.buf.subarray(next);
+      this.inPart = false;
+    }
+  }
+}
+
+/**
+ * Read the server's relayed camera. `onFrame(bitmap)` is called synchronously with the newest
+ * frame (draw it now; it is closed when the next one replaces it), `onState({ state, error,
+ * frames, dropped })` whenever the stream comes up or goes away.
+ *
+ *   const relay = createRelay({ onFrame, onState });
+ *   if (await relay.start()) …   // true once a frame was decoded
+ */
+export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onState = () => {}, timeout = ACQUIRE_TIMEOUT } = {}) {
+  let ctrl = null; // AbortController of the live fetch
+  let wanted = false; // the page asked for frames (so a hidden tab can resume)
+  let live = false;
+  let current = null; // newest ImageBitmap, closed when replaced
+  let latest = null; // newest undecoded JPEG
+  let decoding = false;
+  let error = null;
+  let frames = 0;
+  let dropped = 0;
+  let firstWaiter = null;
+
+  function emit(state) {
+    try {
+      onState({ state, error, frames, dropped });
+    } catch {
+      /* the page's consumer must not break the stream */
+    }
+  }
+
+  function close() {
+    if (ctrl) {
+      ctrl.abort();
+      ctrl = null;
+    }
+  }
+
+  function stop({ forget = true } = {}) {
+    if (forget) wanted = false;
+    close();
+    latest = null;
+    if (current) {
+      current.close();
+      current = null;
+    }
+    if (live || error) {
+      live = false;
+      emit('idle');
+    }
+    live = false;
+  }
+
+  async function decode(bytes) {
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+    const prev = current;
+    current = bitmap;
+    frames += 1;
+    try {
+      onFrame(bitmap);
+    } finally {
+      // Synchronous consumer: the previous frame has been drawn, nothing else can hold it.
+      if (prev) prev.close();
+    }
+  }
+
+  /** Decode the newest frame, then the one that arrived while we were busy. */
+  async function drain() {
+    if (decoding) return;
+    decoding = true;
+    try {
+      while (latest && ctrl) {
+        const bytes = latest;
+        latest = null;
+        await decode(bytes);
+        if (!live) {
+          live = true;
+          error = null;
+          emit('live');
+          if (firstWaiter) {
+            const w = firstWaiter;
+            firstWaiter = null;
+            w(true);
+          }
+        }
+      }
+    } catch (err) {
+      if (ctrl) {
+        close();
+        live = false;
+        error = `relay: ${err && err.message ? err.message : err}`;
+        emit('error');
+      }
+    } finally {
+      decoding = false;
+    }
+  }
+
+  async function read(res) {
+    const reader = res.body.getReader();
+    const parser = new MultipartFrames();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const jpeg of parser.push(value)) {
+        if (latest) dropped += 1; // the decoder was still busy: keep only the newest
+        latest = jpeg;
+        if (!decoding) void drain();
+      }
+    }
+  }
+
+  async function start() {
+    wanted = true;
+    if (document.visibilityState === 'hidden') return false;
+    if (ctrl) return live;
+    const ac = new AbortController();
+    ctrl = ac;
+    try {
+      const res = await fetch(url, {
+        signal: ac.signal,
+        cache: 'no-store',
+        headers: { accept: 'multipart/x-mixed-replace' },
+      });
+      if (!res.ok) throw new Error(`stream answered ${res.status}`);
+      if (!res.body) throw new Error('stream carried no body');
+      const type = res.headers.get('content-type') || '';
+      if (!/multipart\/x-mixed-replace/i.test(type)) throw new Error(`unexpected content-type ${type || '(missing)'}`);
+      // Losing the connection after the first frame is a state change, not a start failure.
+      void read(res).catch((err) => {
+        if (ac.signal.aborted) return;
+        close();
+        live = false;
+        error = `relay: ${err && err.message ? err.message : err}`;
+        emit('error');
+      });
+      const got = await new Promise((resolve) => {
+        firstWaiter = resolve;
+        setTimeout(() => {
+          if (firstWaiter) {
+            firstWaiter = null;
+            resolve(false);
+          }
+        }, timeout);
+      });
+      if (!got) throw new Error(`no frame within ${Math.round(timeout / 1000)} s`);
+      return true;
+    } catch (err) {
+      close();
+      live = false;
+      error = ac.signal.aborted && !err.message ? 'relay: aborted' : `relay: ${err && err.message ? err.message : err}`;
+      emit('error');
+      return false;
+    }
+  }
+
+  // A hidden document keeps no connection open: the server would only buffer frames nobody draws.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      if (ctrl) {
+        close();
+        live = false;
+        emit('idle');
+      }
+    } else if (wanted && !ctrl) {
+      void start();
+    }
+  });
+  window.addEventListener('pagehide', () => stop());
+
+  return {
+    start,
+    stop,
+    /** Frames are flowing and `onFrame` is being called. */
+    isLive: () => live && Boolean(current),
+    /** Why the stream is not live (string), null while it is. */
+    reason: () => error,
+    stats: () => ({ frames, dropped, live }),
+  };
+}

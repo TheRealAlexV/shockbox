@@ -108,6 +108,12 @@ export class Tracker {
     this.failStage = null;
     this.errorName = null;
     this.source = 'camera'; // camera | synthetic
+    // How the frames arrive: `device` is a getUserMedia track, `relay` decoded MJPEG from the
+    // server. `source` stays 'camera' either way — these are camera anchors, not a replay.
+    this.feed = null; // device | relay | null
+    // The geometry the relay path draws into; the device path takes it from the track.
+    this.size = DEVICES['720p'];
+    this._frameCanvas = null;
     this.synthetic = null;
     // Where the model bytes came from (`local` = the module's own file, `cdn` = the model URL).
     this.modelSource = null;
@@ -125,6 +131,7 @@ export class Tracker {
       failStage: this.failStage,
       errorName: this.errorName,
       source: this.source,
+      feed: this.feed,
       fps: this.fps,
       frames: this.frames,
     };
@@ -173,7 +180,7 @@ export class Tracker {
           error: 'The camera track ended (device unplugged, or another app took the camera).',
         });
       });
-      this._setState({ deviceLabel: this.deviceLabel, source: 'camera' });
+      this._setState({ deviceLabel: this.deviceLabel, source: 'camera', feed: 'device' });
 
       this.video = document.createElement('video');
       this.video.muted = true;
@@ -289,6 +296,75 @@ export class Tracker {
     }
   }
 
+  /**
+   * The relayed camera: the same landmarker and the same `onFrame` contract as `start()`, driven
+   * by decoded MJPEG frames instead of a <video>. No getUserMedia and no track to lose.
+   */
+  async startRelay(opts = {}) {
+    if (this.state === 'running' || this.state === 'starting') return this.snapshot();
+    this._setState({ state: 'starting', error: null });
+    this.failStage = 'track';
+    try {
+      if (!this.landmarker) await this._loadModel(opts);
+      this.size = DEVICES[opts.resolution] || DEVICES['720p'];
+      this.failStage = null;
+      this.errorName = null;
+      this._setState({ state: 'running', source: 'camera', feed: 'relay', failStage: null, errorName: null });
+      return this.snapshot();
+    } catch (err) {
+      this.stop({ keepError: true });
+      this._setState({
+        state: 'error',
+        error: describeError(err),
+        errorName: (err && err.name) || 'Error',
+        failStage: this.failStage || 'track',
+      });
+      return this.snapshot();
+    }
+  }
+
+  /** The surface the publisher may composite: the camera element, or the relay's frame canvas. */
+  frameSurface() {
+    return this.feed === 'relay' ? this._frameCanvas : this.video;
+  }
+
+  /**
+   * One relayed frame. Drawn at the tracker's own geometry and detected through the same entry
+   * point the camera loop uses, so a relayed frame is a camera frame to everything downstream.
+   */
+  pushFrame(bitmap, at = performance.now()) {
+    if (this.state !== 'running' || this.feed !== 'relay' || !this.landmarker) return false;
+    const { width, height } = this.size;
+    let c = this._frameCanvas;
+    if (!c) c = this._frameCanvas = document.createElement('canvas');
+    if (c.width !== width || c.height !== height) {
+      c.width = width;
+      c.height = height;
+    }
+    const g = c.getContext('2d');
+    if (!g) return false;
+    g.drawImage(bitmap, 0, 0, width, height);
+    try {
+      this._detect(c, width, height, at);
+    } catch (err) {
+      // A throw from the SDK is a real failure, not "no hands": say so once.
+      this._setState({ state: 'error', error: `tracking threw: ${err.message}` });
+      return false;
+    }
+    return true;
+  }
+
+  /** The one detect call: the camera loop and the relay both come through here. */
+  _detect(source, width, height, at) {
+    const res = this.landmarker.detectForVideo(source, at);
+    const hands = res && res.landmarks ? res.landmarks.map((lm, i) => ({
+      landmarks: lm,
+      handedness: res.handedness && res.handedness[i] ? res.handedness[i][0].categoryName : null,
+    })) : [];
+    countFrame(this);
+    this.onFrame({ hands, width, height, source: 'camera', at });
+  }
+
   _loop() {
     const tick = () => {
       if (this.state !== 'running' || !this.video) return;
@@ -296,13 +372,7 @@ export class Tracker {
       if (v.readyState >= 2 && v.videoWidth && v.currentTime !== this.lastVideoTime) {
         this.lastVideoTime = v.currentTime;
         try {
-          const res = this.landmarker.detectForVideo(v, performance.now());
-          const hands = res && res.landmarks ? res.landmarks.map((lm, i) => ({
-            landmarks: lm,
-            handedness: res.handedness && res.handedness[i] ? res.handedness[i][0].categoryName : null,
-          })) : [];
-          countFrame(this);
-          this.onFrame({ hands, width: v.videoWidth, height: v.videoHeight, source: 'camera', at: performance.now() });
+          this._detect(v, v.videoWidth, v.videoHeight, performance.now());
         } catch (err) {
           // A throw from the SDK is a real failure, not "no hands": say so once.
           this._setState({ state: 'error', error: `tracking threw: ${err.message}` });
@@ -318,6 +388,7 @@ export class Tracker {
   stop({ keepError = false } = {}) {
     cancelAnimationFrame(this.raf);
     this.raf = 0;
+    this.feed = null;
     if (this.stream) {
       for (const t of this.stream.getTracks()) t.stop();
       this.stream = null;
