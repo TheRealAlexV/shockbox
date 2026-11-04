@@ -122,7 +122,19 @@ ok(d1.status === 200 && d1.data.entity && d1.data.entity.kind === 'dialog', 'spa
 const dlgEntity = d1.data.entity || {};
 
 const d2 = await req('POST', '/api/dialogs/live', { any: true });
-ok(d2.status === 200 && d2.data.entity.x !== dlgEntity.x, 'second alert cascades (different x)', [dlgEntity.x, d2.data.entity && d2.data.entity.x]);
+// Alerts do not cascade: every one lands on the single deterministic centre, so two of the same
+// size share the same x (and y) exactly. Their rendered y differs because the stage stacks them
+// in a column with a gap, and both boxes must stay inside the 405x720 canvas.
+const second = d2.data.entity || {};
+const centred = (e) => e.w > 0 && e.x === Math.round((405 - e.w) / 2);
+const insideStage = (e) => e.x >= 0 && e.y >= 0 && e.x + e.w <= 405 && e.y + e.h <= 720;
+ok(d2.status === 200 && centred(dlgEntity) && centred(second) && dlgEntity.x === second.x,
+  'both alerts sit on the same centred axis', [dlgEntity.x, second.x]);
+ok(insideStage(dlgEntity) && insideStage(second), 'both alerts sit inside the stage', [dlgEntity, second]);
+const dialogsCss = await (await fetch(base + '/dialogs/style.css')).text();
+const stageRule = (dialogsCss.match(/#stage\s*\{[^}]*\}/) || [''])[0];
+ok(dlgEntity.y === second.y && /flex-direction:\s*column/.test(stageRule) && /gap:\s*[1-9]/.test(stageRule),
+  'alerts that would overlap are stacked by the stage (rendered y differs)', [dlgEntity.y, second.y]);
 
 const miss = await req('POST', '/api/dialogs/live', { poolId: notifId });
 ok(miss.status === 400, 'spawning a notification through the alerts module is refused', miss.data);

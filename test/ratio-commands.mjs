@@ -49,11 +49,11 @@ const cmd = (body) =>
     body: JSON.stringify(body),
   }).then(async (r) => ({ status: r.status, body: await r.json() }));
 
+// The ratio the wall is actually running (`render.ratio`), not the stored token: the shipped
+// default is 'default', which resolves to 16:9 through `effectiveRatio()`.
 const ratio = async () => {
-  const r = await fetch(`http://127.0.0.1:${port}/api/modules/wall/state`).then((x) => x.json());
-  const s = r.state?.settings || {};
-  const v = typeof s.ratio === 'object' ? s.ratio.value : s.ratio;
-  return v;
+  const r = await fetch(`http://127.0.0.1:${port}/api/wall/live`).then((x) => x.json());
+  return r.render && r.render.ratio;
 };
 
 const srv = spawn(process.execPath, [path.join(root, 'server.mjs'), '--port', String(port), '--state', state], {

@@ -156,6 +156,8 @@ export default {
       // The list lives in core settings (edited once, reported by /health); fall back to the
       // module's own document so an isolated test harness still works.
       sceneList: () => this.forceScenes(),
+      // Forcing compares the running ratio, so a wall on 'default' (16:9) is not rewritten.
+      effective: () => this.effectiveRatio(),
       persist: (st) => {
         this.ratioState = st;
         this.save();
@@ -736,7 +738,10 @@ export default {
   },
 
   /** 9:16 <-> 16:9, refused inside a forcing scene. */  _ratioToggle() {
-    const cur = this.ctx.settings.get('ratio') || '16:9';
+    // The ratio the wall is running, not the stored token: the shipped value is 'default',
+    // which resolves to 16:9, so toggling the raw setting would answer 9:16 while the wall
+    // stayed at 16:9 and need a second press to reach portrait.
+    const cur = this.effectiveRatio();
     const next = cur === '16:9' ? '9:16' : '16:9';
     if (next === '9:16' && this.ratio && this.ratio.state.forcing) {
       this.log.info(`ratio: ${this.ratio.state.lastScene} forces 16:9 — toggle ignored`);

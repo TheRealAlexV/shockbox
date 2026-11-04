@@ -15,7 +15,7 @@ import { num } from '../../core/id.mjs';
 
 const DEFAULTS = ['Desktop', 'Theater', 'PHub', 'OnlyFans', 'CominOut'];
 
-export function createRatioWatcher({ settings, obs, log, persist, sceneList: sceneListFn = null }) {
+export function createRatioWatcher({ settings, obs, log, persist, sceneList: sceneListFn = null, effective = null }) {
   const FORCED = '16:9';
   let lastScene = null;
   let before = null;      // ratio in force before the first forcing scene was entered
@@ -32,7 +32,9 @@ export function createRatioWatcher({ settings, obs, log, persist, sceneList: sce
   }
 
   function setRatio(ratio, why) {
-    const cur = settings.get('ratio');
+    // Compare what the wall is running, not the stored token: 'default' resolves through the
+    // core ratio, and writing 16:9 over it would silently pin an operator who chose "default".
+    const cur = typeof effective === 'function' ? effective() : settings.get('ratio');
     if (cur === ratio) return;
     settings.set('ratio', ratio);
     log.info(`ratio -> ${ratio} (${why})`);
