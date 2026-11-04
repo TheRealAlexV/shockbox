@@ -311,6 +311,7 @@ export async function render(container, ctx) {
   const quickBox = mountQuickSend(quickSlot, {
     title: 'Quick send',
     api,
+    events,
     poolId: 'dialogs',
     kinds: ['dialog'],
     placeholder: 'Pop a dialog — text, or pick from the pool…',

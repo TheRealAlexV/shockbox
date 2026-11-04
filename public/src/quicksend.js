@@ -35,6 +35,7 @@ function inMinutes(n) {
  *   title: string,
  *   kinds: string[],
  *   api: object,
+ *   events?: object,
  *   poolId: string,
  *   placeholder?: string,
  *   who?: string,
@@ -392,6 +393,27 @@ export function mountQuickSend(container, opts) {
   refresh().catch((err) => {
     list.append(el('div', { class: 'qs-empty dim', text: `pool unavailable: ${err.message}` }));
   });
+
+  // A pool deleted or created anywhere (this pane, the messages pane, the deck) reaches the
+  // picker through the shell's SSE bus, so the dropdown is current without a page reload.
+  if (opts.events && typeof opts.events.subscribe === 'function') {
+    const stop = opts.events.subscribe('pool', () => {
+      const before = activePool;
+      opts.api.get('/api/pools')
+        .then((r) => {
+          paintPools(Array.isArray(r) ? r : r && r.pools);
+          // The pool this box was reading is gone: `paintPools` fell back to `all`, so re-read.
+          if (activePool !== before) return refresh();
+          return null;
+        })
+        .catch(() => {
+          /* the next explicit refresh reports the failure */
+        });
+    });
+    if (opts.signal) {
+      opts.signal.addEventListener('abort', () => stop(), { once: true });
+    }
+  }
 
   return {
     refresh,

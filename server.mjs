@@ -204,7 +204,9 @@ const obs = createObsClient({
 let registry = null;
 const registryCtx = {
     sounds: SOUNDS_DIR,
-    core: { version: VERSION, here: HERE, publicDir: PUBLIC_DIR, stateDir: STATE_DIR, soundsDir: SOUNDS_DIR, port: PORT, url: `http://127.0.0.1:${PORT}` },
+    // `settings` is the core store, so a module whose own `ratio` is `default` can resolve it
+    // through `ctx.core.settings` (wall, dialogs, notifications, handfx all do).
+    core: { version: VERSION, here: HERE, publicDir: PUBLIC_DIR, stateDir: STATE_DIR, soundsDir: SOUNDS_DIR, port: PORT, url: `http://127.0.0.1:${PORT}`, settings: coreSettings },
     events,
     obs,
     log: root,

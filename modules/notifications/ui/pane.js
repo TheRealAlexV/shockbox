@@ -272,6 +272,7 @@ export async function render(container, ctx) {
   const quickBox = mountQuickSend(quickSlot, {
     title: 'Quick send',
     api,
+    events,
     poolId: 'notifications',
     kinds: ['notification'],
     placeholder: 'Show a notification on the strip…',

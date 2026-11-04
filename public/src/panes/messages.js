@@ -27,6 +27,9 @@ const VIRTUAL_TABS = [
   { id: 'all', label: 'All' },
   { id: 'random', label: 'Random' },
 ];
+// Autosave window for an inline message edit: longer than a keystroke, short enough that the
+// overlay is current before the eye leaves the row.
+const EDIT_SAVE_MS = 350;
 
 const KINDS = [
   { id: 'dialog', label: 'Alert' },
@@ -58,6 +61,10 @@ export async function render(container, ctx) {
     messages: [],
     loading: false,
   };
+
+  // While an inline editor is open the list is not rebuilt from SSE frames: our own PATCH echo
+  // would otherwise replace the textarea and lose the caret mid-word.
+  let editing = null;
 
   // A pool id can only be validated once `GET /api/pools` lands, so remember the request.
   let wantedTab = new URLSearchParams(location.hash.split('?')[1] || '').get('tab') || '';
@@ -317,6 +324,7 @@ export async function render(container, ctx) {
       managerActions.append(el('span', { class: 'pool-hint dim', text: 'a view, not a pool' }));
     } else {
       const name = list.find((p) => p.id === q.tab)?.label || q.tab;
+      const meta = (q.pools || []).find((p) => p.id === q.tab) || {};
       const held = q.counts?.[q.tab] || 0;
       const rename = el('button', { type: 'button', class: 'btn btn-quiet btn-sm', text: 'Rename' });
       rename.addEventListener('click', () => {
@@ -326,22 +334,29 @@ export async function render(container, ctx) {
         renameInput.focus();
         renameInput.select();
       });
-      const del = actionButton({
-        label: 'Delete pool',
-        variant: 'btn-danger btn-sm',
-        title: `Delete ${name}`,
-        confirm: `Delete — ${held} message${held === 1 ? '' : 's'} move?`,
-        run: () => api.del(`/api/pools/${encodeURIComponent(q.tab)}`),
-        onDone: async (out) => {
-          renameForm.hidden = true;
-          q.tab = 'all';
-          setUrlTab('all');
-          toast(out?.moved ? `pool deleted, ${out.moved} message(s) moved` : 'pool deleted', 'ok');
-          await reload();
-        },
-        onError: (err) => toast(`delete failed: ${err.message}`, 'error'),
-      });
-      managerActions.append(rename, del);
+      managerActions.append(rename);
+      if (meta.builtin) {
+        // No delete affordance for a seed pool: the server would refuse it, and the explanation
+        // (the same sentence the API returns) is more useful than a button that always fails.
+        managerActions.append(el('span', { class: 'pool-hint dim pool-builtin', text: meta.note || 'built-in pool — cannot be deleted' }));
+      } else {
+        const del = actionButton({
+          label: 'Delete pool',
+          variant: 'btn-danger btn-sm',
+          title: `Delete ${name}`,
+          confirm: `Delete — ${held} message${held === 1 ? '' : 's'} move?`,
+          run: () => api.del(`/api/pools/${encodeURIComponent(q.tab)}`),
+          onDone: async (out) => {
+            renameForm.hidden = true;
+            q.tab = 'all';
+            setUrlTab('all');
+            toast(out?.moved ? `pool deleted, ${out.moved} message(s) moved` : 'pool deleted', 'ok');
+            await reload();
+          },
+          onError: (err) => toast(`delete failed: ${err.message}`, 'error'),
+        });
+        managerActions.append(del);
+      }
     }
     const newBtn = el('button', { type: 'button', class: 'btn btn-quiet btn-sm', text: '+ New pool' });
     newBtn.addEventListener('click', () => {
@@ -411,6 +426,8 @@ export async function render(container, ctx) {
   }
 
   function rebuildList() {
+    // Any rebuild replaces every row, so no inline editor can survive it.
+    editing = null;
     const rows = visibleMessages();
     clear(listBox);
     for (const m of rows) listBox.appendChild(rowFor(m));
@@ -481,6 +498,7 @@ export async function render(container, ctx) {
   function openEditor(row, m, bodyEl) {
     if (row.dataset.editing === 'true') return;
     row.dataset.editing = 'true';
+    editing = m.id;
     const draft = {
       text: m.text || '',
       title: m.title || '',
@@ -491,27 +509,103 @@ export async function render(container, ctx) {
       random: !!m.random,
       storm: !!m.storm,
     };
-    const editor = buildEditor(draft, {
-      onCancel: () => {
-        delete row.dataset.editing;
-        editor.remove();
-      },
-      onSave: async () => {
-        const payload = {
-          text: draft.text,
-          title: draft.title,
-          type: draft.type,
-          kind: draft.kind,
-          tags: splitTags(draft.tags),
-          buttons: draft.buttons.filter((b) => b.label.trim()),
-          random: draft.random,
-          storm: draft.storm,
-        };
-        await api.patch(`/api/pool/all/messages/${encodeURIComponent(m.id)}`, payload);
-        toast(`${m.id} saved`, 'ok');
-        await reload();
-      },
+    // The last text the server confirmed. A failed save puts the row back to it instead of
+    // leaving the list claiming a change that never landed.
+    const confirmed = { text: draft.text, title: draft.title };
+    const status = el('span', { class: 'msg-save dim', role: 'status', 'aria-live': 'polite' });
+    let timer = null;
+    let dirty = false;
+    let seq = 0;
+    let closed = false;
+
+    const say = (text, tone) => {
+      status.textContent = text;
+      if (tone) status.dataset.tone = tone;
+      else delete status.dataset.tone;
+    };
+
+    const payload = () => ({
+      text: draft.text,
+      title: draft.title,
+      type: draft.type,
+      kind: draft.kind,
+      tags: splitTags(draft.tags),
+      buttons: draft.buttons.filter((b) => b.label.trim()),
+      random: draft.random,
+      storm: draft.storm,
     });
+
+    async function save() {
+      if (!dirty) return;
+      if (!draft.text.trim()) {
+        say('text is required', 'bad');
+        return;
+      }
+      dirty = false;
+      say('saving…');
+      const mine = ++seq;
+      // What this request sends. `draft` keeps changing while it is in flight.
+      const sent = { text: draft.text, title: draft.title };
+      // Optimistic: the record the rest of the pane reads changes before the request resolves.
+      m.text = draft.text;
+      m.title = draft.title;
+      m.type = draft.type;
+      m.kind = draft.kind;
+      m.tags = splitTags(draft.tags);
+      try {
+        const out = await api.patch(`/api/pool/all/messages/${encodeURIComponent(m.id)}`, payload());
+        // A save that started after this one owns the row; its response is the truth.
+        if (mine !== seq) return;
+        if (out && out.message) {
+          Object.assign(m, out.message);
+          // Typing continued while this request was in flight: keep the optimistic text on top.
+          if (dirty) {
+            m.text = draft.text;
+            m.title = draft.title;
+            m.tags = splitTags(draft.tags);
+          }
+        }
+        confirmed.text = sent.text;
+        confirmed.title = sent.title;
+        if (!dirty) say('saved', 'ok');
+      } catch (err) {
+        if (mine !== seq) return;
+        dirty = true;
+        m.text = confirmed.text;
+        m.title = confirmed.title;
+        say(`not saved: ${err.message}`, 'bad');
+      }
+    }
+
+    function touched() {
+      dirty = true;
+      say('editing…');
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        save();
+      }, EDIT_SAVE_MS);
+    }
+
+    async function close() {
+      if (closed) return;
+      closed = true;
+      clearTimeout(timer);
+      timer = null;
+      if (dirty) await save();
+      if (dirty) {
+        toast(draft.text.trim()
+          ? `the edit to ${m.id} was not saved — the row keeps its last saved text`
+          : 'text is required — the change was not saved', 'error');
+      }
+      editing = null;
+      delete row.dataset.editing;
+      // Rebuilding here (not on every frame) is what keeps typing smooth and, on close, gives
+      // the row back its normal shape from the server's truth.
+      rebuildList();
+    }
+
+    const editor = buildEditor(draft, { onDirty: touched, onClose: close, status });
     bodyEl.replaceWith(editor);
   }
 
@@ -724,22 +818,25 @@ export async function render(container, ctx) {
     };
   }
 
-  function buildEditor(draft, { onCancel, onSave }) {
-    const wrap = el('form', { class: 'msg-editor', autocomplete: 'off' });
+  function buildEditor(draft, { onClose, onDirty, status }) {
+    const wrap = el('form', { class: 'msg-edit', autocomplete: 'off' });
     const textArea = el('textarea', { class: 'input', rows: '2', 'aria-label': 'Text' });
     textArea.value = draft.text;
     textArea.addEventListener('input', () => {
       draft.text = textArea.value;
+      onDirty();
     });
     const titleInput = el('input', { type: 'text', class: 'input input-sm', 'aria-label': 'Title', placeholder: 'title' });
     titleInput.value = draft.title;
     titleInput.addEventListener('input', () => {
       draft.title = titleInput.value;
+      onDirty();
     });
     const typeInput = el('input', { type: 'text', class: 'input input-sm', 'aria-label': 'Type', list: 'pool-types' });
     typeInput.value = draft.type;
     typeInput.addEventListener('input', () => {
       draft.type = typeInput.value;
+      onDirty();
     });
     const kindSeg = el('div', { class: 'segmented segmented-sm', role: 'radiogroup', 'aria-label': 'Kind' });
     for (const k of KINDS) {
@@ -748,6 +845,7 @@ export async function render(container, ctx) {
       b.addEventListener('click', () => {
         draft.kind = k.id;
         for (const x of kindSeg.children) x.setAttribute('aria-checked', String(x === b));
+        onDirty();
       });
       kindSeg.appendChild(b);
     }
@@ -755,6 +853,7 @@ export async function render(container, ctx) {
     tagsInput.value = draft.tags;
     tagsInput.addEventListener('input', () => {
       draft.tags = tagsInput.value;
+      onDirty();
     });
     const btnBox = el('div', { class: 'btn-editor btn-editor-compact' });
     function paint() {
@@ -764,6 +863,7 @@ export async function render(container, ctx) {
         const label = el('input', { type: 'text', class: 'input input-sm', value: b.label, 'aria-label': `Button ${i + 1} label`, placeholder: 'label' });
         label.addEventListener('input', () => {
           b.label = label.value;
+          onDirty();
         });
         // `el` forwards every key to setAttribute: setAttribute('type', ...) on a <select>
         // switches it to a single-line <select> rendering with no value semantics, so the
@@ -775,11 +875,13 @@ export async function render(container, ctx) {
         act.value = b.action;
         act.addEventListener('change', () => {
           b.action = act.value;
+          onDirty();
         });
         const rm = el('button', { type: 'button', class: 'btn btn-quiet btn-sm btn-icon', text: '×', 'aria-label': 'Remove button' });
         rm.addEventListener('click', () => {
           draft.buttons.splice(i, 1);
           paint();
+          onDirty();
         });
         row.append(label, act, rm);
         btnBox.appendChild(row);
@@ -788,6 +890,7 @@ export async function render(container, ctx) {
       add.addEventListener('click', () => {
         draft.buttons.push({ label: '', action: 'close' });
         paint();
+        onDirty();
       });
       btnBox.appendChild(add);
     }
@@ -796,23 +899,18 @@ export async function render(container, ctx) {
     const rand = el('input', { type: 'checkbox', checked: draft.random });
     rand.addEventListener('change', () => {
       draft.random = rand.checked;
+      onDirty();
     });
     const st = el('input', { type: 'checkbox', checked: draft.storm });
     st.addEventListener('change', () => {
       draft.storm = st.checked;
+      onDirty();
     });
 
-    const save = actionButton({
-      label: 'Save',
-      variant: 'btn-primary btn-sm',
-      run: async () => {
-        if (!draft.text.trim()) throw new Error('text is required');
-        return onSave();
-      },
-      onError: (err) => toast(`save failed: ${err.message}`, 'error'),
-    });
-    const cancel = el('button', { type: 'button', class: 'btn btn-quiet btn-sm', text: 'Cancel' });
-    cancel.addEventListener('click', onCancel);
+    // No Save/Cancel pair: the editor autosaves (debounced in openEditor), so the only button is
+    // the one that ends the edit. `status` is the live "saving… / saved / not saved" readout.
+    const done = el('button', { type: 'button', class: 'btn btn-primary btn-sm', text: 'Done' });
+    done.addEventListener('click', () => onClose());
 
     wrap.append(
       textArea,
@@ -826,15 +924,21 @@ export async function render(container, ctx) {
         el('label', { class: 'switch-inline' }, rand, el('span', { text: 'random' })),
         el('label', { class: 'switch-inline' }, st, el('span', { text: 'storm' })),
         el('span', { class: 'control-spacer' }),
-        cancel,
-        save,
+        status,
+        done,
       ),
       btnBox,
     );
     wrap.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') onCancel();
+      if (e.key === 'Escape') onClose();
     });
-    queueMicrotask(() => textArea.focus());
+    // Enter in a one-line field would otherwise submit the form and navigate away.
+    wrap.addEventListener('submit', (e) => e.preventDefault());
+    // Focus lands after the text, so the caret is at the end of the message instead of at 0.
+    queueMicrotask(() => {
+      textArea.focus();
+      textArea.setSelectionRange(textArea.value.length, textArea.value.length);
+    });
     return wrap;
   }
 
@@ -860,7 +964,10 @@ export async function render(container, ctx) {
         if (!q.loading) {
           paintTabs();
           paintChips();
-          rebuildList();
+          // An open inline editor owns its row: adopting the frame's messages above is fine, but
+          // rebuilding the DOM would replace the textarea (and the caret) on every PATCH echo.
+          if (editing) paintManager();
+          else rebuildList();
         }
       } else if (data.counts) {
         q.counts = data.counts;
@@ -871,7 +978,10 @@ export async function render(container, ctx) {
   );
 
   // keep the "x ago"-less list honest on tab focus: cheap re-read when the operator returns
-  const onFocus = () => loadMessages();
+  const onFocus = () => {
+    if (editing) return;
+    loadMessages();
+  };
   window.addEventListener('focus', onFocus);
   unsubs.push(() => window.removeEventListener('focus', onFocus));
 

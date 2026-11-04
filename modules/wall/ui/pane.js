@@ -1101,6 +1101,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   const quickBox = mountQuickSend(quickSlot, {
     title: 'Quick send',
     api,
+    events: ctx.events,
     poolId: 'wall',
     kinds: ['wall'],
     placeholder: 'Message to the wall — text, or pick from the pool…',

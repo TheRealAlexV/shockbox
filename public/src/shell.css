@@ -1219,6 +1219,12 @@ input[type='search'].input {
 .pool-manager .pool-inline[hidden] { display: none; }
 .pool-select { max-width: 240px; }
 .pool-hint { font-size: 10.5px; }
+/* A built-in pool explains itself in place instead of offering a delete that can only fail. */
+.pool-manager .pool-builtin {
+  max-width: 560px;
+  color: var(--fg-3);
+  line-height: 1.35;
+}
 
 .tabs {
   display: flex;
@@ -1429,6 +1435,10 @@ input[type='search'].input {
 
 /* edit form inline in a row */
 .msg-edit { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+/* autosave readout next to Done: saving… / saved / not saved */
+.msg-save { font-size: 10.5px; color: var(--fg-4); }
+.msg-save[data-tone='ok'] { color: var(--ok); }
+.msg-save[data-tone='bad'] { color: var(--bad); }
 
 /* add form */
 .add-form {

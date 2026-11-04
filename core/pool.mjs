@@ -32,6 +32,16 @@ export const SEED_POOLS = [
 // list in the state file is the source of truth now.
 export const POOL_IDS = [...VIRTUAL_POOLS.map((p) => p.id), ...SEED_POOLS.map((p) => p.id)];
 
+/**
+ * One sentence, used by the DELETE refusal and by the pane's pool row, so the operator reads the
+ * same explanation wherever it appears: the pool is named, its kind's fallback is the reason.
+ */
+export function builtinPoolReason(rec) {
+  const label = (rec && (rec.label || rec.name)) || (rec && rec.id) || 'this pool';
+  const kind = (rec && rec.kind) || 'its';
+  return `The built-in pool "${label}" cannot be deleted: messages of kind ${kind} fall back to it. Rename it instead, or create your own pool.`;
+}
+
 // `wall` is a message pool record too: one typography source for alerts, notifications and
 // the LED wall, so a message written once can pop as a dialog or climb the wall.
 export const KINDS = ['dialog', 'notification', 'wall'];
@@ -433,6 +443,9 @@ export function createPool({ file, log, onChange = null }) {
     const index = pools.findIndex((p) => p.id === id);
     if (index < 0) return { status: 404, error: `unknown pool ${id}` };
     const rec = pools[index];
+    // A seed pool is the fallback every message of its kind drains into. Deleting it would leave
+    // that kind with no home, so the refusal names the pool and says why.
+    if (SEED_POOLS.some((s) => s.id === id)) return { status: 409, error: builtinPoolReason(rec) };
     const held = messages.filter((m) => m.poolId === rec.id);
     // Fall back to the seeded pool for that kind (e.g. a custom dialog pool drains into
     // `dialogs`), else any other pool of the same kind.
@@ -679,12 +692,19 @@ export function poolRoutes({ pool, events, log = pool.log }) {
       handler() {
         const { types, tags } = pool.typesAndTags();
         const v = pool.view('all');
-        return {
-          pools: [...VIRTUAL_POOLS, ...pool.poolList()].map((p) => ({ id: p.id, name: p.label, count: v.counts[p.id] || 0 })),
-          types,
-          tags,
-          counts: v.counts,
-        };
+        // `builtin` and `note` let the pane explain a seed pool instead of offering a delete that
+        // can only be refused; user pools are deletable and carry `builtin: false`.
+        const pools = [...VIRTUAL_POOLS, ...pool.poolList()].map((p) => {
+          const seed = SEED_POOLS.find((s) => s.id === p.id);
+          return {
+            id: p.id,
+            name: p.label,
+            count: v.counts[p.id] || 0,
+            builtin: Boolean(seed),
+            ...(seed ? { note: builtinPoolReason(p) } : {}),
+          };
+        });
+        return { pools, types, tags, counts: v.counts };
       },
     },
     {
