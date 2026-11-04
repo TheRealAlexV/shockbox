@@ -56,7 +56,7 @@ only (`core/registry.mjs:157` for string routes, `:169` for pages), so `?mode=ob
 URL is silently unread: `/notify?mode=obs` and `/notify` are the same page, and nothing in this
 module ever looks at a query string. A wrong-looking overlay is not a bad parameter — the parameter
 does not exist. The same is true of the other overlay pages (`/dialogs`, `/wall/render`,
-`/handfx`). Path-only matching is also why each page's `static` sibling directory resolves without
+`/shockfx`). Path-only matching is also why each page's `static` sibling directory resolves without
 per-file routes.
 
 `state.mjs` auto-close is a 400 ms `setInterval` sweep in `init()` (`routes.js:26`), cleared in

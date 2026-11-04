@@ -1,4 +1,4 @@
-// Hand FX module — the server half.
+// ShockFX module (id `handfx`) — the server half.
 //
 // What the server owns (and what it deliberately does not):
 //
@@ -52,28 +52,28 @@ export const CMDS = [
  */
 export const EFFECTS = [
   { id: 'fireball', title: 'Fireball', gesture: 'open palm up', from: 'fireball-controller/main.py' },
-  { id: 'lightning', title: 'Lightning fingers', gesture: 'both hands, fingertips arched together', from: 'handfx_filter (Hand FX)' },
-  { id: 'sparkring', title: 'Spark ring', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
-  { id: 'embers', title: 'Ember rise', gesture: 'any hand', from: 'handfx_filter (Hand FX)' },
-  { id: 'smoke', title: 'Smoke veil', gesture: 'sideways hand / swipe', from: 'handfx_filter (Hand FX)' },
-  { id: 'aura', title: 'Aura outline', gesture: 'any hand', from: 'handfx_filter (Hand FX)' },
-  { id: 'wires', title: 'Wire skeleton', gesture: 'any hand (follows the skeleton)', from: 'handfx_filter (Hand FX)' },
-  { id: 'frost', title: 'Frost creep', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
-  { id: 'portal', title: 'Portal ring', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
-  { id: 'disco', title: 'Disco ball', gesture: 'both hands raised', from: 'handfx_filter (Hand FX)' },
-  { id: 'slime', title: 'Slime drip', gesture: 'palms together', from: 'handfx_filter (Hand FX)' },
-  { id: 'inkflow', title: 'Ink flow', gesture: 'swipe', from: 'handfx_filter (Hand FX)' },
-  { id: 'shatter', title: 'Shatter shards', gesture: 'fist', from: 'handfx_filter (Hand FX)' },
-  { id: 'cyber', title: 'Cyber glitch', gesture: 'fist', from: 'handfx_filter (Hand FX)' },
-  { id: 'bloomlife', title: 'Bloom life', gesture: 'both palms up', from: 'handfx_filter (Hand FX)' },
-  { id: 'echo', title: 'Echo trails', gesture: 'any hand', from: 'handfx_filter (Hand FX)' },
-  { id: 'bodyonfire', title: 'Body on fire', gesture: 'body page sees a body', from: 'handfx body page (PoseLandmarker)' },
-  { id: 'bodysmoke', title: 'Body smoke', gesture: 'body page sees a body', from: 'handfx body page (PoseLandmarker)' },
-  { id: 'frozenbody', title: 'Frozen body', gesture: 'body page sees a body', from: 'handfx body page (PoseLandmarker)' },
-  { id: 'edit', title: 'Hand edit', gesture: 'fist (draws where the fingertips point)', from: 'handfx_filter (Hand FX)' },
-  { id: 'electroshock', title: 'Electro shockwave', gesture: 'open palm towards the camera', from: 'handfx_filter (Hand FX)' },
-  { id: 'meteor', title: 'Meteor', gesture: 'both hands raised', from: 'handfx_filter (Hand FX)' },
-  { id: 'shoot', title: 'Shoot', gesture: 'point (index only)', from: 'handfx_filter (Hand FX)' },
+  { id: 'lightning', title: 'Lightning fingers', gesture: 'both hands, fingertips arched together', from: 'handfx_filter (ShockFX)' },
+  { id: 'sparkring', title: 'Spark ring', gesture: 'open palm towards the camera', from: 'handfx_filter (ShockFX)' },
+  { id: 'embers', title: 'Ember rise', gesture: 'any hand', from: 'handfx_filter (ShockFX)' },
+  { id: 'smoke', title: 'Smoke veil', gesture: 'sideways hand / swipe', from: 'handfx_filter (ShockFX)' },
+  { id: 'aura', title: 'Aura outline', gesture: 'any hand', from: 'handfx_filter (ShockFX)' },
+  { id: 'wires', title: 'Wire skeleton', gesture: 'any hand (follows the skeleton)', from: 'handfx_filter (ShockFX)' },
+  { id: 'frost', title: 'Frost creep', gesture: 'open palm towards the camera', from: 'handfx_filter (ShockFX)' },
+  { id: 'portal', title: 'Portal ring', gesture: 'open palm towards the camera', from: 'handfx_filter (ShockFX)' },
+  { id: 'disco', title: 'Disco ball', gesture: 'both hands raised', from: 'handfx_filter (ShockFX)' },
+  { id: 'slime', title: 'Slime drip', gesture: 'palms together', from: 'handfx_filter (ShockFX)' },
+  { id: 'inkflow', title: 'Ink flow', gesture: 'swipe', from: 'handfx_filter (ShockFX)' },
+  { id: 'shatter', title: 'Shatter shards', gesture: 'fist', from: 'handfx_filter (ShockFX)' },
+  { id: 'cyber', title: 'Cyber glitch', gesture: 'fist', from: 'handfx_filter (ShockFX)' },
+  { id: 'bloomlife', title: 'Bloom life', gesture: 'both palms up', from: 'handfx_filter (ShockFX)' },
+  { id: 'echo', title: 'Echo trails', gesture: 'any hand', from: 'handfx_filter (ShockFX)' },
+  { id: 'bodyonfire', title: 'Body on fire', gesture: 'body page sees a body', from: 'ShockFX body page (PoseLandmarker)' },
+  { id: 'bodysmoke', title: 'Body smoke', gesture: 'body page sees a body', from: 'ShockFX body page (PoseLandmarker)' },
+  { id: 'frozenbody', title: 'Frozen body', gesture: 'body page sees a body', from: 'ShockFX body page (PoseLandmarker)' },
+  { id: 'edit', title: 'Hand edit', gesture: 'fist (draws where the fingertips point)', from: 'handfx_filter (ShockFX)' },
+  { id: 'electroshock', title: 'Electro shockwave', gesture: 'open palm towards the camera', from: 'handfx_filter (ShockFX)' },
+  { id: 'meteor', title: 'Meteor', gesture: 'both hands raised', from: 'handfx_filter (ShockFX)' },
+  { id: 'shoot', title: 'Shoot', gesture: 'point (index only)', from: 'handfx_filter (ShockFX)' },
 ];
 
 /** Projectile skins `shoot` may wear; the renderer's registry accepts exactly these two. */
@@ -291,8 +291,8 @@ function build(ctx) {
         nosimdWasm: fs.existsSync(path.join(VENDOR, 'vision', 'wasm-nosimd', 'vision_wasm_nosimd_internal.wasm')),
         base: '/api/handfx/vendor',
       },
-      page: '/handfx',
-      bodyPage: '/handfx/body',
+      page: '/shockfx',
+      bodyPage: '/shockfx/body',
       // The page is isolated by the headers its manifest entry declares (COOP/COEP); the pane
       // reads this to say plainly whether a browser tab of /handfx will be a secure, isolated
       // document — it is the operator's camera permission that depends on it.

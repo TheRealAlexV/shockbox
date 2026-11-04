@@ -1,4 +1,4 @@
-// Hand FX camera relay — ffmpeg is the page's camera.
+// ShockFX camera relay — ffmpeg is the page's camera.
 //
 // Why this exists: on the streaming rig every physical camera is held by WebcamSwitcher, and a
 // browser cannot name a virtual device until a permission grant succeeds, so the overlay page can

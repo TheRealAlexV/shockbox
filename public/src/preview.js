@@ -385,7 +385,7 @@ export function mountPreview(host, opts = {}) {
   }
 
   /**
-   * Replace the previewed page (a rare, explicit choice: Hand FX's underlay, for instance). The
+   * Replace the previewed page (a rare, explicit choice: ShockFX's underlay, for instance). The
    * iframe is the same node; only its `src` changes, so a pane that repaints is not rebuilding it.
    */
   function setSrc(next) {

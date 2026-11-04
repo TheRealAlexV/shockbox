@@ -1,7 +1,7 @@
 # ShockBox architecture
 
 ShockBox is one Node process that serves an admin shell, module pages, a JSON API and one SSE
-bus. Every stream feature (LED wall, notifications, alerts, hand FX) is a folder under `modules/`.
+bus. Every stream feature (LED wall, notifications, alerts, ShockFX) is a folder under `modules/`.
 There is no build step and no dependency: the server imports only Node built-ins.
 
 ```
@@ -59,7 +59,7 @@ Core has exactly two generic hooks for things only a module knows:
 2. **Module asset mount.** A module may expose `mountPrefix` (e.g. `/vendor/`) and
    `mountFile(req, res, url, filePath)` on its API. Any GET/HEAD under `/api/<id>/<prefix>/…` is
    handed to that handler with the remainder of the path; core does not know what the files are.
-   HandFX serves its ~20 MB MediaPipe runtime this way.
+   ShockFX (module `handfx`) serves its ~20 MB MediaPipe runtime this way.
 
 There is no other core knowledge of a module: no route greps, no per-module conditions.
 

@@ -1,4 +1,4 @@
-// Gesture recognition for the handfx overlay.
+// Gesture recognition for the ShockFX overlay (module id `handfx`).
 //
 // Pure functions over MediaPipe's 21 landmarks (unit coords, 0–1, y down, z toward the camera
 // negative). No rendering, no camera: handed a hand it returns what the hand is doing, so the
@@ -8,7 +8,7 @@
 //   fireball   — fireball-controller/main.py `is_hand_open`: the mean distance of the four
 //                fingertips (8,12,16,20) from the palm centre (landmark 9) exceeds a threshold,
 //                i.e. an open hand, with the palm facing up for the ball to sit on.
-//   lightning  — obs-handfx "Hand FX" lightning: both hands present and raised, index and middle
+//   lightning  — obs-handfx "ShockFX" lightning: both hands present and raised, index and middle
 //                fingertips arched towards each other.
 // The rest are the module's own, chosen so a hand can drive a whole effect list.
 

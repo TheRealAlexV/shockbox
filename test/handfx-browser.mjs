@@ -1,7 +1,7 @@
 // Real-browser check of the handfx module, driven over CDP (no puppeteer dependency).
 //
 // What only a live browser can prove, and what this checks:
-//   · /handfx is served cross-origin isolated (COOP/COEP on the page, not just the API): the page
+//   · /shockfx is served cross-origin isolated (COOP/COEP on the page, not just the API): the page
 //     must report crossOriginIsolated === true, because a wasm+SIMD runtime needs it
 //   · the page boots: WebGL2 context, the effect programs compile, the tracker module imports
 //   · the module registers and its routes answer: /api/handfx/{status,settings,cmd,ack}, the
@@ -220,7 +220,7 @@ async function main() {
     const health = await (await fetch(`${srv.url}/health`)).json();
     ok('module registers', health.modules && health.modules.handfx === 'up', JSON.stringify(health.modules || {}));
 
-    const pageRes = await fetch(`${srv.url}/handfx`);
+    const pageRes = await fetch(`${srv.url}/shockfx`);
     const coi = {
       coop: pageRes.headers.get('cross-origin-opener-policy'),
       coep: pageRes.headers.get('cross-origin-embedder-policy'),
@@ -230,11 +230,11 @@ async function main() {
 
     // The body page is its own small source; it must be served isolated too (wasm + SIMD), and its
     // files with it, or the page cannot boot.
-    const bodyRes = await fetch(`${srv.url}/handfx/body`);
+    const bodyRes = await fetch(`${srv.url}/shockfx/body`);
     const bodyCoi = { coop: bodyRes.headers.get('cross-origin-opener-policy'), coep: bodyRes.headers.get('cross-origin-embedder-policy') };
     const bodyHtml = await bodyRes.text();
     ok('body page is served cross-origin isolated', bodyRes.ok && bodyCoi.coop === 'same-origin' && bodyCoi.coep === 'require-corp' && /body\/main\.js/.test(bodyHtml), `${bodyRes.status} ${JSON.stringify(bodyCoi)}`);
-    const bodyJs = await fetch(`${srv.url}/handfx/body/js/body/main.js`);
+    const bodyJs = await fetch(`${srv.url}/shockfx/body/js/body/main.js`);
     const bodySrc = await bodyJs.text();
     ok('body page script serves and names the missing-model path', bodyJs.ok && /model missing/.test(bodySrc) && /BroadcastChannel/.test(bodySrc), `${bodyJs.status} ${bodySrc.length}B`);
 
@@ -297,7 +297,7 @@ async function main() {
         const lc0 = { send: (method, params = {}) => raw(method, params), events: [], close: () => lws.close() };
         await lc0.send('Runtime.enable');
         await lc0.send('Page.enable');
-        await lc0.send('Page.navigate', { url: `${srv.url}/handfx/body?listener=1` });
+        await lc0.send('Page.navigate', { url: `${srv.url}/shockfx/body?listener=1` });
         for (let i = 0; i < 100; i++) {
           const st = await lc0.send('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true });
           if (st.result.value === 'complete') break;
@@ -314,7 +314,7 @@ async function main() {
 
       // The body page is a separate document: open it here (the listener already has one open for
       // the channel, but the driven page must be the one this session evaluates in).
-      await c.send('Page.navigate', { url: `${srv.url}/handfx/body?drive=1` });
+      await c.send('Page.navigate', { url: `${srv.url}/shockfx/body?drive=1` });
       const bodyBooted = await waitFor(c, 'Boolean(window.__handfxBody)', 15000).catch(() => false);
       if (!bodyBooted) console.log(`     body page console:\n       ${consoleLines.slice(-12).join('\n       ')}\n     url=${await evaluate(c, 'location.href')}`);
       // Drive the body page directly (a real click is the operator's path; the module's Start is
@@ -376,7 +376,7 @@ async function main() {
       const octl = await cdpPage(devtools, overlayTab.id);
       await octl.send('Page.enable');
       await octl.send('Runtime.enable');
-      await octl.send('Page.navigate', { url: `${srv.url}/handfx` });
+      await octl.send('Page.navigate', { url: `${srv.url}/shockfx` });
       for (let i = 0; i < 200; i++) {
         const r = await octl.send('Runtime.evaluate', { expression: 'Boolean(window.__handfx && window.__handfx.fx)', returnByValue: true });
         if (r.result.value) break;
@@ -482,7 +482,7 @@ async function main() {
 
     // ── 2. the page ────────────────────────────────────────────────────────
     await c.send('Network.enable');
-  await c.send('Page.navigate', { url: `${srv.url}/handfx` });
+  await c.send('Page.navigate', { url: `${srv.url}/shockfx` });
     const booted = await waitFor(c, 'Boolean(window.__handfx && window.__handfx.ready)');
     ok('page boots and layers compile', Boolean(booted), booted ? '' : 'window.__handfx.ready never true');
     if (!booted) {
@@ -725,7 +725,7 @@ async function main() {
 
     // ── 8. the full registry: every id draws, history/snapshot/particles/edit work ──
     // Back to the overlay page (the pane navigation above left it).
-    await c.send('Page.navigate', { url: `${srv.url}/handfx` });
+    await c.send('Page.navigate', { url: `${srv.url}/shockfx` });
     const overlayBack = await waitFor(c, 'Boolean(window.__handfx && window.__handfx.ready)', 12000);
     ok('overlay page boots again for the registry pass', Boolean(overlayBack), '');
 

@@ -47,15 +47,15 @@ helper (`:54-57`). Source of truth for what the server does with each body: this
 | key | page · cell | hotkey | AppKey | request |
 |---|---|---|---|---|
 | RATIO `16:9 / 9:16` | LED Wall · `8,1` | F24 | 135 | `POST /api/wall/cmd` body `{"cmd":"ratio.toggle"}` |
-| FX NEXT | Hand FX · `1,0` | F13 | 124 | `POST /api/handfx/cmd` body `{"cmd":"effect.next"}` |
-| FX PREV | Hand FX · `2,0` | F14 | 125 | `… {"cmd":"effect.prev"}` |
-| FIRE | Hand FX · `3,0` | F15 | 126 | `… {"cmd":"projectile.fire","args":{"skin":"projectile"}}` |
-| SKIN | Hand FX · `4,0` | F16 | 127 | runs `%LOCALAPPDATA%\ShockBox\handfx-skin-toggle.ps1` (reads status, then fires) |
-| TRACK | Hand FX · `5,0` | F17 | 128 | `… {"cmd":"tracking.toggle"}` |
-| MIRROR | Hand FX · `1,1` | F18 | 129 | `… {"cmd":"mirror.toggle"}` |
-| EDIT CLEAR | Hand FX · `2,1` | F19 | 130 | `… {"cmd":"edit.clear"}` |
-| RELOAD | Hand FX · `3,1` | F20 | 131 | `… {"cmd":"reload"}` |
-| *(back)* | Hand FX · `0,0` | — | — | Stream Deck `backtoparent` action, no HTTP |
+| FX NEXT | ShockFX · `1,0` | F13 | 124 | `POST /api/handfx/cmd` body `{"cmd":"effect.next"}` |
+| FX PREV | ShockFX · `2,0` | F14 | 125 | `… {"cmd":"effect.prev"}` |
+| FIRE | ShockFX · `3,0` | F15 | 126 | `… {"cmd":"projectile.fire","args":{"skin":"projectile"}}` |
+| SKIN | ShockFX · `4,0` | F16 | 127 | runs `%LOCALAPPDATA%\ShockBox\handfx-skin-toggle.ps1` (reads status, then fires) |
+| TRACK | ShockFX · `5,0` | F17 | 128 | `… {"cmd":"tracking.toggle"}` |
+| MIRROR | ShockFX · `1,1` | F18 | 129 | `… {"cmd":"mirror.toggle"}` |
+| EDIT CLEAR | ShockFX · `2,1` | F19 | 130 | `… {"cmd":"edit.clear"}` |
+| RELOAD | ShockFX · `3,1` | F20 | 131 | `… {"cmd":"reload"}` |
+| *(back)* | ShockFX · `0,0` | — | — | Stream Deck `backtoparent` action, no HTTP |
 
 The binder's `$Bindings` named entries (`bind-handfx-keys.ps1:60-77`), in its order: `wall-ratio`
 (`0x87`), `handfx-next` (`0x7C`), `handfx-prev` (`0x7D`), `handfx-fire` (`0x7E`), `handfx-tracking`
@@ -64,11 +64,11 @@ is appended to the check list with the literal name `127` (`:115`).
 
 Profile layout: the RATIO key sits on the **LED Wall** page at `8,1`
 (`patch-shockbox-keys.py:206-215`); the **Scenes 1** page gets a folder at `7,4` that opens the
-new **Hand FX** child page (`:217-226`); the child page is a 6×2 keypad with `0,0` = back
+new **ShockFX** child page (`:217-226`); the child page is a 6×2 keypad with `0,0` = back
 (`:245-257`, `313`). The child page is reached only through the folder key — the patcher never
 lists it in the profile's page order, so it lives as a folder child.
 
-**Profile UUID.** The Hand FX page's directory name is a UUID the patcher generates itself with
+**Profile UUID.** The ShockFX page's directory name is a UUID the patcher generates itself with
 `uuid.uuid4()` the first time it creates the page (`patch-shockbox-keys.py:201-204`, `245-248`,
 `305-311`), so it is **not committed anywhere** and differs per install. The UUID on the rig as of
 2026-10-31 is `823f02fd-a5fd-4b6b-b25d-4afcc851b0fb` — read it back from the installed profile at
@@ -202,7 +202,7 @@ Read-only tools in `/home/alex/OBS/tools/sd-soundctl/`:
 
 - `inspect-profile.py` — a profile **reader**: it loads a `.sdProfile` and prints its pages, the
   action at each cell and any unresolved `Image` references. Use it to answer "what is on key
-  `3,0` of the Hand FX page" without opening the app.
+  `3,0` of the ShockFX page" without opening the app.
 - `audit-visual.py` — reads a screenshot of the Stream Deck window (taken by `cap.ps1`) and
   measures per-cell ink/plate, flagging cells whose icon is missing or invisible
   (`audit-visual.py:1-14`, `84-142`). It resolves cell roles from its own `ROUTES` table

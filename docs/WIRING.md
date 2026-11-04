@@ -128,8 +128,11 @@ Page routes, as declared by the modules (these are what an OBS browser source sh
 | wall | `/wall/render` | `modules/wall/module.json:15` |
 | notifications | `/notify` | `modules/notifications/module.json:23` |
 | dialogs | `/dialogs` | `modules/dialogs/module.json:22` |
-| handfx | `/handfx` | `modules/handfx/module.json:126-129` |
-| handfx body | `/handfx/body` | `modules/handfx/module.json:136-137` |
+| handfx (ShockFX) | `/shockfx` | `modules/handfx/module.json:126-129` |
+| handfx body (ShockFX) | `/shockfx/body` | `modules/handfx/module.json:136-137` |
+
+The old `/handfx` and `/handfx/` URLs 301 to `/shockfx`, so a browser source saved before the
+rename still resolves.
 
 The admin shell is whatever `public/` serves at `/` (`server.mjs:58`, `core/server-http.mjs:191-205`).
 Which of these each OBS scene actually uses is **external** (the OBS scene collection).

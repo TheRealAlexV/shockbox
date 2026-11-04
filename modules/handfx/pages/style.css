@@ -1,4 +1,4 @@
-/* Hand FX overlay.
+/* ShockFX overlay.
  *
  * In OBS this page is a browser source: the canvas fills the source, everything else is hidden
  * unless the operator asks for it (`?controls=1` or `d`), and the page is transparent. In a

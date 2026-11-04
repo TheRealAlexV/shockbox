@@ -35,7 +35,7 @@ import { shapeFor } from '/src/preview.js';
 /** The four modules, in the order the wall's own stack draws them (wall first, overlays on top). */
 export const MODULES = [
   { id: 'wall', title: 'Wall', hint: 'full picture' },
-  { id: 'handfx', title: 'Hand FX', hint: 'hand overlay' },
+  { id: 'handfx', title: 'ShockFX', hint: 'hand overlay' },
   { id: 'dialogs', title: 'Dialogs', hint: 'phone strip' },
   { id: 'notifications', title: 'Notifs', hint: 'toast strip' },
 ];
@@ -412,7 +412,7 @@ export function mountMergedColumn(host, opts = {}) {
     }),
   );
 
-  /* Hand FX draws on its own camera canvas in its own pane; the strip mirrors those pixels. */
+  /* ShockFX draws on its own camera canvas in its own pane; the strip mirrors those pixels. */
   const fxEl = el('div', { class: 'mx-handfx' });
   const fxMirror = el('canvas', { class: 'mx-mirror' });
   fxMirror.hidden = true;
@@ -925,7 +925,7 @@ export function mountMergedColumn(host, opts = {}) {
   }
 
   /**
-   * Hand FX's picture is not a ShockBox render: the module draws it on its own camera canvas,
+   * ShockFX's picture is not a ShockBox render: the module draws it on its own camera canvas,
    * inside its own pane, and only while that pane's "Start preview" holds the camera. The strip
    * mirrors those pixels — a 2-D copy, refreshed with the poll — because moving the canvas out of
    * a live pane would blank the pane's own preview, and nothing here draws a second effect.

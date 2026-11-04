@@ -27,7 +27,7 @@ const MODULE_LABELS = {
   wall: 'Wall',
   dialogs: 'Dialogs',
   notifications: 'Notifications',
-  handfx: 'Hand FX',
+  handfx: 'ShockFX',
   core: 'Core',
 };
 

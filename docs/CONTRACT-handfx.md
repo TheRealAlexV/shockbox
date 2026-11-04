@@ -1,4 +1,4 @@
-# CONTRACT-handfx — hand and body FX
+# CONTRACT-handfx — ShockFX (hand and body FX)
 
 Purpose: hand tracking and layered WebGL2 effects for an OBS browser source — 23 effects, plus a
 body-tracking page whose segmentation mask drives three of them. Everything is computed in the
@@ -11,14 +11,14 @@ Source: `modules/handfx/server.js`, `module.json`, `ui/pane.js`, `pages/`, `page
 
 ```json
 {
-  "id": "handfx", "title": "Hand FX", "version": "1.0.0", "order": 40, "mount": "server.js",
+  "id": "handfx", "title": "ShockFX", "version": "1.0.0", "order": 40, "mount": "server.js",
   "channels": ["handfx"],
   "pages": [
-    { "route": "/handfx", "file": "pages/overlay.html", "title": "Hand FX overlay",
+    { "route": "/shockfx", "file": "pages/overlay.html", "title": "ShockFX overlay",
       "headers": { "Cross-Origin-Opener-Policy": "same-origin",
                    "Cross-Origin-Embedder-Policy": "require-corp",
                    "Cross-Origin-Resource-Policy": "cross-origin" } },
-    { "route": "/handfx/body", "file": "pages/body.html", "title": "Hand FX body tracking",
+    { "route": "/shockfx/body", "file": "pages/body.html", "title": "ShockFX body tracking",
       "headers": { "Cross-Origin-Opener-Policy": "same-origin",
                    "Cross-Origin-Embedder-Policy": "require-corp",
                    "Cross-Origin-Resource-Policy": "cross-origin" } }
@@ -31,6 +31,11 @@ Both pages are served via the core header hook so MediaPipe's wasm can run (`cro
 `/api/handfx/vendor/…`. The manifest's `pages` array is the only page list the registry reads
 (`core/registry.mjs:116`); the duplicate `files.pages` block that used to sit beside it was never
 read and has been removed.
+
+The module id is still `handfx` (it names the API prefix, the state folder and the setting keys),
+and the native filter's registered kind id is still `handfx_filter` — OBS scene items reference
+it. Only the titles changed. The old page URLs 301 to the new ones (`server.mjs`,
+`legacyFxRoutes`), so browser sources saved before the rename keep working.
 
 **Export shape:** the default export is an object whose `channels`, `mountPrefix` and `mountFile`
 are getters that build the API on first touch (`self(ctx)`), because the context only arrives in
@@ -131,8 +136,8 @@ matches what ships.
 
 | route | file | expects |
 |---|---|---|
-| `/handfx` | `pages/overlay.html` + `js/overlay/main.js` | isolated document; camera + MediaPipe `HandLandmarker`; SSE `/events?channels=handfx`; reads `/api/handfx/status`; posts `/ack` with effect/tracking/model/hands/gesture; receives body masks from the body page over its own channel |
-| `/handfx/body` | `pages/body.html` | isolated; MediaPipe pose + selfie segmenter; posts `{source:'body', open:true}` to `/ack` as a heartbeat; sends the mask to the overlay page |
+| `/shockfx` | `pages/overlay.html` + `js/overlay/main.js` | isolated document; camera + MediaPipe `HandLandmarker`; SSE `/events?channels=handfx`; reads `/api/handfx/status`; posts `/ack` with effect/tracking/model/hands/gesture; receives body masks from the body page over its own channel |
+| `/shockfx/body` | `pages/body.html` | isolated; MediaPipe pose + selfie segmenter; posts `{source:'body', open:true}` to `/ack` as a heartbeat; sends the mask to the overlay page |
 
 Engine modules (`pages/js/engine/`), importable by page and pane: `tracker.js` (camera, MediaPipe,
 synthetic hand), `gestures.js` (pure classifier, motion, gate), `fx.js` (WebGL2 renderer, effect

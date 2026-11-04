@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "ShockBox \u2014 one served app, plugin modules for OBS stream features (LED wall, notifications, alerts, hand FX).",
+  "description": "ShockBox \u2014 one served app, plugin modules for OBS stream features (LED wall, notifications, alerts, ShockFX).",
   "license": "PolyForm-Noncommercial-1.0.0",
   "engines": {
     "node": ">=22"

@@ -8,12 +8,12 @@ dependency: `server.mjs` imports only Node built-ins.
 | `wall` | LED wall renderer for a 1280×720 OBS browser source (`/wall/render`): LED grid, patterns, presets, blackout, bloom/streak/flare grading, a movable 9:16 fence, text slots, and a ratio key that a live forcing scene (Desktop, Theater, PHub, OnlyFans, CominOut) overrides to 16:9 |
 | `notifications` | the 405×720 toast strip (`/notify`) in iOS / Android / Win11 / macOS looks, spawned from the shared message pool, stacked and auto-closing, with a per-banner tone |
 | `dialogs` | fake Win95 / Win11 / macOS alert dialogs (`/dialogs`) with buttons and storm mode, from the same pool (message `kind` decides which module renders it), with a per-alert tone |
-| `handfx` | hand tracking and WebGL2 effects (`/handfx`) plus a body-tracking page (`/handfx/body`): 23 effects, MediaPipe in the page, everything computed client-side |
+| `handfx` | hand tracking and WebGL2 effects (`/shockfx`) plus a body-tracking page (`/shockfx/body`): 23 effects, MediaPipe in the page, everything computed client-side |
 
-Hand FX effects (23): `fireball`, `lightning`, `sparkring`, `embers`, `smoke`, `aura`, `wires`,
+ShockFX effects (23): `fireball`, `lightning`, `sparkring`, `embers`, `smoke`, `aura`, `wires`,
 `frost`, `portal`, `disco`, `slime`, `inkflow`, `shatter`, `cyber`, `bloomlife`, `echo`,
 `bodyonfire`, `bodysmoke`, `frozenbody`, `edit`, `electroshock`, `meteor`, `shoot`. Body tracking
-(pose + selfie segmenter on `/handfx/body`) drives `bodyonfire`, `bodysmoke` and `frozenbody`. All
+(pose + selfie segmenter on `/shockfx/body`) drives `bodyonfire`, `bodysmoke` and `frozenbody`. All
 rendering happens in the page: no camera frame, landmark, mask or per-frame state reaches the
 server; the page posts a status line (`/ack`) only.
 

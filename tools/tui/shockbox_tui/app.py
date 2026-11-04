@@ -342,7 +342,7 @@ class ShockBoxApp(App):
                     yield Button("Show dialog", id="dialog-show", variant="primary")
                     yield Button("Storm", id="dialog-storm")
                     yield Button("Clear", id="dialog-clear", variant="warning")
-            with TabPane("Hand FX", id="tab-handfx"):
+            with TabPane("ShockFX", id="tab-handfx"):
                 yield Static("—", id="handfx-status")
                 with Horizontal(id="handfx-row"):
                     yield Button("Prev", id="handfx-prev")

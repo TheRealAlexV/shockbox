@@ -260,6 +260,23 @@ function defaultSendPath(job) {
   return '/api/notifications/live';
 }
 
+// The module id stayed `handfx` but its pages are now titled ShockFX and served at /shockfx.
+// OBS browser sources still point at the old URLs, so they get a permanent redirect instead of
+// a 404. The API (`/api/handfx/*`) and the id are untouched.
+const LEGACY_FX_PAGES = new Map([
+  ['/handfx', '/shockfx'],
+  ['/handfx/', '/shockfx'],
+  ['/handfx/index.html', '/shockfx'],
+  ['/handfx/body', '/shockfx/body'],
+]);
+const legacyFxRoutes = [...LEGACY_FX_PAGES].map(([from, to]) => ({
+  path: from,
+  handler: (req, res, url) => {
+    res.writeHead(301, { Location: to + (url.search || ''), 'Cache-Control': 'no-store' });
+    res.end();
+  },
+}));
+
 const httpServer = createServer({
   port: PORT,
   host: HOST,
@@ -277,6 +294,8 @@ const httpServer = createServer({
     // Core never names the module; it asks every loaded module for its extra routes.
     extraRoutes: [
       ...poolRoutes({ pool, events, log: log.scope('pool') }),
+      // Old Hand FX page URLs → their ShockFX paths (301), so saved OBS browser sources keep working.
+      ...legacyFxRoutes,
       // The page copy of the shared tone player (`/mod/notifications/sound.mjs`), which the raw
       // module source cannot be: see browserSoundRoutes above.
       ...browserSoundRoutes,

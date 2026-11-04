@@ -1,4 +1,4 @@
-// Second wave of GLSL for the handfx overlay, same contract as fx-glsl.js: every program is
+// Second wave of GLSL for the ShockFX overlay, same contract as fx-glsl.js: every program is
 // GLSL ES 3.00 (`#version 300 es`), WebGL2 only, no extensions, and every fragment writes
 // premultiplied light + alpha (`outColor = vec4(col * a, a)`) so the composite pass can just add
 // it. Effects are deterministic from `u_time` and `u_seed`, and none may wash the frame flat.

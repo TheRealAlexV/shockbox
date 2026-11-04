@@ -1,11 +1,11 @@
-// Hand FX admin pane.
+// ShockFX admin pane.
 //
 // What the operator sets here is the server's (`PATCH /api/handfx/settings`): enable, effect order
 // and per-effect intensity, mirror, sensitivity, camera device, resolution, debug overlay, the
 // "next effect" gesture and the effect travel. What the pane shows about tracking is honest by
 // construction:
 //
-//   · the camera belongs to the overlay page. The pane's preview is that page itself (/handfx) in
+//   · the camera belongs to the overlay page. The pane's preview is that page itself (/shockfx) in
 //     a live 16:9 iframe, so hands, effects, camera and backdrop are the ones OBS draws — the pane
 //     no longer opens a second stream or draws its own approximation
 //   · the overlay reports hands and gestures on the bus (`handfx` → the `page` event); the pane
@@ -259,7 +259,7 @@ export async function render(container, ctx) {
     const bar = el('div', { class: 'hfx-head' });
     bar.append(
       el('div', { class: 'hfx-head-left' },
-        el('span', { class: 'hfx-title', text: 'Hand FX' }),
+        el('span', { class: 'hfx-title', text: 'ShockFX' }),
         el('span', { class: 'hfx-dot', 'data-tone': enabled ? 'ok' : 'idle' }),
         el('span', { class: 'hfx-state', text: enabled ? 'effects on' : 'effects off' }),
         el('span', { class: 'hfx-sep' }),
@@ -294,8 +294,8 @@ export async function render(container, ctx) {
     if (!pv) {
       pv = mountPreview(previewHost, {
         title: 'Preview',
-        hint: 'live /handfx page',
-        src: '/handfx',
+        hint: 'live /shockfx page',
+        src: '/shockfx',
         interactive: false,
         // the page is the whole 16:9 surface; no wall crop guide
         fence: false,
@@ -362,9 +362,9 @@ export async function render(container, ctx) {
 
   function lookCard() {
     const card = el('section', { class: 'panel' });
-    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Overlay' }), el('span', { class: 'panel-hint mono', text: (s.status && s.status.page) || '/handfx' })));
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Overlay' }), el('span', { class: 'panel-hint mono', text: (s.status && s.status.page) || '/shockfx' })));
     const body = el('div', { class: 'panel-body' });
-    const link = el('a', { class: 'gen-link hfx-open', href: (s.status && s.status.page) || '/handfx', target: '_blank', rel: 'noopener' },
+    const link = el('a', { class: 'gen-link hfx-open', href: (s.status && s.status.page) || '/shockfx', target: '_blank', rel: 'noopener' },
       el('span', { class: 'gen-link-title', text: 'Open the overlay page' }), el('span', { class: 'gen-link-go', text: 'open ↗', 'aria-hidden': 'true' }));
     body.append(link, el('p', { class: 'hfx-help', text: 'In OBS, add this URL as a Browser Source at the canvas size. The page hides its controls in OBS; ?controls=1 shows them.' }));
     card.append(body);

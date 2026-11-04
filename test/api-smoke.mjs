@@ -178,7 +178,7 @@ const overlayJs = await fetch(base + '/mod/dialogs/overlay/app.js');
 ok(overlayJs.status === 200 && /EventSource/.test(await overlayJs.text()), 'overlay module assets are served from the module dir');
 
 // A page that names an asset relative to itself while it is served at a module prefix
-// (`href="style.css"` at /handfx → /style.css → 404) fails silently: the document is 200, only the
+// (`href="style.css"` at /shockfx → /style.css → 404) fails silently: the document is 200, only the
 // stylesheet and the script are missing, and the OBS source is blank with no API call to blame. So
 // every declared page is walked here, every href/src resolved the way a browser resolves it (the
 // document URL, plus the page's <base> when it declares one), and each reference must be served.

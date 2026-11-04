@@ -329,7 +329,7 @@ window.__shotter = (() => {
     },
     // A GL buffer (bottom-up rows) encoded as a PNG data URL.
     async _shot(id, opts, log) {
-      const pose = await import('/handfx/js/engine/pose.js');
+      const pose = await import('/shockfx/js/engine/pose.js');
       const lm = pose.makeHand({ cx: 0.5, cy: 0.62, s: 0.3, rot: 0 });
       const lm2 = pose.makeHand({ cx: 0.34, cy: 0.6, s: 0.26, rot: 2.9, curl: { ring: 0.95, pinky: 0.95 } });
       const lm3 = pose.makeHand({ cx: 0.66, cy: 0.6, s: 0.26, rot: -2.9, right: true, curl: { ring: 0.95, pinky: 0.95 } });
@@ -600,7 +600,7 @@ try {
   page = await cdpPage(chrome.devtools);
   await page.send('Page.enable');
   await page.send('Runtime.enable');
-  await page.send('Page.navigate', { url: `${srv.url}/handfx?clean=1` });
+  await page.send('Page.navigate', { url: `${srv.url}/shockfx?clean=1` });
   for (let i = 0; i < 150; i++) {
     await sleep(200);
     const ready = await page.evaluate('Boolean(window.__handfx && window.__handfx.ready)').catch(() => false);

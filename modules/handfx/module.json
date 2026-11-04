@@ -1,10 +1,10 @@
 {
   "id": "handfx",
-  "title": "Hand FX",
+  "title": "ShockFX",
   "version": "1.0.0",
   "order": 40,
   "icon": "hand",
-  "description": "Hand tracking and layered WebGL2 effects for the stream: fireball on an open palm, lightning between arched fingertips, plus spark ring, ember rise and smoke veil. Tracking runs in the page; the server only owns what the operator sets and the command bus.",
+  "description": "ShockFX — hand tracking and layered WebGL2 effects for the stream: fireball on an open palm, lightning between arched fingertips, plus spark ring, ember rise and smoke veil. Tracking runs in the page; the server only owns what the operator sets and the command bus.",
   "channels": ["handfx"],
   "mount": "server.js",
   "ui": {
@@ -203,8 +203,8 @@
   },
   "pages": [
     {
-      "route": "/handfx",
-      "title": "Hand FX overlay",
+      "route": "/shockfx",
+      "title": "ShockFX overlay",
       "file": "pages/overlay.html",
       "headers": {
         "Cross-Origin-Opener-Policy": "same-origin",
@@ -213,8 +213,8 @@
       }
     },
     {
-      "route": "/handfx/",
-      "title": "Hand FX overlay (trailing slash)",
+      "route": "/shockfx/",
+      "title": "ShockFX overlay (trailing slash)",
       "file": "pages/overlay.html",
       "headers": {
         "Cross-Origin-Opener-Policy": "same-origin",
@@ -223,8 +223,8 @@
       }
     },
     {
-      "route": "/handfx/index.html",
-      "title": "Hand FX overlay (index)",
+      "route": "/shockfx/index.html",
+      "title": "ShockFX overlay (index)",
       "file": "pages/overlay.html",
       "headers": {
         "Cross-Origin-Opener-Policy": "same-origin",
@@ -233,8 +233,8 @@
       }
     },
     {
-      "route": "/handfx/body",
-      "title": "Hand FX body tracking",
+      "route": "/shockfx/body",
+      "title": "ShockFX body tracking",
       "file": "pages/body.html",
       "headers": {
         "Cross-Origin-Opener-Policy": "same-origin",

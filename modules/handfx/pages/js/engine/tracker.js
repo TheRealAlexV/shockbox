@@ -1,4 +1,4 @@
-// Camera + hand tracking for the handfx overlay. Runs in the page; the server never sees a frame.
+// Camera + hand tracking for the ShockFX overlay (module id `handfx`). Runs in the page; the server never sees a frame.
 //
 // One MediaPipe `HandLandmarker` in VIDEO mode, driven by requestAnimationFrame off the camera
 // track. Because a browser gives one camera to one tab, a second tab (the pane's preview) cannot
