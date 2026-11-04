@@ -4,10 +4,9 @@
 // the server over HTTP and paints from the SSE bus. A syntax check proves none of that, so this
 // mounts the shell in headless Chrome and asserts the things that can silently lie:
 //   · the pane renders (not the generic fallback) and nothing overflows horizontally
-//   · a real pointer drag on the preview moves the window and the server persists it
-//   · dragging never persists a preview (a crash mid-drag must not replace the choice)
-//   · the whole-wall ⇄ window toggle reads back from the server, not from local state
-//   · a refused ratio toggle is reported with the settled value, not swallowed
+//   · the preview is the module's real page in an iframe, not a redrawn approximation
+//   · the fence fields are a disabled readout of the rect the server derives from the ratio
+//   · the three-way ratio selector writes the server document and the guide follows it
 //   · a look slider reaches the settings document
 //
 //   node test/pane-browser.mjs             # boots its own server
@@ -206,109 +205,57 @@ try {
   // State from the server, straight (the same document the pane paints from).
   const live = async () => fetch(`${srv.url}/api/wall/live`).then((r) => r.json());
   const base = await live();
-  ok('server has the fence settings', Boolean(base.settings && base.settings.fence), Object.keys(base.settings || {}).length + ' keys');
+  ok('server reports the wall render document', Boolean(base.render && base.render.look), `ratio ${base.render?.ratio}`);
 
-  // Ratio must be 9:16 with a window for the drag test to mean anything.
-  await fetch(`${srv.url}/api/wall/settings`, {
-    method: 'PATCH',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ratio: '9:16', fence: { x: 880, y: 0, w: 1440, h: 2560 } }),
-  });
-  // The pane learns this from the server on its own (a `wall-state` push, else the poll). Wait for
-  // it to draw the window: a `.pv-window` still hidden by whole-wall mode carries a 0×0 rect, and
-  // every press derived from that rect lands at client y=0 — outside the picture, so the drag
-  // moves nothing and this test failed for a reason that had nothing to do with dragging.
-  const paneWindow = async () => JSON.parse(await c.eval(`JSON.stringify((function(){
-    var w=document.querySelector('#pane .pv-window');
-    var r=w?w.getBoundingClientRect():null;
-    return {on:!!r&&r.width>8&&r.height>8}; })())`));
-  for (let t0 = Date.now(); Date.now() - t0 < 8000 && !(await paneWindow()).on;) await sleep(120);
-  const before = (await live()).render.fence?.px;
-  ok('window is on the wall before the drag', Boolean(before), JSON.stringify(before));
-
-  // A real pointer drag on the preview: the window's own body is the drag handle. The surface
-  // centre is empty wall (the plane is taller than the 16:9 picture), so pressing there would
-  // test the "move the window to this point" click, not a drag.
-  // Scoped to the module pane: the merged preview column draws the same component in four slots at
-  // the top of the document, and a bare `.pv-frame` selector would pick the wall slot instead of
-  // the pane under test.
+  // The preview is the module's real page in an inert iframe: the src is the contract, and there
+  // is nothing left to redraw or drag. Scoped to #pane because the merged column mounts the same
+  // component at the top of the document.
   const inPane = (sel) => `(document.getElementById('pane')||document).querySelector('${sel}')`;
-  const box = await c.eval(`(function(){
-    var nodes = document.querySelectorAll('[data-wall-preview], #pane .pv-frame, .wall-surface, .preview-surface, #pane canvas, .preview');
-    for (var i=0;i<nodes.length;i++){ var r=nodes[i].getBoundingClientRect(); if(r.width>200&&r.height>100) return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height,cls:nodes[i].className,id:nodes[i].id}); }
-    return null; })()`);
-  ok('a draggable preview surface exists', Boolean(box), box || 'none');
-  if (box) {
-    const b = JSON.parse(box);
-    // The picture box: 15% of its width is the wall distance the window must travel.
-    const frame = JSON.parse(await c.eval(`(function(){var f=${inPane('.pv-frame')};var r=f.getBoundingClientRect();return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height});})()`));
-    const win = JSON.parse(await c.eval(`(function(){var f=${inPane('.pv-window')};var r=f.getBoundingClientRect();return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height});})()`));
-    // Press the middle of the VISIBLE window: a 9:16 window is taller than the 16:9 picture it is
-    // cut from, so the part below the frame's bottom edge is clipped and a press there misses.
-    const cx = Math.max(frame.x + 4, Math.min(win.x + win.w / 2, frame.x + frame.w - 4));
-    const cy = win.y + (Math.min(win.y + win.h, frame.y + frame.h) - win.y) / 2;
-    const dx = frame.w * 0.15;
-    await c.eval(`(function(){var n=${inPane('.pv-window')}; if(n&&n.focus) n.focus(); return true;})()`);
-    await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse' });
-    for (let i = 1; i <= 8; i++) {
-      await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx + (i * dx) / 8, y: cy, button: 'left', buttons: 1, pointerType: 'mouse' });
-      await sleep(40);
-    }
-    await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx + dx, y: cy, button: 'left', buttons: 0, clickCount: 1, pointerType: 'mouse' });
-    await sleep(900);
-    const after = (await live()).render.fence?.px;
-    const moved = after && before && after.x !== before.x;
-    ok('drag persisted the new fence x', Boolean(moved), `${before?.x} -> ${after?.x} (pressed at ${Math.round(cx)},${Math.round(cy)}, moved ${Math.round(dx)} px)`);
-    // The pane re-paints the fields (and the readout) from the committed rect.
-    const fields = JSON.parse(await c.eval(`(function(){
-      var f=${inPane('.pv-window')};
-      var inputs=[].slice.call(document.querySelectorAll('input[type=number]')).map(function(i){return Number(i.value);});
-      var out=document.querySelector('.wall-readout');
-      return JSON.stringify({cells: f && f.dataset.fenceCells || null, px: f && f.dataset.fencePx || null, num: inputs, readout: out ? out.textContent : ''});})()`));
-    const shownX = fields.cells ? Number(fields.cells.split(',')[0]) : NaN;
-    const wantX = after ? Math.round(after.x / (after.pitch?.x || 22.857)) : NaN;
-    const numMatch = fields.num.includes(Math.round(after?.x ?? -1));
-    const readoutMatch = Boolean(after) && fields.readout.includes(String(Math.round(after.x)));
-    ok('pane repaints the fence fields', Boolean(after) && (shownX === wantX || numMatch || readoutMatch), `cells ${fields.cells} (want x ${wantX}) num ${fields.num.join('/')} readout "${fields.readout.trim().slice(0, 40)}"`);
+  const iframeReady = await c.waitFor(`Boolean(${inPane('.pv-frame .pv-iframe')})`, 12000);
+  const src = await c.eval(`(function(){var f=${inPane('.pv-frame .pv-iframe')}; return f? f.getAttribute('src') : '';})()`);
+  ok('the wall preview mounts the module page in an iframe', iframeReady && src.startsWith('/wall/render'), src || 'no iframe');
 
-    // Nothing from a drag may land in the persisted snapshot until commit: the state file's
-    // lastSnapshot carries the committed px now, which is the point.
-    const st = path.join(srv.stateDir || '', 'wall', 'state.json');
-    if (srv.stateDir && fs.existsSync(st)) {
-      const doc = JSON.parse(fs.readFileSync(st, 'utf8'));
-      const snap = doc.lastSnapshot?.fence?.px;
-      ok('persisted snapshot matches the committed window', Boolean(snap) && snap.x === after.x, JSON.stringify(snap));
-    }
-    await shot(c, path.join(SCRATCH, 'pane-wall-dragged.png'));
-  }
-
-  // Whole wall ⇄ window through the pane's own control (`#wall-fence-on`, the window switch),
-  // then read the server back. The switch's direction is whatever it showed when pressed, so the
-  // expectation comes from that: pressing it flips the wall, whichever way it was.
-  const toggled = await c.eval(`(function(){
-    var t=document.querySelector('#wall-fence-on');
-    if(!t) return 'no control';
-    var was=t.checked;
-    t.checked=!was;
-    t.dispatchEvent(new Event('change',{bubbles:true}));
-    return JSON.stringify({was:was, now:t.checked}); })()`);
-  await sleep(900);
-  const afterToggle = (await live()).render.fence;
-  const ratioAfter = (await live()).render.ratio;
-  const ask = toggled === 'no control' ? null : JSON.parse(toggled);
-  const fenceNow = afterToggle?.px ?? null;
-  // Turning the window off posts `ratio: 16:9` only: the stored rect is the window the switch
-  // restores, so the fence px staying put is correct. The ratio is what says whole wall.
-  ok('the whole-wall control changes the server document',
-    Boolean(ask) && ratioAfter === (ask.now ? '9:16' : '16:9') && (!ask.now || Boolean(fenceNow)),
-    `${ask ? (ask.was ? 'on → off' : 'off → on') : toggled} → fence ${fenceNow ? 'set' : 'null'}, ratio ${ratioAfter}`);
-  // put the window back for later checks
+  // Ratio is a setting; the 9:16 window derives from it on the server. Put the wall on 9:16 and
+  // wait for the pane to paint the derived rect into its read-only fields.
   await fetch(`${srv.url}/api/wall/settings`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ratio: '9:16', fence: { x: 880, y: 0, w: 1440, h: 2560 } }),
+    body: JSON.stringify({ ratio: '9:16' }),
   });
-  await sleep(500);
+  const readout = async () => JSON.parse(await c.eval(`JSON.stringify((function(){
+    var out={};
+    ['x','y','w','h'].forEach(function(k){ var n=document.querySelector('#wall-fence-'+k); out[k]= n? {value:n.value,disabled:n.disabled} : null; });
+    var w=document.querySelector('#pane .pv-window'); var r=w?w.getBoundingClientRect():null;
+    out.window = !!r && r.width>8 && r.height>8;
+    return out; })())`));
+  const derived = (await live()).render.fence?.px;
+  for (let t0 = Date.now(); Date.now() - t0 < 8000 && Number((await readout()).x?.value) !== Math.round(derived?.x ?? -1);) await sleep(120);
+  const shown = await readout();
+  ok('the fence fields are a disabled readout of the derived window',
+    Boolean(derived) && ['x','y','w','h'].every((k) => shown[k] && shown[k].disabled && Number(shown[k].value) === Math.round(derived[k])),
+    `fields ${JSON.stringify(shown)} vs ${JSON.stringify(derived)}`);
+  ok('the 9:16 crop guide is drawn over the live page', shown.window, JSON.stringify(shown));
+
+  // The three-way ratio selector replaced the window switch. Each choice PATCHes `ratio`; the
+  // pane's state must come back from the server, not from the button just pressed.
+  const choices = JSON.parse(await c.eval(`JSON.stringify([].slice.call(document.querySelectorAll('#pane .wall-ratio .seg[data-value]')).map(function(b){ return b.dataset.value; }))`));
+  ok('the ratio selector offers default, 16:9 and 9:16', choices.join(',') === 'default,16:9,9:16', JSON.stringify(choices));
+  const clickRatio = (v) => c.eval(`(function(){var b=document.querySelector('#pane .wall-ratio .seg[data-value="${v}"]'); if(!b) return 'no control'; b.click(); return 'clicked';})()`);
+
+  await clickRatio('16:9');
+  await sleep(900);
+  const whole = (await live()).render;
+  ok('choosing 16:9 writes a whole wall to the server', whole.ratio === '16:9' && whole.fence === null,
+    `ratio ${whole.ratio}, fence ${whole.fence ? 'set' : 'null'}`);
+  ok('the crop guide is hidden on a whole wall', !(await readout()).window, 'window still drawn');
+
+  await clickRatio('9:16');
+  await sleep(900);
+  const restoredDoc = (await live()).render;
+  const restored = await readout();
+  ok('choosing 9:16 restores the derived window',
+    restoredDoc.ratio === '9:16' && Boolean(restoredDoc.fence?.px) && restored.window,
+    `ratio ${restoredDoc.ratio}, fence ${restoredDoc.fence ? 'px' : 'null'}`);
 
   // A look control writes the settings document (a placebo control is the failure mode here).
   const lookBefore = (await live()).settings.brightness.value;
@@ -397,10 +344,15 @@ try {
   const restoreRow = await c.eval('Boolean(document.querySelector("[id*=forceScenesRestore]")) || /restore on leaving/i.test(document.body.innerText)');
   ok('no control for a key the server ignores', !restoreRow, restoreRow ? 'a restore row is still rendered' : 'absent');
 
-  // A refused ratio toggle must surface the truth. Force a forcing scene by pointing the
-  // watcher at one, then click 9:16.
-  const forced = await c.eval('Boolean(document.body.innerText.match(/forces 16:9/i))');
-  ok('ratio state is visible in the pane', forced || true, forced ? 'forcing copy present' : 'no forcing scene (expected off-rig)');
+  // The ratio selector must show the ratio the wall is actually running, and a forcing scene is
+  // surfaced on the 9:16 choice (locked + the scene named) instead of leaving a dead control.
+  const ratioUi = JSON.parse(await c.eval(`JSON.stringify((function(){
+    var on=document.querySelector('#pane .wall-ratio .seg[aria-checked="true"]');
+    var pin=document.querySelector('#pane .wall-ratio .seg[data-value="9:16"]');
+    return { on: on? on.dataset.value : null, pin: pin? {locked: pin.dataset.locked, title: pin.title} : null };
+  })())`));
+  ok('the ratio selector shows the ratio the server is running', ratioUi.on === '9:16', JSON.stringify(ratioUi));
+  ok('a forcing scene is named on the locked choice', ratioUi.pin?.locked !== 'true' || /forces 16:9/.test(ratioUi.pin.title), JSON.stringify(ratioUi.pin));
 
   // ---------------------------------------------------------------------------------------
   // The three look dropdowns. Each one is a separate command (`preset.set`, `look.palette`,

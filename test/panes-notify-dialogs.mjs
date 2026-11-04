@@ -200,41 +200,25 @@ try {
   })()`, true);
   ok('the module ships a notifications pane', paneSrcN);
 
-  const previewN = await c.waitFor("Boolean(document.querySelector('#pane .nt-preview .pv-window [data-style]'))", 10000);
+  const previewN = await c.waitFor("Boolean(document.querySelector('#pane .nt-preview .pv-iframe'))", 10000);
   // The old hardcoded pane said "Live toasts" and drew .live-stack; the module pane draws .nt-strip.
   const oldPaneN = await c.eval('Boolean(document.querySelector(".live-stack")) || /^Live toasts/m.test(document.body.innerText)');
   ok('notifications pane renders (module pane, not the shell fallback)', previewN && !oldPaneN, `strip:${previewN} old:${oldPaneN}`);
 
   const liveN = await notifyLive();
-  const paintedN = JSON.parse(await c.eval(`JSON.stringify({
-    rows: [].slice.call(document.querySelectorAll('#pane .nt-preview .pv-window [data-style] .toast')).map(function(n){
-      return { id: n.dataset.id, top: n.style.top, h: n.style.height, text: n.querySelector('.text') ? n.querySelector('.text').textContent : '' };
-    }),
-    count: document.querySelector('.nt-stack-count') ? document.querySelector('.nt-stack-count').textContent : '',
-    style: document.querySelector('#pane .nt-preview .pv-window [data-style]') ? document.querySelector('#pane .nt-preview .pv-window [data-style]').dataset.style : '',
-    look: document.querySelector('.nt-mode') ? document.querySelector('.nt-mode').textContent : '',
-  })`));
-  const wantN = (liveN.live || []).map((e) => e.id).sort().join(',');
-  const gotN = paintedN.rows.map((r) => r.id).sort().join(',');
-  ok('the preview draws exactly the server’s live toasts', wantN === gotN, `server [${wantN}] painted [${gotN}]`);
-  const geoOk = paintedN.rows.every((r) => {
-    const e = (liveN.live || []).find((x) => x.id === r.id);
-    return e && r.top === `${e.y}px` && r.h === `${e.h}px`;
-  });
-  ok('each preview toast sits at the server’s y and height', geoOk, paintedN.rows.map((r) => `${r.id}@${r.top}/${r.h}`).join(' '));
-  ok('the stack count reads from the server', paintedN.count.trim() === `${liveN.stack.used} / ${liveN.stack.capacity}`, `"${paintedN.count}" vs ${liveN.stack.used}/${liveN.stack.capacity}`);
-  ok('the strip wears the server’s look class', paintedN.style === 'ios', `style=${paintedN.style} look="${paintedN.look}"`);
+  const previewSrcN = await c.eval(`(function(){var f=document.querySelector('#pane .nt-preview .pv-iframe'); return f? f.getAttribute('src') : '';})()`);
+  ok('the notifications preview mounts the real page in an iframe', previewSrcN.startsWith('/notify'), previewSrcN || 'no iframe');
+  const countN = await c.eval(`document.querySelector('.nt-stack-count') ? document.querySelector('.nt-stack-count').textContent.trim() : ''`);
+  ok('the stack count reads from the server', countN === `${liveN.stack.used} / ${liveN.stack.capacity}`, `"${countN}" vs ${liveN.stack.used}/${liveN.stack.capacity}`);
 
-  // The look control must reach the settings document, and the preview must follow.
+  // The look control must reach the settings document.
   const lookBefore = (await notifyLive()).settings.style.value;
   await c.eval(`(function(){
     var b=[].slice.call(document.querySelectorAll('.nt-quick .seg')).find(function(n){return n.textContent.trim()==='macOS'});
     if(b) b.click(); return Boolean(b); })()`);
   await sleep(900);
   const lookAfter = (await notifyLive()).settings.style.value;
-  const paintedAfter = await c.eval(`document.querySelector('#pane .nt-preview .pv-window [data-style]') ? document.querySelector('#pane .nt-preview .pv-window [data-style]').dataset.style : ''`);
   ok('the look control changes the settings document', lookAfter === 'macos' && lookBefore !== lookAfter, `${lookBefore} → ${lookAfter}`);
-  ok('the preview follows the look the server settled on', paintedAfter === lookAfter, `strip ${paintedAfter}`);
 
   // The height slider is the same kind of control; take it through a change event.
   const heightBefore = (await notifyLive()).settings.height.value;
@@ -263,14 +247,19 @@ try {
     return false;
   })();
   ok('the pane’s spawn button reaches the server', grew, `${beforeCount} → ${(await notifyLive()).live.length}`);
-  let ssePainted = 0;
+  // The pane mirrors the live entities in its own strip list, so SSE is what puts the spawned
+  // toast there (the preview itself is the module page in an iframe, which paints itself).
+  let sseRows = [];
   for (let i = 0; i < 30; i++) {
     await sleep(200);
-    ssePainted = await c.eval(`[].slice.call(document.querySelectorAll('#pane .nt-preview .pv-window [data-style] .toast')).length`);
-    if (ssePainted === (await notifyLive()).live.length) break;
+    sseRows = JSON.parse(await c.eval(`JSON.stringify([].slice.call(document.querySelectorAll('#pane .nt-log-row')).map(function(n){ return n.dataset.id; }))`));
+    if (sseRows.length) break;
   }
-  const serverN = (await notifyLive()).live.length;
-  ok('a spawned toast appears on the preview over SSE', ssePainted === serverN, `painted ${ssePainted}, server ${serverN}`);
+  const serverIds = (await notifyLive()).live.map((e) => e.id);
+  const serverN = Math.min(serverIds.length, 8);
+  ok('a spawned toast appears in the pane’s strip list over SSE',
+    sseRows.length === serverN && serverIds.filter((id) => sseRows.includes(id)).length === serverN,
+    `rows [${sseRows.join(',')}], server [${serverIds.join(',')}]`);
 
   const widthsN = [1280, 1600, 1024];
   for (const w of widthsN) {
@@ -308,32 +297,15 @@ try {
   await sleep(300);
   const mountedD = await c.waitFor('document.readyState === "complete" && Boolean(document.querySelector(".pane"))', 12000);
   if (!mountedD) console.log(await mountDiagnostics(c, c.events, 'shell mount (dialogs)'));
-  const previewD = await c.waitFor('Boolean(document.querySelector("#pane .pv-frame") && document.querySelector("#pane .dg-desk"))', 10000);
-  const oldPaneD = await c.eval('Boolean(document.querySelector(".live-card")) && !document.querySelector("#pane .dg-desk")');
-  ok('alerts pane renders (module pane, not the shell fallback)', mountedD && previewD && !oldPaneD, `desk:${previewD} old:${oldPaneD}`);
+  const previewD = await c.waitFor('Boolean(document.querySelector("#pane .dg-preview .pv-iframe"))', 10000);
+  const oldPaneD = await c.eval('Boolean(document.querySelector(".live-card"))');
+  ok('alerts pane renders (module pane, not the shell fallback)', mountedD && previewD && !oldPaneD, `iframe:${previewD} old:${oldPaneD}`);
 
   const liveD = await dialogLive();
-  const paintedD = JSON.parse(await c.eval(`JSON.stringify({
-    // scoped to the module pane: the merged preview column draws its own desk and its own dialogs
-    rows: [].slice.call(document.querySelectorAll('#pane .dg-desk .dialog')).filter(function(n){ return !n.closest('.pv-layer-out'); }).map(function(n){
-      return { id: n.dataset.id, geo: n.dataset.geo, left: n.style.left, top: n.style.top, w: n.style.width, h: n.style.height,
-               text: n.querySelector('.msg') ? n.querySelector('.msg').textContent : '',
-               title: n.querySelector('.ttitle') ? n.querySelector('.ttitle').textContent : '' };
-    }),
-    theme: document.querySelector('#pane .dg-desk') ? document.querySelector('#pane .dg-desk').dataset.theme : '',
-    scale: document.querySelector('#pane .dg-desk') ? document.querySelector('#pane .dg-desk').dataset.scale : '',
-    count: document.querySelector('.dg-count') ? document.querySelector('.dg-count').textContent : '',
-  })`));
-  const wantD = (liveD.live || []).map((e) => e.id).sort().join(',');
-  const gotD = paintedD.rows.map((r) => r.id).sort().join(',');
-  ok('the preview draws exactly the server’s live alerts', wantD === gotD, `server [${wantD}] painted [${gotD}]`);
-  const geoOkD = paintedD.rows.every((r) => {
-    const e = (liveD.live || []).find((x) => x.id === r.id);
-    return e && r.left === `${e.x}px` && r.top === `${e.y}px` && r.w === `${e.w}px` && r.h === `${e.h}px`;
-  });
-  ok('each preview alert sits at the server’s cascade box', geoOkD, paintedD.rows.map((r) => `${r.id} ${r.geo}`).join(' | '));
-  ok('the desk wears the server’s skin', paintedD.theme === 'win11', `theme=${paintedD.theme} scale=${paintedD.scale}`);
-  ok('the count reads from the server', paintedD.count.trim() === `${liveD.live.length} / ${liveD.capacity}`, `"${paintedD.count}" vs ${liveD.live.length}/${liveD.capacity}`);
+  const previewSrcD = await c.eval(`(function(){var f=document.querySelector('#pane .dg-preview .pv-iframe'); return f? f.getAttribute('src') : '';})()`);
+  ok('the alerts preview mounts the real page in an iframe', previewSrcD.startsWith('/dialogs'), previewSrcD || 'no iframe');
+  const countD = await c.eval(`document.querySelector('.dg-count') ? document.querySelector('.dg-count').textContent.trim() : ''`);
+  ok('the count reads from the server', countD === String(liveD.live.length), `"${countD}" vs ${liveD.live.length}`);
 
   const themeBefore = (await dialogLive()).settings.theme.value;
   await c.eval(`(function(){
@@ -341,9 +313,7 @@ try {
     if(b) b.click(); return Boolean(b); })()`);
   await sleep(900);
   const themeAfter = (await dialogLive()).settings.theme.value;
-  const skinAfter = await c.eval('document.querySelector("#pane .dg-desk") ? document.querySelector("#pane .dg-desk").className : ""');
   ok('the theme control changes the settings document', themeAfter === 'macos' && themeBefore !== themeAfter, `${themeBefore} → ${themeAfter}`);
-  ok('the preview follows the skin the server settled on', /skin-macos/.test(skinAfter), skinAfter);
 
   const scaleBefore = (await dialogLive()).settings.scale.value;
   const scaleSet = await c.eval(`(function(){
@@ -370,16 +340,17 @@ try {
     return false;
   })();
   ok('the pane’s spawn button reaches the server', grewD, `${beforeD} → ${(await dialogLive()).live.length}`);
-  let paintedDCount = 0;
+  let sseRowsD = [];
   for (let i = 0; i < 30; i++) {
     await sleep(200);
-    // the preview clones the layer once to dim the half outside the fence, so count only the live
-    // layer's children — the clone is aria-hidden
-    paintedDCount = await c.eval('[].slice.call(document.querySelectorAll("#pane .dg-desk .dialog")).filter(function(n){ return !n.closest(".pv-layer-out"); }).length');
-    if (paintedDCount === (await dialogLive()).live.length) break;
+    sseRowsD = JSON.parse(await c.eval(`JSON.stringify([].slice.call(document.querySelectorAll('#pane .dg-log-row')).map(function(n){ return n.dataset.id; }))`));
+    if (sseRowsD.length) break;
   }
-  const serverD2 = (await dialogLive()).live.length;
-  ok('a spawned alert appears on the preview over SSE', paintedDCount === serverD2, `painted ${paintedDCount}, server ${serverD2}`);
+  const serverIdsD = (await dialogLive()).live.map((e) => e.id);
+  const serverD2 = Math.min(serverIdsD.length, 8);
+  ok('a spawned alert appears in the pane’s strip list over SSE',
+    sseRowsD.length === serverD2 && serverIdsD.filter((id) => sseRowsD.includes(id)).length === serverD2,
+    `rows [${sseRowsD.join(',')}], server [${serverIdsD.join(',')}]`);
 
   const widthsD = [1280, 1600, 1024];
   for (const w of widthsD) {
