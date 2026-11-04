@@ -23,7 +23,7 @@ import { createRelay } from './relay.js';
 import { rearmCamera } from './rearm.js';
 import { createWatchdog } from './watchdog.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
-import { FxRenderer, EFFECTS, anchorsFrom } from '../engine/fx.js';
+import { FxRenderer, EFFECTS, anchorsFrom, fenceRectFor } from '../engine/fx.js';
 
 const $ = (id) => document.getElementById(id);
 const stage = $('stage');
@@ -152,8 +152,19 @@ async function loadStatus() {
   return res.json();
 }
 
-function applySettings(status) {
-  // Values may arrive bare (the test and the pane's console hand in plain values) or wrapped as
+/**
+ * The stage the server resolved for this page: `default` has already followed the global wall
+ * ratio there, so `status.settings.ratio` is either a bare string or `{value, effective}`. Absent
+ * (an old status document or a bare test harness) means no fence, never a guessed portrait wall.
+ */
+function ratioOf(status) {
+  const doc = status && status.settings && status.settings.ratio;
+  if (typeof doc === 'string') return doc;
+  if (doc && typeof doc === 'object') return doc.effective || doc.value || 'default';
+  return 'default';
+}
+
+function applySettings(status) {  // Values may arrive bare (the test and the pane's console hand in plain values) or wrapped as
   // `{ value }` (what server.js serves from settings.describe()). Both are the same document.
   const s = {};
   for (const [k, d] of Object.entries(status.settings || {})) s[k] = d && typeof d === 'object' && 'value' in d ? d.value : d;
@@ -170,6 +181,9 @@ function applySettings(status) {
     mirror: s.mirror !== false,
     debugOverlay: s.debugOverlay === true,
     enabled: s.enabled !== false && s.obsHandFx !== false,
+    // The stage the particles are fenced to. Resolved server-side (`default` already followed the
+    // global ratio), so the page never has to guess what `default` means right now.
+    ratio: ratioOf(status),
   });
   if (s.debugOverlay && !debugCanvas) {
     debugCanvas = document.createElement('canvas');
@@ -914,6 +928,13 @@ function ack(now = performance.now()) {
       // A failed ack is not page state, but a successful one is the liveness proof the watchdog
       // waits for: no ack for 5 s means this page's own connection is gone.
       if (res.ok) watchdog.ok();
+      return res.ok ? res.json().catch(() => null) : null;
+    })
+    .then((doc) => {
+      // The server resolves `default` on every read, so a ratio changed in core (or by a scene)
+      // reaches the fence within one beat even though no settings frame was published to the page.
+      const ratio = doc && doc.ratio;
+      if ((ratio === '9:16' || ratio === '16:9') && ratio !== fx.settings.ratio) fx.setSettings({ ratio });
     })
     .catch(() => {});
 }
@@ -966,6 +987,19 @@ function drawDebug(frame, hands, now) {
     } catch {
       /* first frame can be empty */
     }
+  }
+  // The fence the particles feel, drawn only in debug: the OBS source stays clean, and the
+  // operator can see where the wall is while tuning. Derived from the same formula the engine uses.
+  const wall = fenceRectFor(fx.settings.ratio, w, h);
+  if (wall) {
+    debugCtx.strokeStyle = 'rgba(255,214,102,.6)';
+    debugCtx.lineWidth = 1;
+    debugCtx.beginPath();
+    debugCtx.moveTo(wall.x + 0.5, 0);
+    debugCtx.lineTo(wall.x + 0.5, h);
+    debugCtx.moveTo(wall.x + wall.w - 0.5, 0);
+    debugCtx.lineTo(wall.x + wall.w - 0.5, h);
+    debugCtx.stroke();
   }
   for (const hand of hands) {
     const lm = hand.landmarks;

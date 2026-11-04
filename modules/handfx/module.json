@@ -19,6 +19,14 @@
       "help": "Optional, per effect. Only 'shoot' wears a skin today; absent means the default projectile orb. Written by the pane's skin switch and by projectile.fire {skin}.",
       "group": "effects"
     },
+    "ratio": {
+      "type": "enum",
+      "default": "default",
+      "values": ["default", "16:9", "9:16"],
+      "label": "Stage ratio",
+      "group": "ratio",
+      "help": "default follows the global wall ratio. 9:16 makes the centred portrait column a physical wall for moving particles; tracking and classification still read the whole 16:9 frame. 16:9 leaves the whole frame open."
+    },
     "enabled": {
       "type": "boolean",
       "default": true,

@@ -192,6 +192,23 @@ function build(ctx) {
   const { events, log } = ctx;
   const settings = ctx.settings;
   let lastCmd = null;
+  // The ratio this page draws. `default` follows the show-wide core ratio, exactly like the wall,
+  // the dialogs and the notifications, so one global value drives every surface. Resolved on every
+  // read, never stored: a `default` left in a settings document must not freeze an old resolution.
+  const effectiveRatio = () => {
+    const own = settings.get('ratio');
+    if (own === '9:16' || own === '16:9') return own;
+    const core = ctx.core && ctx.core.settings;
+    const global = core && typeof core.get === 'function' ? core.get('ratio') : null;
+    return global === '9:16' ? '9:16' : '16:9';
+  };
+  // The settings document plus the one derived value a page cannot compute itself: `ratio` is
+  // declared as `default`, and the fence geometry depends on what that resolved to right now.
+  const settingsPayload = () => {
+    const out = settings.describe();
+    if (out.ratio && typeof out.ratio === 'object') out.ratio.effective = effectiveRatio();
+    return out;
+  };
   // Body-tracking status: updated only by the overlay's /ack (a timestamp, never a frame) and by
   // the body page's own /ack. Read back on /status so the pane can say whether a mask is arriving.
   const body = { lastMaskAt: 0, pageOpen: false, lastPoseAt: 0 };
@@ -280,7 +297,7 @@ function build(ctx) {
       // reads this to say plainly whether a browser tab of /handfx will be a secure, isolated
       // document — it is the operator's camera permission that depends on it.
       isolation: { crossOriginOpenerPolicy: 'same-origin', crossOriginEmbedderPolicy: 'require-corp' },
-      settings: settings.describe(),
+      settings: settingsPayload(),
       lastCmd,
     };
   }
@@ -359,7 +376,10 @@ function build(ctx) {
               pipe.setMode(now);
               publish('settings.patch', { key: 'publish', value: now });
             }
-            return send(res, 200, { ok: true, changed, settings: settings.describe(), publish: pipe.status() });
+            // A ratio write changes where the wall sits, and the overlay re-derives its fence from
+            // the status document: without this frame it would keep the old wall until a reload.
+            if (changed.includes('ratio')) publish('settings.patch', { key: 'ratio', value: effectiveRatio() });
+            return send(res, 200, { ok: true, changed, settings: settingsPayload(), publish: pipe.status() });
           } catch (err) {
             return send(res, err.status || 400, { ok: false, error: err.message });
           }
@@ -392,12 +412,12 @@ function build(ctx) {
           if (cmd === 'tracking.toggle') {
             const changed = settings.patch({ enabled: !settings.get('enabled') });
             publish(cmd, { ...args, enabled: settings.get('enabled') });
-            return send(res, 200, { ok: true, changed, enabled: settings.get('enabled'), settings: settings.describe() });
+            return send(res, 200, { ok: true, changed, enabled: settings.get('enabled'), settings: settingsPayload() });
           }
           if (cmd === 'mirror.toggle') {
             const changed = settings.patch({ mirror: !settings.get('mirror') });
             publish(cmd, { ...args, mirror: settings.get('mirror') });
-            return send(res, 200, { ok: true, changed, mirror: settings.get('mirror'), settings: settings.describe() });
+            return send(res, 200, { ok: true, changed, mirror: settings.get('mirror'), settings: settingsPayload() });
           }
           if (cmd === 'effect.set') {
             // The pane and Stream Deck set the *effect list*, not a cursor: `args.value` is the
@@ -413,7 +433,7 @@ function build(ctx) {
               }
               const changed = settings.patch({ effects: value });
               publish(cmd, { ...args, effects: settings.get('effects') });
-              return send(res, 200, { ok: true, changed, settings: settings.describe() });
+              return send(res, 200, { ok: true, changed, settings: settingsPayload() });
             }
             const id = args.id;
             if (!EFFECTS.some((e) => e.id === id)) {
@@ -502,7 +522,7 @@ function build(ctx) {
             lastDrawAt: draw.lastDrawAt,
             at: Date.now(),
           });
-          send(res, 200, { ok: true });
+          send(res, 200, { ok: true, ratio: effectiveRatio() });
         },
       },
 

@@ -407,13 +407,69 @@ void main() {
 /* ------------------------------------------------------------------ particles */
 
 const PARTICLES = 512;
-const P_FIELDS = ['x', 'y', 'vx', 'vy', 'age', 'life', 'size', 'skin'];
+const P_FIELDS = ['x', 'y', 'vx', 'vy', 'age', 'life', 'size', 'skin', 'mode'];
 /** The 9:16 page has side walls: how much of a hit comes back, how much of the slide it keeps, and
- *  how long a particle is allowed to live on after touching one (a fireball spends itself on the
- *  wall instead of bouncing for the rest of its life). */
+ *  how long a particle is allowed to live on after touching one (an explosive particle spends
+ *  itself on the wall instead of bouncing for the rest of its life). */
 const FENCE_RESTITUTION = 0.35;
 const FENCE_FRICTION = 0.9;
 const FENCE_IMPACT_LIFE = 0.12;
+
+/**
+ * The ratio's stage, in canvas pixels. 9:16 is the centred portrait column inside the full-surface
+ * page — width = height*9/16, x centred, y 0, full height — and 16:9 (or an unresolved `default`)
+ * is the whole frame, so there is no wall to report. Pure: the fence is a formula, not a stored
+ * rect, so a headless test can check it without a canvas and a ratio change re-derives it.
+ */
+export function fenceRectFor(ratio, width, height) {
+  if (ratio !== '9:16' || !(width > 0) || !(height > 0)) return null;
+  const w = (height * 9) / 16;
+  return { x: (width - w) / 2, y: 0, w, h: height };
+}
+
+/**
+ * One particle's motion step, the fence included. Pure over numbers so the boundary rule can be
+ * tested without WebGL, and so every effect that spawns a particle inherits the same wall.
+ *
+ * `fence` is `{x0, x1}` in page-x (0..1 across the canvas); `null` is open flight. A record that
+ * crosses an edge is placed on the wall and its x-velocity flipped and scaled by `restitution`,
+ * with the slide damped by `friction` and the remaining life clipped to `impactLife` — a wall hit
+ * is an ending, not a trampoline. `mode` 1 (an explosive burst) is instead consumed: the result is
+ * `dead` and the caller detonates at the contact point. 16:9 passes straight through.
+ */
+export function stepParticle(p, dt, fence, {
+  radiusToX = 0,
+  restitution = FENCE_RESTITUTION,
+  friction = FENCE_FRICTION,
+  impactLife = FENCE_IMPACT_LIFE,
+} = {}) {
+  const next = { x: p.x + p.vx * dt, y: p.y + p.vy * dt, vx: p.vx, vy: p.vy, life: p.life, hit: null, dead: false };
+  if (!fence) return next;
+  // A drawn orb is `size` field units tall, which is size / (2 * aspect) in page-x, so the wall
+  // inset is that radius: the picture touches the wall, not the particle's centre.
+  const inset = Math.max(0, (p.size || 0) * radiusToX);
+  const lo = fence.x0 + inset;
+  const hi = fence.x1 - inset;
+  if (lo > hi) return next; // a column narrower than the particle has no inside to be in
+  if (next.x < lo || next.x > hi) {
+    const side = next.x < lo ? lo : hi;
+    const inward = next.x < lo ? 1 : -1; // normal of the wall it touched
+    // Only a particle arriving from inside is an impact; a clamped one is just held against it.
+    const impact = next.vx * inward < 0;
+    next.x = side;
+    next.hit = { x: side, y: next.y, impact };
+    if (impact && p.mode === 1) {
+      next.vx = 0;
+      next.vy = 0;
+      next.dead = true;
+      return next;
+    }
+    next.vx = inward * Math.abs(next.vx) * restitution;
+    next.vy *= friction;
+    next.life = Math.min(next.life, p.age + impactLife);
+  }
+  return next;
+}
 
 /**
  * A tiny CPU particle store, flat `Float32Array` records so a headless test can count and a batched
@@ -461,7 +517,7 @@ export class FxRenderer {
     this.error = null;
     this.supported = false;
     this.live = new Map(); // id -> Live
-    this.settings = { effects: EFFECT_ORDER.slice(), intensity: {}, bufferScroll: 0.35, mirror: true, debugOverlay: false, enabled: true };
+    this.settings = { effects: EFFECT_ORDER.slice(), intensity: {}, bufferScroll: 0.35, mirror: true, debugOverlay: false, enabled: true, ratio: 'default' };
     this.time0 = performance.now();
     this.frame = 0;
     this.debugGl = false; // set true from the browser test to collect the first error per stage
@@ -797,6 +853,8 @@ export class FxRenderer {
       // field-space radius: page-space sizes scale with the shorter side, like every other anchor
       data[o + 6] = (skin === 1 ? 0.035 : 0.018) * (0.7 + Math.random() * 0.7);
       data[o + 7] = skin;
+      // An explosive burst spends itself on the wall (see `stepParticle`); a projectile bounces.
+      data[o + 8] = kind === 'meteor' ? 1 : 0;
     }
     return n;
   }
@@ -817,19 +875,28 @@ export class FxRenderer {
     return this.particles.count;
   }
 
+  /**
+   * The wall the resolved ratio puts in front of the particles, in canvas pixels; `null` in 16:9.
+   * Derived on every call from the ratio and the live canvas size, never stored, so a ratio change
+   * or a resize moves the fence on the next frame and a mount with `default` is ratio-agnostic.
+   */
+  fenceRect() {
+    return fenceRectFor(this.settings.ratio, this.w || 0, this.h || 0);
+  }
+
   /** Advance the particle store by `dt` seconds and retire what expired. */
   _integrateParticles(dt) {
     const data = this.particles.data;
     const L = P_FIELDS.length;
-    // The 9:16 page is taller than wide, so its side walls are physical ground: an effect thrown at
-    // the edge hits the wall and comes back rather than sailing out of frame. The bounds come from
-    // the viewport ratio the shaders already use (u_aspect), never from a pixel constant: a drawn
-    // orb is `size` field units tall, which is size / (2 * aspect) in page-x, so the wall inset is
-    // that radius. 16:9 keeps the free-flight rule below — no fence, off-frame records retire.
+    // The fence is the ratio's stage, not the viewport's shape: in 9:16 the portrait column is
+    // physical ground, so an effect thrown at its edge hits the wall and comes back rather than
+    // sailing out of the picture, while tracking and classification still read the whole frame.
+    // 16:9 (`fence` null) keeps the free-flight rule — off-frame records retire.
+    const rect = this.fenceRect();
+    const fence = rect ? { x0: rect.x / this.w, x1: (rect.x + rect.w) / this.w } : null;
     const aspect = this.h > 0 ? this.w / this.h : 1;
-    const fenced = aspect < 1;
     const radiusToX = 1 / (2 * aspect);
-    const impacts = fenced ? [] : null;
+    const impacts = fence ? [] : null;
     for (let r = this.particles.count - 1; r >= 0; r--) {
       const o = r * L;
       data[o + 4] += dt;
@@ -837,23 +904,27 @@ export class FxRenderer {
         this.particles.kill(o);
         continue;
       }
-      data[o + 0] += data[o + 2] * dt;
-      data[o + 1] += data[o + 3] * dt;
-      if (fenced) {
-        const inset = data[o + 6] * radiusToX;
-        const x = data[o + 0];
-        if (x < inset || x > 1 - inset) {
-          const hit = x < inset ? inset : 1 - inset;
-          const inward = x < inset ? 1 : -1; // normal of the wall it touched
-          // Only a particle arriving from inside is an impact; a clamped one is just held.
-          const impact = data[o + 2] * inward < 0;
-          data[o + 0] = hit;
-          data[o + 2] = inward * Math.abs(data[o + 2]) * FENCE_RESTITUTION;
-          data[o + 3] *= FENCE_FRICTION;
-          data[o + 5] = Math.min(data[o + 5], data[o + 4] + FENCE_IMPACT_LIFE);
-          if (impact && impacts.length < 6) impacts.push(hit, data[o + 1]);
-        }
+      const step = stepParticle(
+        {
+          x: data[o + 0], y: data[o + 1], vx: data[o + 2], vy: data[o + 3],
+          age: data[o + 4], life: data[o + 5], size: data[o + 6], mode: data[o + 8],
+        },
+        dt,
+        fence,
+        { radiusToX },
+      );
+      data[o + 0] = step.x;
+      data[o + 1] = step.y;
+      data[o + 2] = step.vx;
+      data[o + 3] = step.vy;
+      data[o + 5] = step.life;
+      // An explosive particle is consumed by the wall; a projectile was only reflected.
+      if (step.dead) {
+        this.particles.kill(o);
+        if (step.hit && step.hit.impact && impacts.length < 6) impacts.push(step.hit.x, step.hit.y);
+        continue;
       }
+      if (step.hit && step.hit.impact && impacts.length < 6) impacts.push(step.hit.x, step.hit.y);
       // Off-frame particles are retired here, so the store cannot grow with invisible records and
       // a later draw cannot resurrect one.
       if (data[o + 0] < -0.15 || data[o + 0] > 1.15 || data[o + 1] < -0.15 || data[o + 1] > 1.15) {
