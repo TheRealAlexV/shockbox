@@ -1,46 +1,37 @@
-/* ShockBox module previews — one component, every module, one shape.
+/* ShockBox module previews — one component, every module, one live picture.
  *
  * WHY THIS FILE EXISTS
- * Every module pane used to draw its own idea of "preview": the wall pane built a 9:16 drag
- * plane plus a cut-out window; the handfx, notifications and dialogs panes each guessed. The
- * operator reported the wall's preview as "far too tall, looks like three 16:9s stacked" — which
- * is exactly what a 9:16 portrait box drawn at its natural height inside a pane does.
+ * Panes used to redraw their module's look in plain DOM, so wall gradients, dialog skins and
+ * HandFX never appeared. This component mounts the module's real page in an iframe and gives it
+ * the one shape every pane shares.
  *
- * THE FIX IS GEOMETRY, NOT A HEIGHT CAP
- * One frame, one aspect: every module preview renders into a 16:9 box (the LED wall's real
- * picture). Inside that box the *content layer* — the module's own look — is drawn as a
- * **9:16 window**: the portrait strip that actually reaches the phone/TikTok crop. The frame is
- * never taller than 0.5625 × its width, so no pane can grow a portrait column that scrolls off
- * the screen, and every module is the same shape at the same size in the same place.
+ * THE RULE IS GEOMETRY
+ * One frame, one aspect: the preview cell's full width, aspect-ratio 16/9. The page fills that
+ * frame at 100% x 100%, so it scales with the cell instead of sitting in a fixed pixel box and
+ * nothing is stretched. The 9:16 window is an app-side crop guide drawn over the page (the wall's
+ * OBS window); it never changes the page's own size.
  *
- *   ┌─ frame (16:9, the wall picture) ────────────────┐
- *   │  ╎━━━━━━━━┃━━━━━━━━━━━━╎                        │
- *   │  ╎ portrait ┃ 9:16 window ╎  ← the fence        │
- *   │  ╎  content  ┃ (what OBS shows)                 │
- *   └─────────────────────────────────────────────────┘
- *
- * The window is a real cut-out: content inside it is drawn at full strength, everything outside
- * is dimmed (and can be more dimmed with the dim slider), so "what leaves the crop" is obvious
- * without a second thumbnail.
+ * The iframe is inert: no pointer, no focus, no scrollbars. It is created once per pane and
+ * re-attached or resized, never recreated per tick.
  *
  * USAGE (module panes)
  *
- *   import { mountPreview } from '/public/src/preview.js';   // shell resolves the URL
+ *   import { mountPreview } from '/src/preview.js';   // shell resolves the URL
  *
  *   const pv = mountPreview(container, {
  *     title: 'Wall preview',
- *     hint: '2560 × 1440 · drag to move',
+ *     hint: '2560 × 1440',
+ *     src: '/wall/render?scale=1',     // the module's real page, in an iframe
+ *     shape: 'frame',                  // 'frame' = the 16:9 wall picture; 'window' = the 9:16 crop
  *     fence: { x: 0.41, w: 0.18 },     // optional: window left/width as fractions of the frame
  *     interactive: true,               // optional: enables pointer drag of the fence
  *     onFence(rect) {},                // optional: called on drag end with {x, w}
  *   });
- *   pv.setLook({ palette: ['#0ff', '#f0f', '#ff0'], brightness: 1, speed: 1, pattern: 'wave' });
- *   pv.setLayer(el('div', …));         // the module's own preview markup, drawn in the window
  *   pv.setBadge('live');               // small status word in the header, e.g. online/offline
  *   const stop = pv.start();           // start the heartbeat; returns a cleanup
  *
- * `setLayer` is the whole point: a module keeps its own drawing code and hands the element over.
- * The component owns shape, scale, fencing, dimming and the header — never the module's look.
+ * The iframe is the whole point: the module draws itself, and this component never guesses its
+ * look. The component owns shape, scale, fencing, dimming and the header.
  *
  * Path note: pane modules are served from /mod/<id>/, and this file from /public/src/preview.js,
  * so import it with the absolute-relative URL the shell uses for shared helpers.
@@ -65,12 +56,8 @@ function hashStr(s) {
   return Math.abs(h);
 }
 
-/**
- * Patterns get a *shape* class so plain-CSS previews still read differently per pattern. Keeping
- * the mapping here (not per pane) is what makes the look comparable across modules.
- */
+/** Pattern names still map to a stable shape word; the show preview reads it for its wall tag. */
 const PATTERN_SHAPES = ['wave', 'bars', 'dots', 'sweep', 'plasma'];
-
 export function shapeFor(pattern) {
   const p = String(pattern || 'wave');
   return PATTERN_SHAPES.includes(p) ? p : PATTERN_SHAPES[hashStr(p) % PATTERN_SHAPES.length];
@@ -81,6 +68,10 @@ export function mountPreview(host, opts = {}) {
   const {
     title = 'preview',
     hint = '',
+    // The module's real page. It is the preview: nothing here redraws the module's look.
+    src = '',
+    // 'frame' fills the 16:9 wall picture; 'window' fills the 9:16 crop an overlay page draws in.
+    shape = 'frame',
     fence = DEFAULT_FENCE,
     interactive = false,
     dim = 0.55,
@@ -108,17 +99,29 @@ export function mountPreview(host, opts = {}) {
   let fenceReady = opts.placed !== false && Number.isFinite(fence?.w) && fence.w > 0;
 
   const frame = el('div', { class: 'pv-frame', 'aria-label': 'module preview' });
-  const lookEl = el('div', { class: 'pv-look', 'aria-hidden': 'true' });
-  const dotsEl = el('div', { class: 'pv-dots', 'aria-hidden': 'true' });
-  const layer = el('div', { class: 'pv-layer' });
+  // The module's own page, in an iframe: the preview is the real document, not a redrawing of it.
+  // Created once per mount; the paint path below never touches it, so a pane repaint cannot
+  // reload the page underneath the operator. Inert by construction — no pointer, no focus, no
+  // scrollbars — so every drag and press comes from the pane's own controls.
+  const iframe = src
+    ? el('iframe', {
+        class: 'pv-iframe',
+        src,
+        title: `${title} — live page`,
+        scrolling: 'no',
+        tabindex: '-1',
+        inert: '',
+        'aria-hidden': 'true',
+        sandbox: 'allow-scripts allow-same-origin allow-forms',
+        allow: 'camera; microphone; autoplay',
+      })
+    : null;
+  if (iframe) iframe.setAttribute('loading', 'eager');
   const frameTag = el('span', { class: 'pv-tag mono', text: '16:9' });
-  frame.append(lookEl, dotsEl, layer, frameTag);
+  frame.append(frameTag);
 
-  // The window is a cut-out ring drawn OVER the frame, and the module's layer is lifted INTO the
-  // window's area by a second layer placed after the shade — so the inside of the window reads at
-  // full strength while everything outside it is veiled. The frame's own layer is the veil target.
-  // The shade hangs on the frame, above the frame's layer and BELOW the lit copy. A child of the
-  // window would be clipped to the hole it is meant to cut.
+  // The window is a crop guide drawn over the live page: the shade veils everything outside it,
+  // so "what leaves the crop" is obvious at full page strength inside.
   const shade = el('div', { class: 'pv-shade', 'aria-hidden': 'true' });
   const win = el('div', { class: 'pv-window' });
   const winLabel = el('span', { class: 'pv-winlabel mono', text: '9:16' });
@@ -132,18 +135,11 @@ export function mountPreview(host, opts = {}) {
     win.append(winLabel, grip);
   }
 
-  // `.pv-layer` is the module's content and lives INSIDE the window, sized to it — that is where
-  // "what the stream shows" is drawn. The copy outside it is the same content drawn to the whole
-  // frame and veiled, so the operator still sees what is being cut off, just at reduced strength.
-  const layerIn = el('div', { class: 'pv-layer pv-layer-in' });
-  const layerOut = el('div', { class: 'pv-layer pv-layer-out', 'aria-hidden': 'true' });
-  frame.append(layerOut, shade);
-
-  // the lit layer is parented to the window so the module's content is positioned in the crop's
-  // own coordinates (0..w, 0..h), not the frame's — a module that draws a text block 'centred'
-  // then draws it centred in the window, which is what the stream actually renders
-  win.append(layerIn);
-  frame.append(win);
+  // `shape: 'window'` means the page itself is the 9:16 crop (an overlay at 405×720), so it goes
+  // inside the window; the wall's 16:9 page fills the frame and the window is the OBS crop drawn
+  // over it. The shade hangs on the frame, above the iframe and below the window ring.
+  if (iframe) (shape === 'window' ? win : frame).append(iframe);
+  frame.append(shade, win);
   // the stage is a query container: its own size drives the frame's, and a container whose size
   // depends on its content re-enters layout (a ResizeObserver loop). See `container-type` in
   // preview.css.
@@ -182,10 +178,6 @@ export function mountPreview(host, opts = {}) {
 
   /* ---------------------------------------------------------------- geometry */
 
-  // The frame's border, in CSS px: the picture is the frame's inner box and the geometry below is
-  // written for the picture, so this is the one number that turns one into the other.
-  const FRAME_HAIR = 1;
-
   function layout() {
     // The frame is ALWAYS 16:9 and as wide as the stage allows. Every child's size is written in
     // px here from ONE number: the width the frame is about to get, so neither the pane's height
@@ -196,30 +188,18 @@ export function mountPreview(host, opts = {}) {
     // window controls. That loop is what pinned the frame at a stale width (two pixels narrow, or
     // frozen entirely once the pane grew past the cap). The stage's width is the only independent
     // measurement: it is never derived from anything inside the frame.
-    const avail = stage.clientWidth || 0;
-    // Cap: 64vw, i.e. a 16:9 frame under ~36vh. A share of the viewport, matching the old CSS.
-    const cap = (window.innerWidth || avail) * 0.64;
-    // whole pixels: the frame's width sets the window's height, so a fractional width (921.6px)
-    // lands the two boxes on different sub-pixel rows and every measurement drifts by a fraction
-    const frameW = Math.max(80, Math.floor(avail ? Math.min(avail, cap) : cap));
-    // `frameW` is the PICTURE's width — the inner box, inside the two hairlines. The frame is
-    // border-box, so its own width is that plus the border; capping it at the picture width would
-    // shrink the picture by the border and drift every screen-px → wall-px conversion.
-    const hair = FRAME_HAIR;
-    frame.style.maxWidth = `${(frameW + 2 * hair).toFixed(2)}px`;
+    // The frame itself is CSS: width:100%; aspect-ratio:16/9. No pixel box is written here, so
+    // the picture is the preview cell's full canvas and the iframe scales with it. The stage is
+    // the only independent measurement, and it never depends on anything inside the frame.
+    const frameW = Math.max(80, Math.floor(stage.clientWidth || 0));
     const w = fenceRect.w ?? DEFAULT_FENCE.w;
     const x = clamp(fenceRect.x ?? DEFAULT_FENCE.x, 0, 1 - w);
-    // left/width in px off frameW, like the height: a percentage of the frame is fine in CSS but
-    // `height` is already px here, and mixing the two made the ratio drift by the border width
-    // the frame's picture is its width minus the two hairlines, so a percentage of the frame
-    // overflows the picture by the border; the window is sized off the inner box instead, and the
-    // window's border is outside its size (`box-sizing: content-box`) so the picture it crops is
-    // exactly the width/height written here
-    const innerW = Math.max(1, frameW);
-    win.style.left = `${(x * innerW).toFixed(2)}px`;
-    win.style.width = `${(w * innerW).toFixed(2)}px`;
+    // The fence overlay is the only px geometry: percentages would include the frame hairline in
+    // the wall→screen mapping. The iframe below it is 100% × 100%.
+    win.style.left = `${(x * 100).toFixed(3)}%`;
+    win.style.width = `${(w * 100).toFixed(3)}%`;
     // height in px from that width, so the window never asks the frame for its height
-    const winH = frameW > 0 ? Math.floor((innerW * w) / WINDOW_ASPECT) : 0;
+    const winH = frameW > 0 ? Math.floor((frameW * w) / WINDOW_ASPECT) : 0;
     if (winH > 0) win.style.height = `${winH.toFixed(2)}px`;
     win.style.setProperty('--pv-dim', String(dimValue.toFixed(3)));
     // vertical placement: `top` is the wall-space top of the window as a fraction of the PICTURE's
@@ -265,8 +245,6 @@ export function mountPreview(host, opts = {}) {
       shade.style.setProperty('--pv-x1', `${x1.toFixed(3)}%`);
       shade.style.setProperty('--pv-y0', `${y0.toFixed(3)}%`);
       shade.style.setProperty('--pv-y1', `${y1.toFixed(3)}%`);
-      layerIn.style.setProperty('--pv-lit-w', `${winRect.width.toFixed(2)}px`);
-      layerIn.style.setProperty('--pv-lit-h', `${winRect.height.toFixed(2)}px`);
     }
     dimOut.textContent = `${Math.round(dimValue * 100)}%`;
   }
@@ -406,51 +384,13 @@ export function mountPreview(host, opts = {}) {
     return Boolean(fenceReady);
   }
 
-  /* ---------------------------------------------------------------- look */
-
   /**
-   * Paint the module's look into the frame: palette (array of CSS colours), brightness, speed and
-   * pattern. This is a preview, not the engine — it is a graded gradient, a dot lattice, and a
-   * drift whose period follows `speed`, which is enough to read "which look is this" and matches
-   * the wall pane's visual language so the two cannot disagree about what a pattern looks like.
+   * Replace the previewed page (a rare, explicit choice: Hand FX's underlay, for instance). The
+   * iframe is the same node; only its `src` changes, so a pane that repaints is not rebuilding it.
    */
-  function setLook(look = {}) {
-    const pal = Array.isArray(look.palette) && look.palette.length >= 2
-      ? look.palette
-      : ['#6ff7ff', '#b18cff', '#ff7ad9'];
-    lookEl.style.setProperty('--pv-a', pal[0]);
-    lookEl.style.setProperty('--pv-b', pal[Math.min(1, pal.length - 1)]);
-    lookEl.style.setProperty('--pv-c', pal[Math.min(2, pal.length - 1)]);
-    const bright = clamp(Number(look.brightness ?? 1), 0, 2);
-    const sat = clamp(Number(look.saturation ?? 1), 0, 2);
-    const speed = Number(look.speed ?? 1);
-    lookEl.style.setProperty('--pv-bright', String(bright));
-    lookEl.style.setProperty('--pv-sat', String(sat));
-    lookEl.style.setProperty('--pv-dur', `${clamp(18 / Math.max(0.15, speed), 4, 120)}s`);
-    dotsEl.style.opacity = String(clamp(0.25 + bright * 0.5, 0.12, 1));
-    if (look.blackout) {
-      panel.dataset.blackout = 'true';
-      dimValue = 1;
-    } else {
-      delete panel.dataset.blackout;
-      dimValue = userDim;
-    }
-    stage.dataset.shape = shapeFor(look.pattern);
-    layout();
-  }
-
-  /** Hand the module's own markup over to be drawn inside the 9:16 window. */
-  function setLayer(node) {
-    clear(layer);
-    clear(layerIn);
-    clear(layerOut);
-    if (!node) return;
-    layerIn.append(node);
-    if (node.cloneNode) {
-      const copy = node.cloneNode(true);
-      copy.classList?.add('pv-dim-copy');
-      layerOut.append(copy);
-    }
+  function setSrc(next) {
+    if (!iframe || !next || iframe.getAttribute('src') === next) return;
+    iframe.setAttribute('src', next);
   }
 
   /** A status word in the header: 'live', 'offline', 'not connected'… */
@@ -507,14 +447,7 @@ export function mountPreview(host, opts = {}) {
     }
   }
 
-  /**
-   * Turn the wall's grade off, leaving only the module's own layer.
-   *
-   * A pane whose picture is not an LED wall (hand fx draws hands on a black stage) still mounts
-   * this component for its frame and crop, and must not get a palette gradient behind its content:
-   * the slot would read as "the wall" while showing something else. Quiet mode keeps the frame,
-   * the window, the crop and the layer, and drops the look and the lattice.
-   */
+  /** Hush the frame's chrome for a pane whose page is not an LED wall. */
   function quiet(on = true) {
     panel.dataset.quiet = on ? 'true' : 'false';
     layout();
@@ -528,65 +461,14 @@ export function mountPreview(host, opts = {}) {
     layout();
   }
 
-  setLook(opts.look || {});
   setBadge(badge, opts.badgeTone || '');
 
   // `api` is the live surface the module may mutate after mount (onFenceChange/onFenceMove…) —
   // returning it here keeps later subscribers assignable without re-mounting the component
-  api = { el: panel, frame, window: win, layer, setLook, setLayer, setBadge, setFence, setFenceVisible, hasFence, setDim, quiet, layout, start, stop };
+  api = { el: panel, frame, window: win, iframe, setSrc, setBadge, setFence, setFenceVisible, hasFence, setDim, quiet, layout, start, stop };
   // a plain read, kept in sync with the API so callers can branch without re-deriving the rect
   Object.defineProperty(api, 'fenceReady', { get: () => hasFence() });
   if (typeof onFence === 'function') api.onFenceChange = onFence;
 
   return api;
-}
-
-/**
- * The merged overview: every module's preview in one composite, drawn as one wall with every
- * module's layer stacked in the window. This is what the "all modules" view renders — it answers
- * "what will the stream actually look like", which no single module pane can.
- *
- * @param {HTMLElement} host
- * @param {object} opts  { layers: [{id,title,tone}], onToggleLayer }
- */
-export function mountMergedPreview(host, opts = {}) {
-  const layers = opts.layers || [];
-  const enabled = new Set(layers.map((l) => l.id));
-  const pv = mountPreview(host, {
-    title: 'all modules · merged',
-    hint: 'every effect and overlay in one 16:9 frame',
-    dim: 0.72,
-  });
-
-  const stack = el('div', { class: 'pv-stack' });
-  pv.setLayer(stack);
-
-  const chips = el('div', { class: 'pv-chips' });
-  const nodeFor = new Map();
-
-  function paintStack() {
-    clear(stack);
-    for (const l of layers) {
-      if (!enabled.has(l.id)) continue;
-      const node = el('div', { class: 'pv-slot', 'data-layer': l.id, 'data-tone': l.tone || '' });
-      nodeFor.set(l.id, node);
-      stack.append(node);
-    }
-    opts.onPaintLayer?.(nodeFor, enabled);
-  }
-
-  for (const l of layers) {
-    const chip = el('button', { class: 'pv-chip', type: 'button', 'aria-pressed': 'true' }, l.title || l.id);
-    chip.addEventListener('click', () => {
-      if (enabled.has(l.id)) enabled.delete(l.id);
-      else enabled.add(l.id);
-      chip.setAttribute('aria-pressed', String(enabled.has(l.id)));
-      paintStack();
-      opts.onToggleLayer?.(l.id, enabled.has(l.id));
-    });
-    chips.append(chip);
-  }
-  pv.el.querySelector('.pv-head')?.append(chips);
-  paintStack();
-  return { ...pv, nodeFor, enabled, repaint: paintStack, isDragging, window: win, frame };
 }

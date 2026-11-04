@@ -40,178 +40,12 @@
 
 /* ------------------------------------------------------- preview component */
 
-/* The shared preview owns the frame; the layer is the module's 405×720 canvas inside it. */
+/* The shared preview owns the 16:9 frame and the live /notify page inside it. */
 .nt-preview-host {
   padding: 12px;
   border: var(--hair) solid var(--line);
   background: var(--bg-1);
 }
-
-/* The overlay canvas at its own px size; scaled into the window by pane.js. Every px in here
-   is a strip px, so the toast sizes read as real numbers, not a fitted approximation. */
-.nt-layer {
-  --nt-h: 76px;
-  position: absolute;
-  left: 0;
-  top: 0;
-  /* the overlay canvas in its own px: 405×720 at scale 1 (810×1440 in OBS at 2×) */
-  width: 405px;
-  height: 720px;
-  transform-origin: top left;
-  background: #101014;
-  pointer-events: none;
-}
-
-/* --- the preview toast: the overlay's own structure --------------------- */
-
-.nt-layer .toast {
-  position: absolute;
-  left: 14px;
-  right: 14px;
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 8px 10px;
-  box-sizing: border-box;
-  border-radius: 14px;
-  pointer-events: none;
-  /* stacked rows keep their server y; a spawn lands on top with a short rise */
-  transition: top 180ms ease;
-}
-
-.nt-layer .toast[data-newest='true'] {
-  animation: nt-in 220ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
-}
-
-@keyframes nt-in {
-  from { opacity: 0; transform: translateX(14px) scale(0.99); }
-  to { opacity: 1; transform: none; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .nt-layer .toast[data-newest='true'] { animation: none; }
-  .nt-layer .toast { transition: none; }
-}
-
-.nt-layer .lead {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-}
-
-.nt-layer .glyph {
-  width: 18px;
-  height: 18px;
-  fill: currentColor;
-}
-
-.nt-layer .body {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.nt-layer .title {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  opacity: 0.75;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.nt-layer .text {
-  font-size: 13px;
-  line-height: 1.25;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  word-break: break-word;
-}
-
-.nt-layer .acts {
-  flex: 0 0 auto;
-  align-self: center;
-  display: flex;
-  gap: 6px;
-}
-
-.nt-layer .btn {
-  font: inherit;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 4px 9px;
-  border-radius: 7px;
-  border: 1px solid currentColor;
-  background: transparent;
-  color: inherit;
-  opacity: 0.85;
-  pointer-events: none;
-}
-
-/* --- the four looks, copied from the overlay ---------------------------- */
-
-.nt-layer .t-ios {
-  background: rgba(246, 246, 248, 0.97);
-  color: #101014;
-  border-radius: 16px;
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.32), inset 0 0 0 1px rgba(255, 255, 255, 0.7);
-}
-
-.nt-layer .t-ios .lead { background: #e9e9ee; color: #3a3a40; }
-
-.nt-layer .t-android {
-  background: #f7f7f9;
-  color: #14161a;
-  border-radius: 20px;
-  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
-}
-
-.nt-layer .t-android .lead { background: #dfe3ea; color: #2c313a; }
-
-.nt-layer .t-win11 {
-  background: #f3f3f3;
-  color: #1a1a1a;
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
-  border-right: 4px solid #2b88d8;
-}
-
-.nt-layer .t-win11 .lead { background: #e5e5e5; color: #0078d4; }
-
-.nt-layer .t-macos {
-  background: rgba(236, 236, 238, 0.96);
-  color: #1b1b1d;
-  border-radius: 12px;
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.3);
-  backdrop-filter: blur(10px);
-}
-
-.nt-layer .t-macos .lead { background: #dcdcdf; color: #3b3b3f; }
-
-/* --- empty state -------------------------------------------------------- */
-
-.nt-empty {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 26px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  color: rgba(255, 255, 255, 0.28);
-}
-
-.nt-empty[hidden] { display: none; }
 
 /* --- panel head bits ---------------------------------------------------- */
 
@@ -222,16 +56,6 @@
 }
 
 .nt-stack-count[data-state='full'] { color: var(--warn); }
-
-.nt-mode {
-  font-size: 9.5px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--accent);
-  padding: 1px 6px;
-  border: 1px solid var(--accent-dim);
-  border-radius: var(--r);
-}
 
 /* ----------------------------------------------------------------- storm */
 

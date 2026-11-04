@@ -1,8 +1,8 @@
 // Notifications control pane.
 //
-// The module draws toasts on a 405×720 phone strip inside OBS. This pane is the operator's
-// desk next to it: a scaled, live preview of the strip, the stack controls, a pool send,
-// and the look straight from the module's settings schema.
+// The module draws toasts on a 405×720 phone stage inside OBS. This pane is the operator's
+// desk next to it: the real /notify page in a live 16:9 iframe, the stack controls, a pool
+// send, and the look straight from the module's settings schema.
 //
 // Data:
 //   GET    /api/notifications/live       {rev, live:[entity], stack:{x,gap,height,used,capacity}, lastSpawnAt, settings}
@@ -15,9 +15,8 @@
 // Live:
 //   channel `notifications`, cmd `snapshot` | `relayout`; event `sound` is informational.
 //
-// The preview is a still of the module's own CSS: the same look class (t-ios … t-macos), the
-// same lead/title/text/acts structure, at the strip's own px sizes inside a scaled wrapper —
-// so what the operator tunes is what OBS draws, not an approximation of it.
+// The preview is the module's own page (/notify), so every look class and every toast size is
+// the one OBS draws. The pane never redraws a toast.
 
 import { el, clear, dot, actionButton, fmtAgo, every } from '/src/ui.js';
 import { toast } from '/src/toast.js';
@@ -58,7 +57,6 @@ export async function render(container, ctx) {
   let stack = null; // {x, gap, height, used, capacity}
   let settingsMeta = ctx.settings || {};
   let lastSpawnAt = 0;
-  let seqRev = -1;
   let streamAt = 0;
   let pool = [];
   let toneNames = null; // /api/notifications/audio/list files, or null when unavailable
@@ -169,128 +167,35 @@ export async function render(container, ctx) {
     quickBox.refresh().catch(() => {});
   }
 
-  /* --- preview: the shared preview component ------------------------------
-     One 16:9 stage with the module's own 9:16 window inside it, the same shape every
-     other module's preview has. The live toasts are drawn on the layer, which is a
-     405×720 canvas in the overlay's real coordinate space, scaled into the window. */
+  /* --- preview: the module's real page, live ------------------------------
+     /notify is the OBS surface itself: a 16:9 page with the 405x720 stage already drawn inside
+     it. The preview is that page in a full-canvas 16:9 iframe, not a redrawn approximation. */
 
   const stackOut = el('span', { class: 'nt-stack-count mono', text: '0 / 0' });
   const previewHost = el('div', { class: 'nt-preview-host' });
-  const pv = mountPreview(previewHost, { title: 'Notification overlay', hint: '9:16 · live', windowed: true });
+  mountPreview(previewHost, {
+    title: 'Notification window',
+    hint: `${CANVAS_W} x ${CANVAS_H} · live`,
+    src: '/notify',
+    // the page draws its own stage inside the 16:9 surface; no crop guide needed
+    fence: false,
+  });
 
-  // the layer: the overlay canvas at its own px size, scaled to the window's lit width
-  const layerIn = el('div', { class: 'nt-layer' });
-  layerIn.style.width = `${CANVAS_W}px`;
-  layerIn.style.height = `${CANVAS_H}px`;
-  const strip = layerIn; // the 405×720 canvas the toasts are absolutely placed in
-  pv.setLayer(layerIn);
-  const emptyNote = el('div', { class: 'nt-empty' }, el('span', { text: 'no toasts on the strip' }));
-  strip.appendChild(emptyNote);
-
-  // A flat dark stage, not the LED wall's gradient: this is a phone strip, not a wall.
-  // setLook(null) would fall back to the wall palette, so a one-colour palette is passed.
-  try { pv.setLook?.({ palette: ['#101014', '#101014', '#101014'], brightness: 0, saturation: 0, speed: 1 }); } catch { /* the look is optional */ }
-  pv.setFenceVisible?.(true);
-  pv.setFence?.({ x: (2560 - 405) / 2 / 2560, y: 0, w: 405 / 2560 });
-
-  // The component sizes the window to the wall crop and publishes its lit width on the window;
-  // the layer keeps 405×720 stage px and is scaled down into it, so every number inside the
-  // layer is a real strip px.
-  function fitLayer() {
-    const rect = pv.window?.getBoundingClientRect?.();
-    const published = parseFloat(pv.window?.style?.getPropertyValue('--pv-lit-w')) || 0;
-    const w = published || rect?.width || 0;
-    const k = w > 0 ? w / CANVAS_W : 1;
-    layerIn.style.transform = k === 1 ? 'none' : `scale(${k})`;
-    return k;
-  }
-  fitLayer();
-  try {
-    const ro = new ResizeObserver(() => fitLayer());
-    ro.observe(pv.window);
-    timers.push(() => ro.disconnect());
-  } catch { /* older engines: the one-shot fit above is enough */ }
-
-  const previewMode = el('span', { class: 'nt-mode' });
   const previewPanel = el('section', { class: 'panel nt-preview' },
     el('div', { class: 'panel-head' },
       el('span', { class: 'panel-title', text: 'Notification window' }),
       stackOut,
-      previewMode,
-      el('span', { class: 'panel-hint mono dim', text: `${CANVAS_W} × ${CANVAS_H} · live` }),
+      el('span', { class: 'panel-hint mono dim', text: `${CANVAS_W} x ${CANVAS_H} · live page` }),
     ),
     previewHost,
   );
 
-  function lookClass(style) {
-    const key = String(style || 'ios').toLowerCase();
-    return `t-${LOOKS[key] ? key : 'ios'}`;
-  }
-
-  /** One preview toast: the same nodes the overlay builds. */
-  function previewToast(entity) {
-    const node = el('div', { class: `toast in ${lookClass(entity.style || settingsMeta.style?.value)}`, dataset: { id: entity.id } });
-    node.append(
-      el('div', { class: 'lead', 'aria-hidden': 'true' },
-        el('svg', { class: 'glyph', viewBox: '0 0 16 16' }, glyphPath(entity.type))),
-      el('div', { class: 'body' },
-        entity.title ? el('div', { class: 'title', text: entity.title }) : null,
-        el('div', { class: 'text', text: entity.text || '' }),
-      ),
-      entity.buttons && entity.buttons.length
-        ? el('div', { class: 'acts' }, ...entity.buttons.map((b) => el('button', { type: 'button', class: 'btn', tabindex: '-1', text: b.label })))
-        : null,
-    );
-    // The overlay positions rows in canvas px; the preview does the same, in the scaled canvas.
-    const y = Number(entity.y);
-    const h = Number(entity.h);
-    if (Number.isFinite(y)) node.style.top = `${y}px`;
-    if (Number.isFinite(h)) node.style.height = `${h}px`;
-    return node;
-  }
-
-  function glyphPath(type) {
-    const ns = 'http://www.w3.org/2000/svg';
-    const p = document.createElementNS(ns, 'path');
-    // The overlay's own four glyphs, simplified to one path each.
-    const d = {
-      Error: 'M8 1.6 1.2 13.4h13.6zM7.2 5.6h1.6v4H7.2zM7.2 10.8h1.6v1.4H7.2z',
-      Warning: 'M8 1.6 1.2 13.4h13.6zM7.2 5.6h1.6v4H7.2zM7.2 10.8h1.6v1.4H7.2z',
-      Question: 'M8 1.6a6.4 6.4 0 1 0 0 12.8A6.4 6.4 0 0 0 8 1.6zm-.1 9.6h1.5v1.4H7.9zm1.5-2.1c0-1 .9-1.4.9-2.4 0-.9-.7-1.4-1.5-1.4-.7 0-1.3.4-1.5 1l1.2.5c.1-.3.4-.5.7-.5.3 0 .5.2.5.5 0 .6-.9 1-.9 2.3z',
-      Info: 'M8 1.6a6.4 6.4 0 1 0 0 12.8A6.4 6.4 0 0 0 8 1.6zM7.2 6h1.6v6.2H7.2zm0-2.2h1.6v1.4H7.2z',
-      System: 'M8 1.6a6.4 6.4 0 1 0 0 12.8A6.4 6.4 0 0 0 8 1.6zM7.2 6h1.6v6.2H7.2zm0-2.2h1.6v1.4H7.2z',
-    }[type] || 'M8 1.6a6.4 6.4 0 1 0 0 12.8A6.4 6.4 0 0 0 8 1.6zM7.2 6h1.6v6.2H7.2zm0-2.2h1.6v1.4H7.2z';
-    p.setAttribute('d', d);
-    return p;
-  }
-
+  /** The page paints the toasts; the pane only mirrors the stack counters from the bus. */
   function paintPreview() {
-    const styleKey = String(settingsMeta.style?.value || 'ios');
-    const height = Number(settingsMeta.height?.value) || 76;
-    // One class on the layer repaints every toast's look; the module also does this per row.
-    strip.className = `nt-layer ${lookClass(styleKey)}`;
-    strip.style.setProperty('--nt-h', `${height}px`);
-    strip.dataset.style = styleKey;
-    previewMode.textContent = LOOKS[styleKey] || styleKey;
-    previewMode.dataset.look = styleKey;
-    // the server's capacity, not a guess
     const capacity = Math.max(1, Number(stack?.capacity) || MAX_STACK);
-    const rev = seqRev;
     const shown = [...live].sort((a, b) => (a.born || 0) - (b.born || 0));
-    for (const node of [...strip.querySelectorAll('.toast')]) node.remove();
-    emptyNote.hidden = shown.length > 0;
-    for (const entity of shown) strip.appendChild(previewToast(entity));
-    // mark which row is newest, so a spawn is visible even before its slide settles
-    const newest = shown[shown.length - 1];
-    if (newest) strip.querySelector(`.toast[data-id="${cssId(newest.id)}"]`)?.setAttribute('data-newest', 'true');
     stackOut.textContent = `${stack?.used ?? shown.length} / ${capacity}`;
     stackOut.dataset.state = (stack?.used ?? shown.length) >= capacity ? 'full' : 'ok';
-    strip.dataset.rev = String(rev);
-    fitLayer();
-  }
-
-  function cssId(id) {
-    return String(id).replace(/["\\]/g, '\\$&');
   }
 
   /* --- live list: what is on the strip now -------------------------------- */
@@ -318,12 +223,6 @@ export async function render(container, ctx) {
         el('span', { class: 'nt-log-text', text: entity.title ? `${entity.title} — ${entity.text || ''}` : entity.text || '' }),
         el('span', { class: 'nt-log-when mono dim', text: fmtAgo(entity.born) }),
       );
-      row.addEventListener('click', () => {
-        // Clicking a row spawns nothing; it just points the preview at that toast.
-        const node = strip.querySelector(`.toast[data-id="${cssId(entity.id)}"]`);
-        node?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        node?.animate?.([{ outline: '1px solid rgba(177,140,255,0.9)' }, { outline: '1px solid rgba(177,140,255,0)' }], { duration: 900 });
-      });
       list.appendChild(row);
     }
   }
@@ -397,7 +296,6 @@ export async function render(container, ctx) {
     if (Array.isArray(data.live)) live = data.live;
     if (data.stack) stack = data.stack;
     if (data.settings) settingsMeta = data.settings;
-    if (Number.isFinite(Number(data.rev))) seqRev = Number(data.rev);
     if (Number.isFinite(Number(data.lastSpawnAt))) lastSpawnAt = Number(data.lastSpawnAt);
     paintPreview();
     paintList();
@@ -456,8 +354,8 @@ export async function render(container, ctx) {
         return out;
       },
     });
-    // The style and height rows are drawn above (the preview's own mode line and the strip's
-    // height); leaving them in the form would PATCH the same keys from a second place.
+    // The style and height quick controls above own these keys; the form must not PATCH them
+    // from a second place.
     form?.omitRows?.((key) => PANE_OWNED_KEYS.has(key));
     form?.renameGroup?.('general', 'Look');
     form?.omitGroupRow?.('general');
@@ -479,7 +377,6 @@ export async function render(container, ctx) {
   let heightTimer = null;
   heightRange.addEventListener('input', () => {
     heightVal.textContent = heightRange.value;
-    strip.style.setProperty('--nt-h', `${heightRange.value}px`);
     clearTimeout(heightTimer);
     heightTimer = setTimeout(() => patchSettings({ height: Number(heightRange.value) }), 220);
   });

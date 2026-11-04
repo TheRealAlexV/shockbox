@@ -233,39 +233,6 @@
 
 
 
-.wall-dots {
-  position: absolute;
-  inset: 0;
-  background:
-    radial-gradient(120% 90% at 22% 28%, var(--w-c) 0%, transparent 55%),
-    radial-gradient(110% 120% at 78% 70%, var(--w-b) 0%, transparent 60%),
-    linear-gradient(112deg, var(--w-a) 0%, var(--w-b) 46%, var(--w-c) 100%);
-  filter: hue-rotate(var(--w-hue, 0deg)) saturate(var(--w-sat, 1)) brightness(calc(var(--w-bright, 1) * 0.72));
-  background-size: 180% 180%;
-  animation: wall-drift var(--w-dur, 24s) ease-in-out infinite alternate;
-}
-
-.wall-dots::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: radial-gradient(circle at 50% 50%, rgba(0, 0, 0, 0.55) 0 1.1px, transparent 1.6px);
-  /* the lattice follows the preview's own scale, so the LEDs read at any pane width */
-  background-size: var(--w-dot, 6px) var(--w-dot, 6px);
-  mix-blend-mode: multiply;
-  opacity: 0.9;
-}
-
-
-@keyframes wall-drift {
-  from { background-position: 0% 30%; }
-  to { background-position: 100% 70%; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .wall-dots { animation: none; }
-}
-
 /* blackout: the wall really is dark */
 
 /* the window: everything outside it dims to fenceOutDim */
@@ -493,11 +460,6 @@
   background: currentColor;
 }
 .wall-mode[data-mode='window'] { color: var(--accent); border-color: rgba(177, 140, 255, 0.4); }
-
-/* ---- the window's own picture ---------------------------------------------------------
-   A copy of the wall's gradient inside the fence. These rules sit after the base layer on
-   purpose: `.fence-hole` is worn together with `.wall-dots` (the clone keeps its class), and
-   an equal-specificity rule earlier in the sheet would lose the background to the wall's. */
 
 /* ---- image -------------------------------------------------------------------------------
    A schematic of the wall, not a copy of it: the rectangle is the region `imageX`/`imageY`/

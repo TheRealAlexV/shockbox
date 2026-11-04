@@ -1,7 +1,7 @@
 // Alerts (dialogs) control pane.
 //
 // The module draws fake OS error dialogs that cascade over a 405×720 phone strip inside OBS.
-// This pane is the operator's desk next to it: a scaled, live preview of the strip with the
+// This pane is the operator's desk next to it: the real /dialogs page in a live 16:9 iframe,
 // real cascade positions, the spawn controls, a pool send, and the look from the schema.
 //
 // Data:
@@ -26,17 +26,11 @@ import { mountQuickSend } from '/src/quicksend.js';
 import { mountSchedulePanel } from '/src/schedule-panel.js';
 import { mountPreview } from '/src/preview.js';
 
-const CANVAS_W = 405;
-const CANVAS_H = 720;
-// The 810×1440 dialog canvas inside the 2560×1440 picture: a centred 9:16 strip.
-const FENCE = { x: (2560 - 810) / 2 / 2560, w: 810 / 2560, y: 0 };
-
 const THEMES = { win11: 'Windows 11', win95: 'Windows 95', macos: 'macOS' };
 
-const TYPE_ICON = { Error: 'error', Alert: 'warning', Warning: 'warning', System: 'info', Question: 'question' };
 const ICON_TONE = { error: 'bad', warning: 'warn', info: 'info', question: 'accent', none: 'idle' };
 
-/* The schema rows this pane draws with its own controls (the preview's mode line, the scale). */
+/* The schema rows this pane draws with its own quick controls. */
 const PANE_OWNED_KEYS = new Set(['theme', 'scale']);
 
 export async function render(container, ctx) {
@@ -49,7 +43,6 @@ export async function render(container, ctx) {
   let live = [];
   let capacity = 80;
   let settingsMeta = ctx.settings || {};
-  let seqRev = -1;
   let streamAt = 0;
   let pool = [];
 
@@ -184,149 +177,32 @@ export async function render(container, ctx) {
     poolSendBtn.disabled = !pool.length;
   }
 
-  /* --- preview: the phone strip ------------------------------------------ */
+  /* --- preview: the module's real page, live ------------------------------
+     /dialogs is the OBS surface itself: a 16:9 page with the centred stage already drawn. The
+     preview is that page in a full-canvas 16:9 iframe, not a redrawn dialog. */
 
   const countOut = el('span', { class: 'dg-count mono', text: '0' });
-  const emptyNote = el('div', { class: 'dg-empty' },
-    el('span', { class: 'dg-empty-mark' }),
-    el('span', { text: 'no alerts on the strip' }),
-  );
-  // The shared preview: the dialogs are the window's layer, drawn in the 405×720 canvas space.
-  const desk = el('div', { class: 'dg-desk' }); // the canvas root the layer scales
-  desk.append(emptyNote);
   const previewHost = el('div', { class: 'dg-preview-host' });
-  const pv = mountPreview(previewHost, { interactive: false, fence: false, windowed: false });
+  mountPreview(previewHost, {
+    title: 'Alerts page',
+    hint: '810 × 1440 canvas · live',
+    src: '/dialogs',
+    // the page draws its own centred stage inside the 16:9 surface; no crop guide needed
+    fence: false,
+  });
 
-  const previewMode = el('span', { class: 'dg-mode' });
   const previewPanel = el('section', { class: 'panel dg-preview' },
     el('div', { class: 'panel-head' },
       el('span', { class: 'panel-title', text: 'Phone strip' }),
       countOut,
-      previewMode,
-      el('span', { class: 'panel-hint mono dim', text: '810 × 1440 canvas · live cascade' }),
+      el('span', { class: 'panel-hint mono dim', text: 'live page' }),
     ),
     previewHost,
   );
-  pv.setFenceVisible(true);
-  pv.setFence(FENCE);
-  pv.setLayer(desk);
-  // The window is sized from the frame's width, so its pixel size is what the layer scales by;
-  // the component writes --pv-lit-w/-h on the window for exactly that.
-  const scaleLayer = () => {
-    const win = pv.window;
-    const w = parseFloat(getComputedStyle(win).getPropertyValue('--pv-lit-w')) || win.clientWidth;
-    if (w > 0) desk.style.transform = `scale(${w / CANVAS_W})`;
-    emptyNote.hidden = desk.querySelectorAll('.dialog').length > 0;
-  };
-  const winRO = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => scaleLayer()) : null;
-  winRO?.observe(pv.window);
-  timers.push(() => winRO?.disconnect());
 
-  /** One preview dialog: the overlay's own structure, placed at the entity's canvas box. */
-  function previewDialog(entity) {
-    const node = el('div', { class: 'dialog in', dataset: { id: entity.id } });
-    // The overlay applies the theme per dialog; the preview's stage carries the skin, but an
-    // entity spawned under a different theme keeps its own, so stamp it from the entity.
-    const theme = THEMES[entity.theme] ? entity.theme : 'win11';
-    node.dataset.theme = theme;
-    const titlebar = el('div', { class: 'titlebar' },
-      el('span', { class: 'ttitle', text: entity.title || (entity.type || 'Alert') }),
-      el('button', { type: 'button', class: 'tclose', tabindex: '-1', 'aria-hidden': 'true' }),
-    );
-    const iconName = ICON_TONE[entity.icon] ? entity.icon : TYPE_ICON[entity.type] || 'error';
-    const body = el('div', { class: 'body' },
-      el('span', { class: 'icon', 'data-icon': iconName, 'aria-hidden': 'true' }, iconSvg(iconName, theme)),
-      el('div', { class: 'msg', text: entity.text || '' }),
-    );
-    node.append(titlebar, body);
-    if (Array.isArray(entity.buttons) && entity.buttons.length) {
-      node.append(el('div', { class: 'buttons' }, ...entity.buttons.map((b, i) => {
-        const btn = el('button', { type: 'button', class: i === 0 || b.action === 'close' ? 'btn primary' : 'btn', tabindex: '-1', text: b.label });
-        return btn;
-      })));
-    }
-    // Position in canvas px; the stage's scale is the only fitting applied.
-    const x = Number(entity.x);
-    const y = Number(entity.y);
-    const w = Number(entity.w);
-    const h = Number(entity.h);
-    if (Number.isFinite(x)) node.style.left = `${x}px`;
-    if (Number.isFinite(y)) node.style.top = `${y}px`;
-    if (Number.isFinite(w)) node.style.width = `${w}px`;
-    if (Number.isFinite(h)) node.style.height = `${h}px`;
-    node.dataset.geo = `${Math.round(x) || 0},${Math.round(y) || 0} ${Math.round(w) || 0}×${Math.round(h) || 0}`;
-    return node;
-  }
-
-  function iconSvg(name, theme) {
-    const ns = 'http://www.w3.org/2000/svg';
-    const svg = document.createElementNS(ns, 'svg');
-    svg.setAttribute('viewBox', '0 0 32 32');
-    svg.setAttribute('aria-hidden', 'true');
-    svg.setAttribute('data-theme', theme);
-    const add = (d, fill) => {
-      const p = document.createElementNS(ns, 'path');
-      p.setAttribute('d', d);
-      p.setAttribute('fill', fill);
-      svg.appendChild(p);
-    };
-    // The overlay's own icon set, kept in one path each: a win11 ringed badge, a win95 flat
-    // glyph, and the macOS rounded square — the theme decides which one reads as "this OS".
-    const SHAPES = {
-      error: 'M16 3 3 28h26z',
-      warning: 'M16 3 3 28h26z',
-      question: 'M16 3a13 13 0 1 0 0 26 13 13 0 0 0 0-26z',
-      info: 'M16 3a13 13 0 1 0 0 26 13 13 0 0 0 0-26z',
-      none: '',
-    };
-    const MARKS = {
-      error: 'M14 9h4v11h-4zM14 22h4v3h-4z',
-      warning: 'M14 9h4v11h-4zM14 22h4v3h-4z',
-      question: 'M13.4 21.4v-1.2c0-2.1 3.3-2.4 3.3-4.6 0-1.4-1-2.3-2.4-2.3-1.2 0-2 .6-2.5 1.5l-2.6-1.4c.9-1.7 2.8-2.9 5.2-2.9 3.1 0 5.3 1.8 5.3 4.6 0 3.2-3.6 3.8-3.6 5.2v1.1zm.2 4.4h3v3.2h-3z',
-      info: 'M14 9h4v3h-4zM14 14h4v10h-4z',
-      none: '',
-    };
-    const shape = SHAPES[name] || SHAPES.error;
-    const mark = MARKS[name] || MARKS.error;
-    // 95: flat yellow/blue on no ring; mac: rounded blue square; win11: white badge on a colour
-    if (theme === 'win95' || theme === 'macos') {
-      add(shape, theme === 'win95' ? '#ffffe1' : name === 'error' ? '#ff5d6a' : name === 'question' ? '#6fb3ff' : '#f2c14e');
-      add(mark, theme === 'win95' ? '#000' : '#fff');
-    } else {
-      add('M16 2a14 14 0 1 0 0 28 14 14 0 0 0 0-28z', name === 'error' ? '#ff5d6a' : name === 'question' ? '#6fb3ff' : '#f2c14e');
-      add(mark, '#1a1a1a');
-    }
-    return svg;
-  }
-
+  /** The page paints the dialogs; the pane only mirrors the live count from the bus. */
   function paintPreview() {
-    const themeKey = THEMES[settingsMeta.theme?.value] ? settingsMeta.theme.value : 'win11';
-    const scale = Number(settingsMeta.scale?.value) || 0.7;
-    desk.className = `dg-desk skin-${themeKey}`;
-    desk.dataset.theme = themeKey;
-    desk.dataset.scale = String(scale);
-    desk.style.setProperty('--dg-scale', String(scale));
-    previewMode.textContent = THEMES[themeKey];
-    previewMode.dataset.theme = themeKey;
-    const rows = [...live].sort((a, b) => (a.born || 0) - (b.born || 0));
-    for (const node of [...desk.querySelectorAll('.dialog')]) node.remove();
-    for (const entity of rows) desk.appendChild(previewDialog(entity));
-    // The layer root was cleared-and-refilled by setLayer only once; re-hand it so a clone for
-    // the dimmed half stays the same content, then re-scale to the window's current width.
-    pv.setLayer(desk);
-    // The newest one is the one the operator just triggered: mark it so a spawn is findable
-    // inside a full cascade.
-    const newest = rows[rows.length - 1];
-    if (newest) desk.querySelector(`.dialog[data-id="${cssId(newest.id)}"]`)?.setAttribute('data-newest', 'true');
-    countOut.textContent = `${rows.length}${capacity ? ` / ${capacity}` : ''}`;
-    countOut.dataset.state = capacity && rows.length >= capacity ? 'full' : 'ok';
-    desk.dataset.rev = String(seqRev);
-    emptyNote.hidden = rows.length > 0;
-    scaleLayer();
-  }
-
-  function cssId(id) {
-    return String(id).replace(/["\\]/g, '\\$&');
+    countOut.textContent = String(live.length);
   }
 
   /* --- live list --------------------------------------------------------- */
@@ -355,11 +231,6 @@ export async function render(container, ctx) {
         el('span', { class: 'dg-log-geo mono dim', text: `${Math.round(entity.x || 0)},${Math.round(entity.y || 0)}` }),
         el('span', { class: 'dg-log-when mono dim', text: fmtAgo(entity.born) }),
       );
-      row.addEventListener('click', () => {
-        const node = desk.querySelector(`.dialog[data-id="${cssId(entity.id)}"]`);
-        node?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        node?.animate?.([{ outline: '2px solid rgba(177,140,255,0.9)' }, { outline: '2px solid rgba(177,140,255,0)' }], { duration: 900 });
-      });
       list.appendChild(row);
     }
   }
@@ -503,7 +374,6 @@ export async function render(container, ctx) {
     if (Array.isArray(data.live)) live = data.live;
     if (Number.isFinite(Number(data.capacity))) capacity = Number(data.capacity);
     if (data.settings) settingsMeta = data.settings;
-    if (Number.isFinite(Number(data.rev))) seqRev = Number(data.rev);
     paintPreview();
     paintList();
     paintStream();

@@ -5,22 +5,18 @@
 // "next effect" gesture and the effect travel. What the pane shows about tracking is honest by
 // construction:
 //
-//   · the camera is one document's to hold. If the overlay page has it, this pane lists the hands
-//     and gestures the overlay reports on the bus (`handfx` → the `page` event) and says
-//     "camera held by the overlay" — it does not open a second stream
-//   · if the overlay is not tracking, the pane's own preview asks for the camera on the operator's
-//     explicit click. Denied, held elsewhere, insecure origin and "model failed" are all named
-//   · with no camera and no overlay it shows "synthetic replay" on request: a scripted hand that
-//     goes through the real classifier, labelled as synthetic everywhere it appears
+//   · the camera belongs to the overlay page. The pane's preview is that page itself (/handfx) in
+//     a live 16:9 iframe, so hands, effects, camera and backdrop are the ones OBS draws — the pane
+//     no longer opens a second stream or draws its own approximation
+//   · the overlay reports hands and gestures on the bus (`handfx` → the `page` event); the pane
+//     turns those into the honest status line and timestamps it
 //   · the effect registry is the union of the server's ids and this build's implementations; a
 //     setting naming an effect this build cannot draw is shown as such, not silently dropped
 //
 // The pane lives off the shell's own tokens (public/src/shell.css) and a small pane.css.
 
 import { el, frag, clear, actionButton } from '/src/ui.js';
-import { syntheticHands } from '../pages/js/engine/tracker.js';
-import { classify as classifyPose, Motion } from '../pages/js/engine/gestures.js';
-import { EFFECTS as ENGINE_EFFECTS, FxRenderer, anchorsFrom } from '../pages/js/engine/fx.js';
+import { EFFECTS as ENGINE_EFFECTS } from '../pages/js/engine/fx.js';
 
 // What this build can actually draw. The page's registry is the truth (it is the same module the
 // overlay imports), so the pane can never claim an effect the page would silently skip.
@@ -36,34 +32,33 @@ export async function render(container, ctx) {
   const { api, events, signal } = ctx;
   const root = el('div', { class: 'hfx' });
   container.append(root);
+  // Persistent slots: the preview slot is never emptied, so the iframe is never detached and
+  // reloaded by a status poll or a bus event. Only the slot beside it is rebuilt.
+  const headerHost = el('div');
+  const bannerHost = el('div');
+  const body = el('div', { class: 'hfx-body' });
+  const previewSlot = el('div', { class: 'hfx-preview-slot' });
+  const sideSlot = el('div', { class: 'hfx-side-slot' });
+  body.append(previewSlot, sideSlot);
+  const effectsHost = el('div');
+  const footerHost = el('div');
+  root.append(headerHost, bannerHost, body, effectsHost, footerHost);
 
   const s = {
     status: null, // /api/handfx/status
     settings: {}, // plain values from the settings describe
-    deviceList: [],
-    streaming: false,
-    streamError: null,
-    camera: 'off', // off | asking | on | denied | held | error | insecure
-    cameraLabel: '', // the label of the camera this pane actually opened
-    cameraFrom: null, // why the opened camera is not the WebcamSwitcher one; null when it is
-    devices: 'idle', // idle | listing | denied | error
     page: null, // last honest status line from the overlay
     live: new Map(), // effect id -> {startedAt, hands, gesture} (from the overlay's reports)
-    synthetic: false,
     underlay: true, // the camera feed under the effects; off leaves the dark backdrop
-    previewEffect: null, // the effect id the preview draws live
     log: [],
   };
-
-  let stream = null;
-  let videoEl = null;
-  let stopStream = () => {};
 
   /* -------------------------------------------------------------- data */
 
   async function refresh() {
     s.status = await api.get('/api/handfx/status');
     s.settings = Object.fromEntries(Object.entries(s.status.settings || {}).map(([k, d]) => [k, d.value]));
+    s.underlay = s.settings.underlay !== false;
     return s.status;
   }
 
@@ -111,96 +106,6 @@ export async function render(container, ctx) {
     if (window.isSecureContext) return null;
     return `This page is served from ${location.origin}, which is not a secure context. A browser only allows the camera on https, http://localhost or http://127.0.0.1 — open the pane there.`;
   }
-
-  async function listDevices() {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-      s.devices = 'error';
-      return;
-    }
-    if (!window.isSecureContext) {
-      s.devices = 'insecure';
-      return;
-    }
-    s.devices = 'listing';
-    try {
-      const all = await navigator.mediaDevices.enumerateDevices();
-      s.deviceList = all.filter((d) => d.kind === 'videoinput');
-      // Labels are blank until this origin has permission; say so rather than showing blanks.
-      s.devices = s.deviceList.some((d) => d.label) ? 'ok' : 'unlabelled';
-    } catch {
-      s.devices = 'error';
-    }
-    if (root.isConnected) render();
-  }
-
-  // The WebcamSwitcher virtual camera is found by name. Its driver hands out a new device id on
-  // every start, so a stored id goes stale and the pane would open whatever the browser picked
-  // without saying so. A labelled match wins; failing that the saved device, then the first video
-  // device — and the note names the substitute, so the swap is never silent.
-  const SWITCHER = 'webcamswitcher';
-
-  function pickCamera() {
-    const list = s.deviceList || [];
-    const named = list.find((d) => (d.label || '').toLowerCase().includes(SWITCHER));
-    if (named) return { id: named.deviceId, label: named.label || '' };
-    const want = s.settings.deviceId || '';
-    const chosen = (want && list.find((d) => d.deviceId === want)) || list[0] || null;
-    return { id: chosen ? chosen.deviceId : want, label: chosen ? chosen.label || '' : '' };
-  }
-
-  async function startPreview(deviceId) {
-    stopPreview();
-    const insecure = secureText();
-    if (insecure) {
-      s.camera = 'insecure';
-      s.streamError = insecure;
-      render();
-      return;
-    }
-    s.camera = 'asking';
-    s.streamError = null;
-    render();
-    try {
-      const res = s.settings.resolution || '720p';
-      const size = { '480p': [640, 480], '720p': [1280, 720], '1080p': [1920, 1080] }[res] || [1280, 720];
-      // An explicit id (a click on the device list) is honoured as-is; otherwise the camera is
-      // resolved by label so the virtual camera survives its changing id.
-      const pick = deviceId ? { id: deviceId, label: '' } : pickCamera();
-      const constraints = { video: { width: { ideal: size[0] }, height: { ideal: size[1] } }, audio: false };
-      if (pick.id) constraints.video.deviceId = { exact: pick.id };
-      stream = await navigator.mediaDevices.getUserMedia(constraints);
-      s.camera = 'on';
-      // The track's own label is the truth about what opened, not the constraint we asked for.
-      const opened = ((stream.getVideoTracks()[0] || {}).label) || '';
-      s.cameraLabel = opened;
-      const hadSwitcher = (s.deviceList || []).some((d) => (d.label || '').toLowerCase().includes(SWITCHER));
-      s.cameraFrom = opened.toLowerCase().includes(SWITCHER) ? null
-        : hadSwitcher
-          ? `opened ${opened || 'an unlabelled camera'} by your click, not the WebcamSwitcher one`
-          : `WebcamSwitcher camera not found — using ${opened || pick.label || 'an unlabelled video device'}`;
-      if (s.cameraFrom) push(s.cameraFrom, 'warn');
-      await listDevices();
-    } catch (err) {
-      s.camera = /NotAllowed|Security/i.test(err.name || '') ? 'denied' : /NotReadable|Abort/i.test(err.name || '') ? 'held' : 'error';
-      s.streamError = err.message || err.name;
-      push(`camera: ${s.camera} — ${s.streamError}`, 'bad');
-    }
-    render();
-  }
-
-  function stopPreview() {
-    if (stream) for (const t of stream.getTracks()) t.stop();
-    stream = null;
-    if (s.camera !== 'held') s.camera = 'off';
-    s.cameraLabel = '';
-    s.cameraFrom = null;
-    if (videoEl) {
-      videoEl.srcObject = null;
-      videoEl = null;
-    }
-  }
-
-  /* -------------------------------------------------------------- effects */
 
   function registry() {
     const served = (s.status && s.status.effects) || [];
@@ -321,27 +226,31 @@ export async function render(container, ctx) {
   /* -------------------------------------------------------------- render */
 
   function render() {
-    clear(root);
     const status = s.status;
     const reg = registry();
     const enabled = s.settings.enabled !== false;
     const insecure = secureText();
     const page = pageSummary();
 
-    root.append(header(status, reg, page, enabled));
+    headerHost.replaceChildren(header(status, reg, page, enabled));
 
-    if (insecure) root.append(banner(insecure, 'bad'));
+    const notices = [];
+    if (insecure) notices.push(banner(insecure, 'bad'));
     if (status && (!status.runtime || !status.runtime.vendored)) {
-      root.append(banner('The MediaPipe runtime is not vendored. The overlay will report “model failed”; see modules/handfx/vendor/README.md.', 'bad'));
+      notices.push(banner('The MediaPipe runtime is not vendored. The overlay will report “model failed”; see modules/handfx/vendor/README.md.', 'bad'));
     }
     if (status && status.model && !status.model.local) {
-      root.append(banner(`No local model file: the overlay downloads hand_landmarker.task once from ${status.model.url} and caches it in Cache Storage.`, 'info'));
+      notices.push(banner(`No local model file: the overlay downloads hand_landmarker.task once from ${status.model.url} and caches it in Cache Storage.`, 'info'));
     }
+    bannerHost.replaceChildren(...notices);
 
-    const body = el('div', { class: 'hfx-body' });
-    body.append(previewCard(), sideColumn(reg, enabled));
-    root.append(body);
-    root.append(effectsCard(reg), footer(reg));
+    if (!pv) {
+      previewCard();
+      previewSlot.append(previewHost);
+    }
+    sideSlot.replaceChildren(sideColumn(reg, enabled));
+    effectsHost.replaceChildren(effectsCard(reg));
+    footerHost.replaceChildren(footer(reg));
     renderLog();
   }
 
@@ -376,62 +285,29 @@ export async function render(container, ctx) {
     return el('div', { class: 'hfx-banner', 'data-tone': tone, text });
   }
 
+  /* The page is mounted once and re-attached on every render, so the iframe is never recreated
+     by a bus event or a status poll. */
+  const previewHost = el('div', { class: 'hfx-preview-host' });
+  let pv = null;
+
   function previewCard() {
-    const card = el('section', { class: 'panel hfx-preview' });
-    const head = el('div', { class: 'panel-head' },
-      el('span', { class: 'panel-title', text: 'Preview' }),
-      el('span', { class: 'panel-hint mono', 'data-hfx-preview-state': s.camera }),
-      effectPicker(),
-    );
-    const stage = el('div', { class: 'hfx-stage', 'data-state': s.camera, 'data-underlay': s.underlay ? 'on' : 'off' });
-    const cam = el('video', { class: 'hfx-video', autoplay: true, muted: true, playsInline: true });
-    cam.muted = true;
-    const fxLayer = previewCanvas();
-    const lm = document.createElement('canvas');
-    lm.className = 'hfx-landmarks';
-    const hud = el('div', { class: 'hfx-hud' });
-    stage.append(cam, fxLayer, lm, hud);
-    videoEl = cam;
-
-    const note = el('div', { class: 'hfx-preview-note' });
-    if (s.camera === 'on') {
-      note.append(el('span', { class: 'hfx-note ok', text: `camera live in this pane${s.cameraLabel ? ` — ${s.cameraLabel}` : ''}` }));
-      // Never a silent swap: when the WebcamSwitcher camera is not the one that opened, say which
-      // one did and why.
-      if (s.cameraFrom) note.append(el('span', { class: 'hfx-note warn', text: s.cameraFrom }));
+    if (!pv) {
+      pv = mountPreview(previewHost, {
+        title: 'Preview',
+        hint: 'live /handfx page',
+        src: '/handfx',
+        interactive: false,
+        // the page is the whole 16:9 surface; no wall crop guide
+        fence: false,
+      });
+      pv.el.querySelector('.pv-headright')?.append(underlayToggle());
     }
-    else if (s.camera === 'asking') note.append(el('span', { class: 'hfx-note', text: 'waiting for the permission prompt…' }));
-    else if (s.camera === 'denied') note.append(el('span', { class: 'hfx-note bad', text: 'camera permission denied — allow it for this origin and try again' }));
-    else if (s.camera === 'held') note.append(el('span', { class: 'hfx-note bad', text: 'camera held by another app or tab (the overlay, OBS, a call) — stop it there first' }));
-    else if (s.camera === 'insecure') note.append(el('span', { class: 'hfx-note bad', text: 'camera needs a secure origin (127.0.0.1 / localhost / https)' }));
-    else if (s.camera === 'error') note.append(el('span', { class: 'hfx-note bad', text: s.streamError || 'camera error' }));
-    else {
-      const page = pageSummary();
-      if (page.tone === 'ok') note.append(el('span', { class: 'hfx-note', text: 'the overlay is tracking; its picture stays in its page (one camera, one document)' }));
-      else note.append(el('span', { class: 'hfx-note', text: 'no camera here. The preview opens it on your click only; nothing is captured before that.' }));
-    }
-    note.append(
-      underlayToggle(),
-      actionButton({ label: s.camera === 'on' ? 'Stop preview' : 'Start preview', variant: 'btn btn-sm hfx-preview-btn', run: async () => (s.camera === 'on' ? stopPreview() : startPreview()), onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
-      actionButton({ label: s.synthetic ? 'Stop synthetic' : 'Synthetic', variant: 'btn btn-sm', run: async () => { s.synthetic = !s.synthetic; s.syntheticAt = performance.now(); synthMotion.push(null, performance.now()); }, onDone: () => render(), onError: (err) => push(err.message, 'bad') }),
-    );
-    if (s.synthetic) note.append(el('span', { class: 'hfx-note ok', text: 'synthetic hands — drawn over the camera feed when it is live, on the dark backdrop when it is not' }));
-    if (s.settings.obsHandFx === false) note.append(el('span', { class: 'hfx-note', text: 'effects off for OBS — this preview draws none either, so it matches the source' }));
-    card.append(head, stage, el('div', { class: 'panel-body hfx-preview-body' }, note));
-
-    // After the DOM is in place: attach the live stream and start the landmark loop.
-    queueMicrotask(() => {
-      if (!videoEl) return;
-      if (stream) videoEl.srcObject = stream;
-      drawLandmarks();
-      startFx();
-    });
-    return card;
+    return pv.el;
   }
 
   function sideColumn(reg, enabled) {
     const col = el('div', { class: 'hfx-side' });
-    col.append(trackingCard(), bodyCard(), cameraCard(), lookCard());
+    col.append(trackingCard(), bodyCard(), lookCard());
     return col;
   }
 
@@ -480,56 +356,6 @@ export async function render(container, ctx) {
     if (page && page.lastPoseAt) {
       body.append(el('div', { class: 'hfx-note', text: `body page beat ${Math.round((Date.now() - page.lastPoseAt) / 1000)}s ago` }));
     }
-    card.append(body);
-    return card;
-  }
-
-  function cameraCard() {
-    const card = el('section', { class: 'panel' });
-    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Camera' })));
-    const body = el('div', { class: 'panel-body hfx-fields' });
-    const list = el('div', { class: 'hfx-devices' });
-    if (s.devices === 'insecure') list.append(el('div', { class: 'hfx-note bad', text: 'device list unavailable: insecure origin' }));
-    else if (!s.deviceList.length) list.append(el('div', { class: 'hfx-note', text: s.devices === 'unlabelled' ? 'camera found, name hidden until this origin has permission' : 'no camera listed yet — press Refresh' }));
-    else {
-      for (const d of s.deviceList) {
-        const chosen = (s.settings.deviceId || '') === d.deviceId || (!s.settings.deviceId && d.deviceId === s.deviceList[0].deviceId);
-        const b = el('button', { type: 'button', class: 'hfx-dev', 'data-chosen': chosen ? 'true' : 'false', title: d.label || d.deviceId });
-        b.append(el('span', { class: 'hfx-dev-name', text: d.label || `camera ${d.deviceId.slice(0, 8) || '?'}` }), el('span', { class: 'hfx-dev-id mono', text: d.deviceId ? d.deviceId.slice(0, 10) : '' }));
-        b.addEventListener('click', async () => {
-          await patch('deviceId', d.deviceId || '');
-          if (s.camera === 'on') await startPreview(d.deviceId);
-          else render();
-        });
-        list.append(b);
-      }
-    }
-    body.append(
-      el('div', { class: 'hfx-row' }, el('span', { class: 'hfx-label', text: 'device' }), list),
-      el('div', { class: 'hfx-row hfx-actions' },
-        actionButton({ label: 'Refresh list', variant: 'btn btn-sm', run: listDevices, onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
-        actionButton({ label: 'Clear device', variant: 'btn btn-quiet btn-sm', run: () => patch('deviceId', ''), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
-      ),
-      el('div', { class: 'hfx-row' }, el('span', { class: 'hfx-label', text: 'publish' }), selectControl('publish', s.settings.publish || 'off', (s.status?.settings?.publish?.values) || ['off', 'raw', 'effects'], (v) => patch('publish', v))),
-      // The truth about the pipe, read from /status rather than assumed: the camera slot may not be
-      // running at all, which is `waiting`, not a failure.
-      (() => {
-        const mode = s.settings.publish || 'off';
-        if (mode === 'off') {
-          return el('p', { class: 'hfx-help', text: 'publish off: no pipe is opened — the ShockBox Virtual Camera keeps its black placeholder, and nothing is converted.' });
-        }
-        const p = s.status?.publish || {};
-        const g = p.geometry;
-        const size = g ? `${g.width}×${g.height} NV12 @ ${g.fps} fps` : 'format.ini not read yet';
-        const ago = p.lastFrameAt ? `${Math.max(0, Math.round((Date.now() - p.lastFrameAt) / 1000))}s ago` : 'never';
-        const why = p.stage === 'live' ? 'live' : 'waiting — no consumer on the pipe, or the overlay page is not sending';
-        return el('p', {
-          class: `hfx-help hfx-note ${p.stage === 'live' ? 'ok' : 'warn'}`,
-          text: `publish ${mode}: ${size} · ${why} · ${p.frames || 0} frames, last ${ago}${p.error ? ` · ${p.error}` : ''}`,
-        });
-      })(),
-      el('p', { class: 'hfx-help', text: 'The camera opens only on Start preview (or the overlay’s own Start). One document holds the camera at a time; the overlay holds it while it is tracking.' }),
-    );
     card.append(body);
     return card;
   }
@@ -672,189 +498,23 @@ export async function render(container, ctx) {
   // settings: the operator's list, intensity and mirror come in, but only the chosen effect is
   // live here. The renderer and its canvas outlive a re-render (the canvas is re-attached, never
   // remade), so the WebGL context survives the pane's status refresh.
-  let fxr = null;
-  let fxCanvas = null;
-  let fxRaf = 0;
-  let fxKey = '';
-
-  function previewCanvas() {
-    if (!fxCanvas) {
-      fxCanvas = document.createElement('canvas');
-      fxCanvas.className = 'hfx-fx';
-      fxCanvas.setAttribute('aria-hidden', 'true');
-    }
-    return fxCanvas;
-  }
-
-  /** What this build can draw, in the server's order — the preview offers only those. */
-  function previewChoices() {
-    const ids = registry().filter((e) => e.id && KNOWN.has(e.id)).map((e) => e.id);
-    const list = [...new Set(ids)];
-    return list.length ? list : [...KNOWN];
-  }
-
-  function previewEffectId() {
-    const choices = previewChoices();
-    if (s.previewEffect && choices.includes(s.previewEffect)) return s.previewEffect;
-    return (s.settings.effects || []).find((id) => choices.includes(id)) || choices[0] || null;
-  }
-
-  function effectPicker() {
-    const current = previewEffectId();
-    const sel = el('select', { class: 'hfx-select hfx-preview-effect', 'aria-label': 'effect shown in the preview' });
-    const choices = previewChoices();
-    if (!choices.length) sel.append(el('option', { value: '', text: 'no effects in this build' }));
-    for (const id of choices) {
-      const title = effectTitle({ id }, id);
-      sel.append(el('option', { value: id, text: `${title.text}${effectEnabled(id) ? '' : ' — off'}` }));
-    }
-    if (current) sel.value = current;
-    sel.addEventListener('change', () => {
-      s.previewEffect = sel.value || null;
-      startFx();
-    });
-    return sel;
-  }
-
   function underlayToggle() {
     const input = el('input', { type: 'checkbox', id: 'hfx-underlay' });
-    input.checked = s.underlay;
-    input.addEventListener('change', () => {
-      s.underlay = input.checked;
-      render();
+    input.checked = s.underlay !== false;
+    input.addEventListener('change', async () => {
+      const want = input.checked;
+      s.underlay = want;
+      try {
+        await patch('underlay', want);
+        push(`underlay ${want ? 'on' : 'off'}`, 'ok');
+      } catch (err) {
+        s.underlay = !want;
+        input.checked = !want;
+        push(`underlay refused: ${err.message}`, 'bad');
+      }
     });
     return el('label', { class: 'hfx-underlay', title: 'the camera feed under the effects' },
       input, el('span', { class: 'hfx-note', text: 'Underlay' }));
-  }
-
-  /**
-   * Anchors for the preview's frame. The pane has no detector of its own: with the synthetic rig on
-   * the effects follow those hands; with it off there is nothing to anchor to, so they are drawn at
-   * a fixed centre anchor rather than at a hand the pane cannot see.
-   */
-  function previewView(now) {
-    if (s.synthetic) {
-      if (!s.syntheticAt) s.syntheticAt = performance.now();
-      return anchorsFrom(syntheticHands((now - s.syntheticAt) / 1000));
-    }
-    return {
-      palms: [{ x: 0.5, y: 0.55, radius: 0.16 }],
-      fingertipPairs: [],
-      front: { x: 0.5, y: 0.55, radius: 0.12 },
-      anchor: { x: 0.5, y: 0.55, radius: 0.2 },
-      swipe: null,
-      hands: [],
-    };
-  }
-
-  function startFx() {
-    cancelAnimationFrame(fxRaf);
-    if (!fxCanvas || !fxCanvas.isConnected) return;
-    // One flag decides both: when the OBS source draws no effects, the preview draws none either,
-    // so the operator tunes what the stream actually shows.
-    if (s.settings.obsHandFx === false) {
-      fxCanvas.style.display = 'none';
-      return;
-    }
-    fxCanvas.style.display = '';
-    if (!fxr) {
-      fxr = new FxRenderer(fxCanvas, { onError: (msg) => push(`preview effects: ${msg}`, 'bad') });
-      if (!fxr.init()) {
-        fxr = null;
-        return;
-      }
-    }
-    const tick = (now) => {
-      fxRaf = requestAnimationFrame(tick);
-      if (!fxr || !fxr.gl) return;
-      const id = previewEffectId();
-      if (!id) return;
-      const intensity = Number((s.settings.intensity || {})[id] ?? 1);
-      const key = `${id}|${intensity}|${s.settings.mirror !== false}|${s.settings.bufferScroll ?? 0.35}`;
-      if (key !== fxKey) {
-        fxKey = key;
-        fxr.setSettings({
-          effects: [id],
-          intensity: { [id]: intensity },
-          mirror: s.settings.mirror !== false,
-          bufferScroll: Number(s.settings.bufferScroll ?? 0.35),
-          enabled: true,
-        });
-      }
-      fxr.view = previewView(now);
-      const live = fxr.live.get(id);
-      // One-shots run out; re-fire instead of leaving an empty box after the first burst.
-      if (!live || !live.active || (Number(live.age) || 0) > 3) fxr.trigger(id, { view: fxr.view });
-      fxr.render(now, fxr.view);
-    };
-    fxRaf = requestAnimationFrame(tick);
-  }
-
-  /* -------------------------------------------------------------- landmark loop */
-
-  let landmarkRaf = 0;
-  function drawLandmarks() {
-    cancelAnimationFrame(landmarkRaf);
-    const canvas = root.querySelector('.hfx-landmarks');
-    if (!canvas) return;
-    const ctx2d = canvas.getContext('2d');
-    const tick = () => {
-      const stageEl = canvas.parentElement;
-      const w = (canvas.width = stageEl.clientWidth);
-      const h = (canvas.height = stageEl.clientHeight);
-      ctx2d.clearRect(0, 0, w, h);
-      const p = s.page;
-      const fresh = p && Date.now() - (p.at || 0) < 6000;
-      if (s.camera === 'on' && videoEl && videoEl.videoWidth) {
-        // The pane draws its own landmarks when it holds the camera (same 21-point skeleton);
-        // there is no detector in the pane, so it shows the picture only and says so in the HUD.
-        ctx2d.font = '11px ui-monospace, monospace';
-        ctx2d.fillStyle = 'rgba(255,255,255,.75)';
-        ctx2d.fillText('preview only — detection runs in the overlay', 8, h - 8);
-      } else if (fresh && p.tracking) {
-        ctx2d.font = '11px ui-monospace, monospace';
-        ctx2d.fillStyle = 'rgba(255,255,255,.75)';
-        ctx2d.fillText(`overlay reports: ${p.hands} hand${p.hands === 1 ? '' : 's'} · ${p.gesture || 'none'}`, 8, h - 8);
-      }
-      if (s.synthetic) drawSynthetic(ctx2d, w, h);
-      else synthMotion.push(null, performance.now());
-      landmarkRaf = requestAnimationFrame(tick);
-    };
-    landmarkRaf = requestAnimationFrame(tick);
-  }
-
-  const synthMotion = new Motion();
-  function drawSynthetic(c2d, w, h) {
-    if (!s.syntheticAt) s.syntheticAt = performance.now();
-    const t = (performance.now() - s.syntheticAt) / 1000;
-    const hands = syntheticHands(t);
-    const centre = hands.length ? { x: hands[0].landmarks[9].x, y: hands[0].landmarks[9].y } : null;
-    const mv = synthMotion.push(centre, performance.now());
-    const result = classifyPose(hands, { swipe: mv });
-    s.syntheticReading = result.gesture;
-    c2d.save();
-    c2d.font = '11px ui-monospace, monospace';
-    c2d.fillStyle = 'rgba(242,193,78,.9)';
-    c2d.fillText(`SYNTHETIC REPLAY — not a camera, not tracking · ${result.gesture}`, 8, 16);
-    const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
-    for (const hand of hands) {
-      const lm = hand.landmarks;
-      c2d.strokeStyle = hand.handedness === 'Right' ? 'rgba(111,179,255,.85)' : 'rgba(177,140,255,.85)';
-      c2d.lineWidth = 2;
-      c2d.beginPath();
-      for (const [a, b] of CONN) {
-        c2d.moveTo(lm[a].x * w, lm[a].y * h);
-        c2d.lineTo(lm[b].x * w, lm[b].y * h);
-      }
-      c2d.stroke();
-      c2d.fillStyle = 'rgba(255,255,255,.85)';
-      for (const p of lm) {
-        c2d.beginPath();
-        c2d.arc(p.x * w, p.y * h, 2.4, 0, Math.PI * 2);
-        c2d.fill();
-      }
-    }
-    c2d.restore();
   }
 
   /* -------------------------------------------------------------- wiring */
@@ -892,7 +552,6 @@ export async function render(container, ctx) {
     root.append(banner(`Cannot read /api/handfx/status: ${err.message}`, 'bad'));
     return () => unsub();
   }
-  await listDevices();
   render();
 
   // The body-tracking row is about the last few seconds (mask freshness), not the last command:
@@ -903,19 +562,13 @@ export async function render(container, ctx) {
   }, 3000);
 
   signal.addEventListener('abort', () => {
-    cancelAnimationFrame(landmarkRaf);
-    cancelAnimationFrame(fxRaf);
     clearTimeout(refreshTimer);
     clearInterval(bodyTimer);
-    stopPreview();
     unsub();
   });
 
   return () => {
-    cancelAnimationFrame(landmarkRaf);
-    cancelAnimationFrame(fxRaf);
     clearTimeout(refreshTimer);
-    stopPreview();
     unsub();
   };
 }

@@ -507,14 +507,6 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   // committed rect, the pixel readout and which commands the window moves.
   const previewHost = el('div', { class: 'wall-preview-host' });
   let preview = null;
-  let previewLayerPainted = false;
-
-  // The layer drawn inside the 9:16 window: the wall's lattice and its tag. The dotted veil is
-  // NOT here — the preview applies it itself, which is why an unmodified default fence rect can
-  // still be lit (a full-size grid would otherwise read as "the wall is not dimmed at all").
-  const layerEl = el('div', { class: 'wall-layer' });
-  const surfaceTag = el('span', { class: 'wall-surface-tag mono' });
-  layerEl.append(surfaceTag);
 
   const readout = el('div', { class: 'wall-readout' });
   const cellsOut = el('div', { class: 'wall-readout-row' },
@@ -1280,7 +1272,6 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
         blackout: Number(lookValue('blackout') ?? 0) > 0,
       });
     }
-    paintPreviewLook();
   }
 
   /* Look names as the four sources spell them:
@@ -1462,30 +1453,14 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     if (preview) return preview;
     preview = mountPreview(previewHost, {
       title: 'Wall preview',
-      hint: `${WALL_W} × ${WALL_H} · the 9:16 window is derived from the ratio`,
-      // Read-only: the window is a consequence of the ratio, so there is nothing here to drag.
+      hint: `${WALL_W} × ${WALL_H} · live 16:9 render surface`,
+      // The real engine page paints the wall; the component only adds the 9:16 crop guide.
+      src: '/wall/render?scale=1',
       interactive: false,
       dim: Number(lookValue('fenceOutDim') ?? 0.18),
-      look: previewLook(),
     });
-    preview.setLayer(null);
     preview.host = previewHost;
     return preview;
-  }
-
-  function previewLook() {
-    // The ramp the wall is running: the shared store's name when it knows one, else the pane's own
-    // page answer, else the engine default. A store fed from the document (which has no palette
-    // key) reports `neonwave`; a store fed by the column's `loadLook` reports the live name.
-    const palette = (shared && shared.get().palette) || DEFAULT_PALETTE;
-    return {
-      palette: PALETTES[palette] || PALETTES.neonwave,
-      brightness: clamp(Number(lookValue('brightness') ?? 1), 0, 2),
-      saturation: clamp(Number(lookValue('saturation') ?? 1), 0, 2),
-      speed: Number(lookValue('speed') ?? 1),
-      pattern: String(lookValue('pattern') || 'wave'),
-      blackout,
-    };
   }
 
   // pixel rect (wall px, 2560×1440 picture) → the component's fence fractions
@@ -1508,15 +1483,6 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     return { x, y, w, h };
   }
 
-  function paintPreviewLook() {
-    // `palette` is not a schema key (the engine reads `paletteWeight`); the component paints the
-    // default palette the engine uses, so the preview and the stream agree on the look.
-    mountWallPreview().setLook(previewLook());
-    // the layer keeps the wall's own lattice: dots read as cells at the drawn scale
-    const drawnW = previewHost.getBoundingClientRect().width || 0;
-    if (drawnW > 0) layerEl.style.setProperty('--w-dot', `${clamp((drawnW / 112) * 1.6, 3, 7).toFixed(1)}px`);
-  }
-
   function paintPreview() {
     const pv = mountWallPreview();
     // the mode is decided from the wall's RATIO, not from whether a rect happens to be cached:
@@ -1530,14 +1496,10 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     if (pv.frame) frameEl = pv.frame;
     if (shown && !pv.fenceReady) {
       // no rect to place yet: the component draws its default window rather than nothing
-      pv.setLook(previewLook());
       previewPanel.dataset.fence = 'on';
-      surfaceTag.textContent = '9:16 window';
       return;
     }
-    pv.setLook(previewLook());
     previewPanel.dataset.fence = shown ? 'on' : 'off';
-    surfaceTag.textContent = shown ? '9:16 window' : 'whole wall · 16:9';
     if (shown && fencePx) {
       const r = fencePx;
       pv.setFence(rectToFence(r));

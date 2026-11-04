@@ -1,15 +1,15 @@
-/* ShockBox module previews — the one shape every module preview uses.
+/* ShockBox module previews — one live 16:9 picture, every module.
  *
- * Geometry contract (see public/src/preview.js for why): the FRAME is 16:9 and is never taller
- * than 0.5625 × its width. The 9:16 window sits inside it as a percentage of the frame's width,
- * with its pixel height measured from that width, so a portrait window can never grow the pane.
+ * Geometry contract: the FRAME is width:100% with aspect-ratio 16/9, so the preview cell's full
+ * canvas is the picture. The module's real page lives in an iframe at 100% x 100% of that frame:
+ * no pixel box, no redrawing, no distortion. The optional 9:16 window is an app-side crop guide
+ * drawn over the page; it never changes the page's own size.
  *
  * Colours come from the shell tokens only — this file must not invent a palette.
  */
 
 .pv {
   margin: 0 0 14px;
-  /* the component is the pane's top element; no extra chrome above it */
   overflow: hidden;
 }
 
@@ -38,28 +38,16 @@
 
 .pv-stage {
   position: relative;
-  /* A query container, INLINE size only: this is what tells the engine the stage's size must not
-     depend on its own content, which is the condition that turns a ResizeObserver that writes to
-     the observed subtree into a loop. The size is driven by the pane's width, so the container is
-     satisfied without any query rules. */
+  /* inline-size containment only: the stage is sized by the pane, never by its own content */
   container-type: inline-size;
-  /* the frame is capped narrower than the pane on wide screens; centring it here is what keeps
-     the window's pixel maths (a share of the frame, read back from the DOM) exact */
-  display: flex;
-  justify-content: center;
   width: 100%;
-  /* the stage adds a little breathing room for the grip and the label, never height of its own;
-     the frame is capped inside it, so it is centred there */
   padding: 10px 0 16px;
   min-width: 0;
-  /* the stage's width is the frame's (its padding is vertical only), so the frame's own
-     width:100% is the stage width minus nothing — stated here so a pane rule cannot outrun it */
   box-sizing: border-box;
 }
 
 .pv-stage {
-  /* --pv-crop is the part of a 9:16 window that lies outside the 16:9 picture, which the frame
-     clips; the component reserves it here so the crop never runs under the controls below */
+  /* clipped height of a 9:16 window that runs past the 16:9 picture */
   padding-bottom: var(--pv-crop, 0px);
 }
 
@@ -67,34 +55,31 @@
   position: relative;
   width: 100%;
   aspect-ratio: 16 / 9;
-  /* include the border in the 16:9 box: a content-box frame measures its inner picture as
-     (width − 2 × hairline), which is a 2px sliver of error in every screen-px → wall-px
-     conversion the panes do (the drag maths reads the box back from the DOM) */
   box-sizing: border-box;
-  /* no max-width: it would resolve from the frame's own height under `aspect-ratio`, and the
-     window inside it controls that height — a loop that pins the frame a few pixels narrow */
   overflow: hidden;
   border: var(--hair) solid var(--line-3);
   background: #000;
-  /* it is a child of the frame so it cannot move the frame. The frame takes its height from its
-     16:9 width only — the window's own height must never add to it, so the window is out of flow
-     and the frame's box is fixed. The component sets `data-overhang` on the window when it is the
-     whole 9:16 crop of a 16:9 wall, and reserves that clipped height on the stage as --pv-crop. */
-  isolation: isolate;
 }
 
-.pv-shade {
-  /* the dim ring is four boxes rather than one enormous spread border: a spread border also
-     paints ON the text and grid lines at the frame's edge, which read as "the whole preview is
-     dimmed". Four positioned fills stop exactly at the window's edges instead. */
+/* The live page. Inert: no pointer, no focus, no scrollbars; it exists to be looked at. */
+.pv-iframe {
   position: absolute;
   inset: 0;
-  /* The dim is the operator's choice and the window's absence of it: outside is what the stream
-     cuts away, inside is what it shows. A translucent veil made both sides pastel. */
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #000;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------- the 9:16 crop guide */
+
+.pv-shade {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
   background: rgba(0, 0, 0, calc(0.05 + var(--pv-dim, 0.55) * 0.55));
-  /* outer contour clockwise, then the window's contour counter-clockwise: a nonzero fill
-     cancels the overlap, so the region inside the window is genuinely empty (a bare contour
-     would just be filled solid). */
+  /* outer contour clockwise, window contour counter-clockwise: nonzero fill cancels the hole */
   clip-path: polygon(
     0% 0%, 100% 0%, 100% 100%, 0% 100%,
     var(--pv-x1, 59%) var(--pv-y1, 100%),
@@ -102,6 +87,18 @@
     var(--pv-x0, 41%) var(--pv-y0, 0%),
     var(--pv-x0, 41%) var(--pv-y1, 100%)
   );
+}
+
+.pv-window {
+  position: absolute;
+  z-index: 4;
+  overflow: hidden;
+  /* the crop edge is drawn outside the box so it never eats a pixel of the page */
+  outline: var(--hair) solid var(--accent-2);
+}
+
+.pv-window > .pv-iframe {
+  z-index: 3;
 }
 
 .pv-winlabel {
@@ -168,94 +165,7 @@
 
 .pv-dimout { display: none; }
 
-/* ------------------------------------------------------------- the picture */
-
-/* `.pv-look` is the graded gradient and `.pv-dots` the LED lattice: together they are the
- * module's picture, drawn inside the frame at the look's palette. They are absolutely placed
- * inside the frame, which is close to the only thing that is forced: without a `position: absolute`
- * they stack as block boxes above the frame's own children and collapse to zero height — the
- * frame then reads as a black void with a tag in it, on every module. The frame is
- * `position: relative; overflow: hidden`, so these are clipped to it either way. */
-.pv-look,
-.pv-dots {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
-
-.pv-look {
-  /* three stops from the look's palette, mixed through the grade the module sets */
-  background:
-    radial-gradient(120% 90% at 18% 12%, color-mix(in srgb, var(--pv-a, #6ff7ff) 78%, transparent) 0%, transparent 62%),
-    radial-gradient(95% 85% at 82% 22%, color-mix(in srgb, var(--pv-b, #b18cff) 72%, transparent) 0%, transparent 66%),
-    radial-gradient(130% 110% at 60% 108%, color-mix(in srgb, var(--pv-c, #ff7ad9) 70%, transparent) 0%, transparent 70%),
-    linear-gradient(160deg, #05060a 0%, #0a0d16 55%, #05060a 100%);
-  background-size: 220% 220%, 220% 220%, 220% 220%, 100% 100%;
-  filter: saturate(var(--pv-sat, 1)) brightness(var(--pv-bright, 1));
-  /* the drift: a long, slow travel whose period follows the look's speed */
-  animation: pv-drift var(--pv-dur, 18s) linear infinite alternate;
-}
-
-/* the LED lattice: cells read as dots at the drawn scale, not as a pixel grid */
-.pv-dots {
-  background-image: radial-gradient(circle at center, rgba(255, 255, 255, 0.16) 0.6px, transparent 0.9px);
-  background-size: var(--pv-dot, 5px) var(--pv-dot, 5px);
-  mix-blend-mode: overlay;
-}
-
-/* the pattern: a shape class per look, so two looks read apart even at a still frame */
-.pv-stage[data-shape='wave'] .pv-look { animation-name: pv-drift; }
-.pv-stage[data-shape='bars'] .pv-look { background-size: 18% 100%, 35% 100%, 220% 220%, 100% 100%; }
-.pv-stage[data-shape='dots'] .pv-dots { background-size: var(--pv-dot, 9px) var(--pv-dot, 9px); }
-.pv-stage[data-shape='sweep'] .pv-look {
-  background-size: 100% 100%, 100% 100%, 100% 100%, 100% 100%;
-  animation: pv-sweep var(--pv-dur, 18s) ease-in-out infinite alternate;
-}
-.pv-stage[data-shape='plasma'] .pv-look {
-  background-size: 320% 320%, 300% 300%, 280% 280%, 100% 100%;
-  animation: pv-plasma calc(var(--pv-dur, 18s) * 1.4) ease-in-out infinite alternate;
-}
-
-@keyframes pv-drift {
-  from { background-position: 0% 0%, 100% 0%, 50% 100%, 0 0; }
-  to { background-position: 18% 22%, 82% 30%, 40% 78%, 0 0; }
-}
-@keyframes pv-sweep {
-  from { background-position: 0% 50%, 0% 50%, 0% 50%, 0 0; filter: saturate(var(--pv-sat, 1)) brightness(calc(var(--pv-bright, 1) * 0.85)); }
-  to { background-position: 12% 50%, 24% 50%, 6% 50%, 0 0; filter: saturate(var(--pv-sat, 1)) brightness(var(--pv-bright, 1)); }
-}
-@keyframes pv-plasma {
-  from { background-position: 0% 0%, 100% 100%, 50% 50%, 0 0; }
-  to { background-position: 30% 40%, 60% 20%, 20% 80%, 0 0; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .pv-look { animation: none; }
-}
-
-.pv[data-blackout='true'] .pv-look,
-.pv[data-blackout='true'] .pv-dots {
-  opacity: 0.05;
-  animation: none;
-}
-
-/* quiet: the module's own layer only (setQuiet/quiet() in preview.js). The frame stays, so the
-   crop and the window geometry are unchanged; the wall's gradient and lattice go. */
-.pv[data-quiet='true'] .pv-look,
-.pv[data-quiet='true'] .pv-dots { display: none; }
-.pv[data-quiet='true'] { background: #0b0b0f; }
-
 /* ----------------------------------------------------------------- merged view */
-
-.pv-stack {
-  position: absolute;
-  inset: 0;
-}
-
-.pv-slot {
-  position: absolute;
-  inset: 0;
-}
 
 .pv-chips {
   display: flex;
@@ -289,43 +199,19 @@
   background: var(--accent);
 }
 
-/* narrower panes: the header wraps, the dim control keeps its priority */
+/* narrower panes: the header wraps, the picture keeps its 16:9 box */
 @media (max-width: 700px) {
   .pv-head { gap: 6px; }
-  .pv-frame { max-height: 42vh; }
-}
-
-/* ------------------------------------------------------------------- layers */
-
-/* Outside the window: the same content, veiled — what is being cut off. Sits above the look,
-   below the shade, so it reads at the same reduced strength as the picture around it. */
-.pv-layer-out { z-index: 1; }
-.pv-layer-out .pv-dim-copy { opacity: 0.55; }
-
-/* Inside the window: the module's content at full strength, sized to the crop. It is a child of
-   the window, so its coordinate space is the window's box — exactly what the stream renders. */
-.pv-layer-in {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
-
-.pv-layer-in > * {
-  position: absolute;
-  inset: 0;
-}
-
-.pv-window {
-  /* above the picture, so it is the unlit one: outside is what the stream cuts away, inside is
-     what it shows. The picture (`.pv-look` / `.pv-dots`) is a positioned, opaque layer stacked
-     above a static window otherwise — the window would be painted UNDER it and read as a black
-     rectangle with a tag. */
-  position: absolute;
-  z-index: 4;
-  /* the lit content must not paint over the window's own border */
-  overflow: hidden;
 }
 
 .pv-tag {
+  position: absolute;
+  left: 8px;
+  bottom: 6px;
   z-index: 5;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--fg-3);
+  pointer-events: none;
+  text-shadow: 0 1px 2px #000;
 }
