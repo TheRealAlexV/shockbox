@@ -58,7 +58,7 @@
       "type": "boolean",
       "default": true,
       "label": "Camera picture under the effects",
-      "help": "On: the overlay page draws the camera it is reading beneath the effects, so the page is the picture. Off: the effects sit on a transparent page, which is what an OBS source laid over a camera source wants. Read by the page; a preview turns it off through PATCH /api/handfx/settings.",
+      "help": "On: the overlay page draws the camera it is reading beneath the effects, so the page is the picture. Off: the effects sit on a transparent page, which is what an OBS source laid over a camera source wants. Read by the page; the pane's live preview forces it off in its own iframe only (it never writes this setting).",
       "group": "general"
     },
     "publish": {
@@ -180,14 +180,6 @@
       },
       "label": "Per-effect intensity",
       "help": "Per-effect multipliers (0–2), merged onto the defaults. Keys the pane knows: the registry's effect ids.",
-      "group": "effects"
-    },
-    "nextGesture": {
-      "type": "enum",
-      "default": "bothFingertips",
-      "values": ["bothFingertips", "palmTouch", "bothPalmsUp", "fist"],
-      "label": "‘Next effect’ gesture",
-      "help": "The same two-hand gesture as lightning would race it, so the next-effect gesture must differ: touch two index fingertips to step the effect list.",
       "group": "effects"
     },
     "bufferScroll": {

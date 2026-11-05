@@ -268,6 +268,13 @@ function build(ctx) {
       model: { local: Boolean(model), name: MODEL_NAME, url: MODEL_URL },
       bodyModels: bodyModels(),
       body: { lastMaskAt: body.lastMaskAt, pageOpen: body.pageOpen && Date.now() - body.lastPoseAt < 5000, lastPoseAt: body.lastPoseAt },
+      // The two facts a reader should not have to dig out of `settings` (which carries the whole
+      // describe document): the persisted mode, and what is actually driving the particles right
+      // now. `trackingSource: 'auto'` + `effectiveSource: 'synthetic'` is the fallback — read
+      // `cameraError`/`relayError`/`cameraSource` for why — and is not the same thing as the
+      // operator asking for synthetic.
+      trackingSource: ['camera', 'synthetic'].includes(settings.get('trackingSource')) ? settings.get('trackingSource') : 'auto',
+      effectiveSource: draw.anchors, // camera | synthetic | none — the page's anchors, not a guess
       // Whether the overlay is drawing at all, and on what: `none` means the page is open but no
       // loop has rendered (or no page is open), which is the state that looks like a dead source.
       draws: draw.draws,
@@ -457,6 +464,10 @@ function build(ctx) {
         method: 'POST',
         handler: async (req, res, url, bodyIn) => {
           bodyIn = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
+          // The pane's live preview is a viewer, not a source: it says `preview: true` and the
+          // server drops the whole report. Without this a preview's own draws would make a dead
+          // OBS source look healthy (Math.max across clients below).
+          if (bodyIn.preview === true) return send(res, 200, { ok: true, preview: true });
           if (bodyIn.source === 'body') {
             // The body page's beat: it is open and its camera is running. Timestamp only.
             body.pageOpen = bodyIn.open === true;

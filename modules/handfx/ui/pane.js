@@ -295,11 +295,15 @@ export async function render(container, ctx) {
     if (!pv) {
       pv = mountPreview(previewHost, {
         title: 'Preview',
-        hint: 'live /shockfx page',
+        // A preview draws synthetic hands and forces the underlay off in its own iframe; say so,
+        // so the operator never reads the preview as the OBS source's exact look.
+        hint: 'live /shockfx · synthetic hands, underlay off in this preview',
         src: '/shockfx',
         interactive: false,
-        // the page is the whole 16:9 surface; no wall crop guide
-        fence: false,
+        // The 9:16 collision column the particles are fenced to (`engine/fx.js`
+        // fenceRectFor(9:16)` at 16:9: full height, w = 9/16 · h/w), in the preview frame's
+        // fractions. Not the component's wall-crop default, which is a different column.
+        fence: { x: 0.3418, w: 0.3164 },
       });
       pv.el.querySelector('.pv-headright')?.append(underlayToggle());
     }
@@ -312,12 +316,37 @@ export async function render(container, ctx) {
     return col;
   }
 
+  /**
+   * What is actually driving the particles, from /status (`effectiveSource`, the page's own anchor
+   * source) beside the persisted mode (`trackingSource`). `auto` + synthetic is a fallback, named
+   * with the camera's own error; it must never read the same as the operator choosing synthetic.
+   */
+  function effectiveSource() {
+    const st = s.status || {};
+    const setting = st.trackingSource || s.settings.trackingSource || 'auto';
+    const eff = st.effectiveSource || 'none';
+    const why = (st.cameraError && (st.cameraError.message || st.cameraError.name)) || st.relayError || (st.cameraSource === 'synthetic' ? 'no camera' : '');
+    if (eff === 'camera') return { tone: 'ok', text: setting === 'auto' ? 'camera (auto)' : 'camera' };
+    if (eff === 'synthetic' && setting === 'synthetic') return { tone: 'info', text: 'synthetic (chosen)' };
+    if (eff === 'synthetic') return { tone: why ? 'warn' : 'info', text: 'synthetic — auto fallback', why };
+    if (setting === 'camera') return { tone: 'warn', text: 'camera only — nothing drawn' };
+    return { tone: 'idle', text: 'nothing drawn yet' };
+  }
+
   function trackingCard() {
     const card = el('section', { class: 'panel' });
-    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Tracking' })));
+    const src = effectiveSource();
+    card.append(el('div', { class: 'panel-head' },
+      el('span', { class: 'panel-title', text: 'Tracking' }),
+      el('span', { class: 'hfx-pill', 'data-tone': src.tone, text: src.text }),
+    ));
     const body = el('div', { class: 'panel-body hfx-fields' });
     body.append(
       row('effects enabled', switchControl('enabled', s.settings.enabled !== false, async (v) => { await patch('enabled', v); if (v) await bus('tracking.toggle').catch(() => {}); })),
+      // The persisted hand source. The pill above shows what it resolved to right now, so `auto`
+      // that fell back to the rig is visible without reading the camera error.
+      row('hand source', selectControl('trackingSource', s.settings.trackingSource || 'auto', (s.status?.settings?.trackingSource?.values) || ['auto', 'camera', 'synthetic'], (v) => patch('trackingSource', v))),
+      ...(src.why ? [el('div', { class: 'hfx-note', text: `camera: ${String(src.why).slice(0, 160)}` })] : []),
       // The source (the overlay page) and this preview read the same flag, so the operator can
       // never tune effects that the OBS source is not drawing.
       row('effects in OBS', switchControl('obsHandFx', s.settings.obsHandFx !== false, async (v) => patch('obsHandFx', v))),
@@ -325,7 +354,6 @@ export async function render(container, ctx) {
       row('debug overlay', switchControl('debugOverlay', s.settings.debugOverlay === true, async (v) => patch('debugOverlay', v))),
       row('sensitivity', sliderControl('sensitivity', s.settings.sensitivity ?? 1, 0.4, 2, 0.05, (v) => patch('sensitivity', v))),
       row('travel', sliderControl('bufferScroll', s.settings.bufferScroll ?? 0.35, 0, 1.5, 0.05, (v) => patch('bufferScroll', v))),
-      row('next-effect gesture', selectControl('nextGesture', s.settings.nextGesture || 'bothFingertips', (s.status?.settings?.nextGesture?.values) || ['bothFingertips', 'palmTouch', 'bothPalmsUp', 'fist'], (v) => patch('nextGesture', v))),
       row('resolution', selectControl('resolution', s.settings.resolution || '720p', (s.status?.settings?.resolution?.values) || ['480p', '720p', '1080p'], (v) => patch('resolution', v))),
     );
     card.append(body);

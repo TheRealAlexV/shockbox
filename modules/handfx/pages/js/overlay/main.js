@@ -25,6 +25,14 @@ import { createWatchdog } from './watchdog.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
 import { FxRenderer, EFFECTS, anchorsFrom, fenceRectFor } from '../engine/fx.js';
 
+/**
+ * `?preview=1` is the pane's live preview (public/src/preview.js appends it). A preview is a
+ * viewer, not a source: it must never open the camera or the relay, never POST /ack, and never
+ * report draws — otherwise a dead OBS source looks alive because the pane's iframe is painting.
+ * It still runs the synthetic rig locally, so the effects are visible.
+ */
+const PREVIEW = new URLSearchParams(location.search).get('preview') === '1';
+
 const $ = (id) => document.getElementById(id);
 const stage = $('stage');
 const canvas = $('fx');
@@ -172,7 +180,10 @@ function applySettings(status) {  // Values may arrive bare (the test and the pa
   state.settings = s;
   state.status = status;
   state.trackingSource = s.trackingSource === 'camera' || s.trackingSource === 'synthetic' ? s.trackingSource : 'auto';
-  state.underlay = s.underlay !== false;
+  // A preview never writes settings, and a preview of a camera we are not allowed to open would
+  // only show a still; the pane forces the underlay off for its own iframe so the preview is the
+  // effects on the pane's dark backdrop, not a claimed camera picture.
+  state.underlay = !PREVIEW && s.underlay !== false;
   fx.setSettings({
     effects: s.effects && s.effects.length ? s.effects : [],
     intensity: s.intensity || {},
@@ -198,8 +209,8 @@ function applySettings(status) {  // Values may arrive bare (the test and the pa
   const list = effectiveEffects();
   if (state.cursor >= list.length) state.cursor = Math.max(0, list.length - 1);
   // The virtual camera's mode and geometry travel with the status document; nothing else tells
-  // this page whether to feed it.
-  publisher.fromStatus(status);
+  // this page whether to feed it. A preview is not the source, so it never feeds the pipe.
+  publisher.fromStatus(PREVIEW ? null : status);
   syncSyntheticMode();
   applyUnderlay();
   renderState();
@@ -444,7 +455,7 @@ const watchdog = createWatchdog({
  *  its acks stop too) and a tab coming back fires `visibilitychange`, which re-runs autoCamera. */
 let booted = false;
 setInterval(() => {
-  if (!booted || document.visibilityState === 'hidden') return;
+  if (PREVIEW || !booted || document.visibilityState === 'hidden') return;
   void watchdog.tick();
 }, 1000);
 
@@ -499,6 +510,7 @@ const AUTO_CAM_GAP = 5000;
 const autoCam = { attempts: 0, lastAt: 0, busy: false };
 
 async function autoCamera() {
+  if (PREVIEW) return false; // a preview never opens the camera or the relay
   if (state.trackingSource === 'synthetic') return false; // the operator asked for synthetic only
   if (autoCam.busy || autoCam.attempts >= AUTO_CAM_ATTEMPTS) return false;
   // No visibility gate: an OBS browser source reports `hidden` while it is not in the program, and
@@ -575,6 +587,7 @@ async function openDevice(opts) {
 }
 
 async function startTracking({ fromBus = false, synthetic = false } = {}) {
+  if (PREVIEW && !synthetic) return; // a preview never acquires a camera or the relay
   // A running camera owns the view; a running synthetic rig gives way to a real camera (the
   // overlay starts on synthetic when no camera arrives, so the Start button must still work).
   if (state.tracking && !state.synthetic) return;
@@ -652,7 +665,9 @@ function stopTracking({ manual = true, keepView = false } = {}) {
  * and on /ack as `synthetic`, never claimed to be camera input. Returns whether it drew.
  */
 function ensureSyntheticAnchors() {
-  if (state.trackingSource === 'camera') return false; // camera only: never draw a synthetic frame
+  // A preview has no camera to show, so it always runs the rig locally; the pane labels it as the
+  // preview, never as the OBS source.
+  if (state.trackingSource === 'camera' && !PREVIEW) return false; // camera only: never draw a synthetic frame
   if (state.tracking && !state.synthetic) return false; // a camera session owns the view
   // Ask the tracker, never a remembered flag: a camera attempt (and a Stop) closes the rig's frame
   // loop, and `state.synthetic` stayed true across it — the rig was then never restarted, so no
@@ -891,6 +906,9 @@ function tickBody() {
 /* ---------------------------------------------------------------- honest state out */
 
 function ack(now = performance.now()) {
+  // A preview never reports: the server's draw truth belongs to the OBS source, and a preview
+  // that acks makes a dead source look healthy (draws/staleness are read back on /status).
+  if (PREVIEW) return;
   // At most 2/s: this is a status line, not telemetry.
   if (now - state.lastAck < 500) return;
   state.lastAck = now;
@@ -1119,7 +1137,9 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   } catch (err) {
     setBanner(`Cannot read /api/handfx/status: ${err.message}`, 'bad');
   }
-  connectBus();
+  // A preview listens to the bus for nothing: every command it could receive would act on the
+  // preview (tracking.toggle, reload), and its status must never be mistaken for the source's.
+  if (!PREVIEW) connectBus();
   // The page has just heard from the server: the watchdog starts healthy rather than counting a
   // stale 0 as a failed connection in its first second. A page whose boot could not reach the
   // server is left stale on purpose, so the first tick starts recovering.
@@ -1134,6 +1154,7 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   // opens here if this page asks for it itself (`auto` and `camera`; `synthetic` skips it).
   autoCamera().catch(() => {});
   document.addEventListener('visibilitychange', () => {
+    if (PREVIEW) return; // a preview never acquires, and never "recovers" a source it is not
     if (document.visibilityState === 'visible') {
       autoCamera().catch(() => {});
       void watchdog.tick();

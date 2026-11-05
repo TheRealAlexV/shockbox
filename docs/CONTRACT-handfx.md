@@ -45,10 +45,10 @@ are getters that build the API on first touch (`self(ctx)`), because the context
 
 | method | path | params | reply |
 |---|---|---|---|
-| GET | `/status` | — | `{cmds[], effects[{id,title,gesture,from}], model{local,name,url}, bodyModels{pose,segmenter,local}, body{lastMaskAt,pageOpen,lastPoseAt}, runtime{vendored,simdWasm,nosimdWasm,base}, page, bodyPage, isolation{…}, settings, lastCmd}` |
+| GET | `/status` | — | `{cmds[], effects[{id,title,gesture,from}], model{local,name,url}, bodyModels{pose,segmenter,local}, body{lastMaskAt,pageOpen,lastPoseAt}, trackingSource, effectiveSource, draws, anchors, lastDrawAt, lastAckAt, runtime{vendored,simdWasm,nosimdWasm,base}, page, bodyPage, isolation{…}, settings, lastCmd}` |
 | PATCH | `/settings` | any subset of the settings keys | `{ok, changed[], settings}`; an effect id the registry does not know → 400 |
 | POST | `/cmd` | `{cmd, args?}` | `{ok, seq}`; document-owning commands add `changed`, `enabled` or `mirror` plus `settings`; unknown `cmd` → 400 |
-| POST | `/ack` | the page's status line | `{ok:true}` |
+| POST | `/ack` | the page's status line; `{preview:true}` is dropped entirely | `{ok:true}` (`{ok:true, preview:true}` for a preview) |
 | GET/HEAD | `/model` | `?kind=pose\|segmenter` (default: hand model) | the model file (octet-stream, `max-age=86400`); 404 `{ok:false, error:'no local model', url}` |
 | GET/HEAD | `/vendor/<path>` | — | a file under `modules/handfx/vendor/`, MIME-typed; wasm is `immutable` for a year |
 
@@ -92,12 +92,19 @@ from `POST /ack` — never as a frame.
 | `debugOverlay` | boolean | false | camera picture + 21 landmarks drawn under the effects |
 | `effects` | string[] | fireball, lightning, sparkring, embers, smoke | ordered list of live effect ids |
 | `intensity` | object id → number | every id at 1 | per-effect multiplier (0–2), read by the page |
-| `nextGesture` | enum `bothFingertips`\|`palmTouch`\|`bothPalmsUp`\|`fist` | `bothFingertips` | shown in the pane; **read by no page code** |
+| `trackingSource` | enum `auto`\|`camera`\|`synthetic` | `auto` | which hand source the page runs; also served top-level on `/status` and shown by the pane's `hand source` select |
+| `underlay` | boolean | true | camera picture under the effects; the pane's live preview forces it off **in its own iframe only** and never patches it |
 | `bufferScroll` | number 0–1.5 | 0.35 | how far an effect rises from a low palm |
 
-**Read by nothing:** `nextGesture` is stored, displayed in the pane (`ui/pane.js:377`) and never
-read by `pages/js/` — the page's next-effect gesture is hardcoded to `palmTouch`
-(`pages/js/overlay/main.js:40`). The default (`bothFingertips`) is also the lightning gesture.
+`nextGesture` was removed: it was stored and shown in the pane but read by no page code (the page
+has always hardcoded `palmTouch` as the next-effect gesture), and its default (`bothFingertips`)
+is the lightning gesture, so no single intended behaviour could be wired without changing what
+two fingertips do. The pane row and the setting are gone; the page keeps `palmTouch`.
+
+`/status` also carries `trackingSource` (the setting) and `effectiveSource`
+(`camera`|`synthetic`|`none`, the page's own anchor source). `auto` + `effectiveSource:"synthetic"`
+is the camera fallback — read `cameraError`/`relayError`/`cameraSource` for why — not the operator
+choosing synthetic.
 
 ### Merge semantics (what wins when a page and the document disagree)
 
@@ -116,21 +123,9 @@ event — and the renderer merges each one onto what it already has in `setSetti
   `skins.shoot`; `module.json` `skins.help` says the same). An unknown skin is a 400, never coerced.
 - **`effects` replaces** the list, and any effect not in it stops drawing immediately
   (`fx.js:563`). `effect.set` is the only command that writes it.
-- **`nextGesture` is inert**: it is never delivered to the page by anything that reads it, so the
-  merge never sees it. Do not build a deck key on it.
 - **`bufferScroll`** is a plain scalar overwrite; the renderer reads it as the lift of an effect
   rising from a low palm, `(1 - y) * bufferScroll * 0.6` in field heights (`fx.js:1304`), and the
   overlay defaults it to `0.35` when absent (`pages/js/overlay/main.js:106`).
-
-### `nextGesture` and `lightning` are mutually exclusive
-
-The "next effect" gesture must not be the gesture that fires `lightning`. The classifier returns
-`bothFingertips` for lightning (`main.js:37`), and the page hardcodes `palmTouch` as "next"
-(`main.js:40`). `module.json`'s `nextGesture` enum therefore exists to stop the operator picking
-`bothFingertips` for stepping the list: the same two-hand fingertip gesture cannot both arch
-lightning and advance the cursor. Valid values: `bothFingertips` (default — i.e. "no separate
-next gesture", because the page ignores it), `palmTouch`, `bothPalmsUp`, `fist`; only `palmTouch`
-matches what ships.
 
 ## Pages
 
@@ -192,8 +187,27 @@ Gestures (`main.js` `GESTURE_EFFECTS`): `palmUp`→fireball, `bothFingertips`→
 
 `ui/pane.js` in the admin shell: preview, honest camera/model/tracking states, effect registry and
 order, skin switch, per-device camera list, settings form (`PATCH /api/handfx/settings`), deck keys
-through `POST /api/handfx/cmd`, `/status` polling. It shows "preview only" while the overlay holds
-the camera.
+through `POST /api/handfx/cmd`, `/status` polling. The Tracking card has a `hand source` select
+(`auto`|`camera`|`synthetic`, persisted like the underlay switch) and a pill that reads
+`/status.effectiveSource` — e.g. `synthetic — auto fallback (…cameraError…)` — so `auto` that fell
+back to the rig is visible, not implied.
+
+## Preview isolation (`?preview=1`)
+
+The pane's live preview is the real page (`public/src/preview.js` appends `?preview=1`). A
+preview is a viewer, never a source:
+
+- it does not open the camera or the relay, does not connect the command bus, and does not run the
+  recovery watchdog (`pages/js/overlay/main.js`);
+- it never POSTs `/ack`, so it contributes nothing to `draws`/`lastDrawAt`/`lastAckAt`; the server
+  also drops `/ack` bodies carrying `{preview:true}` outright (`server.js` `/ack`), so a preview
+  can never inflate the `Math.max` draw counter even if one is posted by hand;
+- it draws the synthetic rig locally, so effects are visible, and forces the underlay off in its
+  own iframe (never a settings write);
+- the pane labels it (`synthetic hands, underlay off in this preview`) rather than pretending the
+  preview is the OBS source, and it shows the 9:16 collision fence the particles collide with.
+
+With only a preview open, `/status` reports `draws: 0`, `effectiveSource: "none"`.
 
 ## Honest states (page and pane must not fake these)
 
@@ -201,7 +215,8 @@ the camera.
   messages, never "tracking" when it is not.
 - model: `idle`, `loading`, `ready`, `failed`, `cached` (downloaded from the CDN once).
 - no hands is `hands: 0, gesture: 'none'`.
-- synthetic replay is labelled as such.
+- synthetic replay is labelled as such; `auto` failing over to it is shown as a fallback, not as a
+  chosen mode.
 
 ## Privacy
 
