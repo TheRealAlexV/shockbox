@@ -35,7 +35,17 @@ export const BOUNDARY = 'framebound';
 const SOI = Buffer.from([0xff, 0xd8, 0xff]);
 const EOI = Buffer.from([0xff, 0xd9]);
 const CRLF = Buffer.from('\r\n');
+/**
+ * ffmpeg's useful half is at the head of stderr: the dshow device open, the input format and the
+ * reason the device refused. Its epilogue (`[enc:mjpeg] Could not open encoder before EOF`,
+ * `Task finished with error code`) is what the tail holds. Keep the first 2 KB (over the head, so
+ * it cannot grow) and the last 400 bytes, with a marker between them when the middle was dropped.
+ * Both are fixed-size strings: a chatty ffmpeg cannot grow memory here.
+ */
+const STDERR_HEAD = 2048;
 const STDERR_TAIL = 400;
+/** A status error carries head + tail + argv + labels; anything beyond this is a runaway string. */
+const MAX_ERROR = STDERR_HEAD + STDERR_TAIL + 512;
 /** A stream with an SOI and no EOI must not grow forever. */
 const MAX_PENDING = 8 * 1024 * 1024;
 const STOP_AFTER_MS = 5000;
@@ -195,7 +205,9 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   let child = null;
   let parser = null;
   let latest = null;
+  let stderrHead = '';
   let stderrTail = '';
+  let currentArgv = [];
   let attempt = 0;
   let spawnedAt = 0;
   let restartTimer = null;
@@ -244,12 +256,30 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   }
 
   /**
+   * The stderr an operator needs, not just the epilogue: the first 2 KB (device open, format) with
+   * the last 400 bytes appended after a marker. `head.endsWith(tail)` means the whole output fits
+   * in the head; returning it alone avoids printing the overlap twice.
+   */
+  function stderrWindow() {
+    const head = stderrHead.trim();
+    const tail = stderrTail.trim();
+    if (!head) return tail;
+    if (!tail || head.endsWith(tail)) return head;
+    return `${head}\n…\n${tail}`;
+  }
+
+  /** The exact argv, quoted so a device name with spaces stays one readable token. */
+  function argvLine() {
+    return currentArgv.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(' ');
+  }
+
+  /**
    * ffmpeg is running but has delivered no frame in 2 s. That is a dead camera, not a slow one:
    * report the state with the producer's own words, keep the last frame for /camera/latest.jpg
    * (status marks it `stale`), and restart the producer under the normal backoff.
    */
   function stall() {
-    const tail = stderrTail.trim();
+    const window = stderrWindow();
     const waited = Math.max(1, Math.round(silenceFor() / 1000));
     const what = counters.lastFrameAt
       ? `no frame for ${waited} s`
@@ -257,7 +287,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     const proc = child;
     child = null; // the exit handler must ignore the process we are about to kill
     parser = null;
-    setError(`${what}${tail ? `: ${tail}` : ''}`);
+    setError(`${what}; argv: ${argvLine()}${window ? `; stderr: ${window}` : ''}`);
     scheduleRestart();
     if (proc) killProcess(proc);
   }
@@ -282,7 +312,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   }
 
   function setError(message) {
-    counters.error = String(message || 'camera relay failed').slice(0, STDERR_TAIL + 120);
+    counters.error = String(message || 'camera relay failed').slice(0, MAX_ERROR);
     state = 'error';
     if (log && typeof log.warn === 'function') log.warn(`handfx camera: ${counters.error}`);
   }
@@ -399,14 +429,17 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       return;
     }
     let proc;
+    const argv = [bin, ...ffmpegArgs(cfg)];
+    currentArgv = argv;
     try {
-      proc = spawn(bin, ffmpegArgs(cfg), { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      proc = spawn(bin, argv.slice(1), { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (err) {
       fail(`ffmpeg failed to start: "${bin}" (${err.code || err.message})`);
       return;
     }
     child = proc;
     parser = createFrameParser(onFrame);
+    stderrHead = '';
     stderrTail = '';
     spawnedAt = Date.now();
     state = 'starting';
@@ -415,7 +448,11 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       if (parser) parser.push(chunk);
     });
     proc.stderr.on('data', (chunk) => {
-      stderrTail = (stderrTail + chunk.toString()).slice(-STDERR_TAIL);
+      const text = chunk.toString();
+      // Fill the head only until it is full; the ring lives on the first 2 KB, never the whole
+      // stream, so ffmpeg cannot grow this process's memory by talking.
+      if (stderrHead.length < STDERR_HEAD) stderrHead = (stderrHead + text).slice(0, STDERR_HEAD);
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL);
     });
     proc.on('error', (err) => {
       if (child !== proc) return;
@@ -425,8 +462,10 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     proc.on('exit', (code, signal) => {
       if (child !== proc) return;
       child = null;
-      const tail = stderrTail.trim();
-      fail(`ffmpeg exited (${signal || `code ${code}`})${tail ? `: ${tail}` : ''}`);
+      const window = stderrWindow();
+      fail(
+        `ffmpeg exited (${signal || `code ${code}`}); argv: ${argvLine()}${window ? `; stderr: ${window}` : ''}`,
+      );
     });
   }
 
@@ -498,9 +537,10 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     status() {
       const silent = silenceFor() > stallLimit();
       const reported = silent ? 'error' : state;
+      const window = stderrWindow();
       const error =
         silent && !counters.error
-          ? `no frame for ${Math.max(1, Math.round(silenceFor() / 1000))} s${stderrTail.trim() ? `: ${stderrTail.trim()}` : ''}`
+          ? `no frame for ${Math.max(1, Math.round(silenceFor() / 1000))} s; argv: ${argvLine()}${window ? `; stderr: ${window}` : ''}`
           : counters.error;
       return {
         state: reported,

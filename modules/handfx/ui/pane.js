@@ -327,6 +327,7 @@ export async function render(container, ctx) {
     const eff = st.effectiveSource || 'none';
     const why = (st.cameraError && (st.cameraError.message || st.cameraError.name)) || st.relayError || (st.cameraSource === 'synthetic' ? 'no camera' : '');
     if (eff === 'camera') return { tone: 'ok', text: setting === 'auto' ? 'camera (auto)' : 'camera' };
+    if (eff === 'stale') return { tone: 'warn', text: `stale — no page report for ${Math.round((st.staleForMs || 0) / 1000)} s`, why: st.lastAckedSource ? `last said: ${st.lastAckedSource}` : '' };
     if (eff === 'synthetic' && setting === 'synthetic') return { tone: 'info', text: 'synthetic (chosen)' };
     if (eff === 'synthetic') return { tone: why ? 'warn' : 'info', text: 'synthetic — auto fallback', why };
     if (setting === 'camera') return { tone: 'warn', text: 'camera only — nothing drawn' };

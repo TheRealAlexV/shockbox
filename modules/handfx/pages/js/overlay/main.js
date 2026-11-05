@@ -32,6 +32,8 @@ import { FxRenderer, EFFECTS, anchorsFrom, fenceRectFor } from '../engine/fx.js'
  * It still runs the synthetic rig locally, so the effects are visible.
  */
 const PREVIEW = new URLSearchParams(location.search).get('preview') === '1';
+/** The bundle this document was loaded from: the `?v=` the page loader put on this module's URL. */
+const BUILD = new URL(import.meta.url).searchParams.get('v') || 'unknown';
 
 const $ = (id) => document.getElementById(id);
 const stage = $('stage');
@@ -916,6 +918,9 @@ function ack(now = performance.now()) {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
+      // The bundle this document is running. The server compares it with its own and reports
+      // `buildMatches` on /status; an old OBS source then shows as a mismatch, not as healthy.
+      build: BUILD,
       effect: state.effect,
       tracking: state.tracking,
       model: state.model,

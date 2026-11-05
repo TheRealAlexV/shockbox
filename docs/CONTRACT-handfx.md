@@ -45,7 +45,8 @@ are getters that build the API on first touch (`self(ctx)`), because the context
 
 | method | path | params | reply |
 |---|---|---|---|
-| GET | `/status` | — | `{cmds[], effects[{id,title,gesture,from}], model{local,name,url}, bodyModels{pose,segmenter,local}, body{lastMaskAt,pageOpen,lastPoseAt}, trackingSource, effectiveSource, draws, anchors, lastDrawAt, lastAckAt, runtime{vendored,simdWasm,nosimdWasm,base}, page, bodyPage, isolation{…}, settings, lastCmd}` |
+| GET | `/status` | — | `{cmds[], effects[{id,title,gesture,from}], model{local,name,url}, bodyModels{pose,segmenter,local}, body{lastMaskAt,pageOpen,lastPoseAt}, trackingSource, effectiveSource, lastAckedSource, stale, staleForMs, build, clientBuild, buildMatches, draws, anchors, lastDrawAt, lastAckAt, runtime{vendored,simdWasm,nosimdWasm,base}, page, bodyPage, isolation{…}, settings, lastCmd}` |
+| GET | `/build` | — | `{build}` — the bundle id the page loads with (`?v=`) and reports on `/ack` |
 | PATCH | `/settings` | any subset of the settings keys | `{ok, changed[], settings}`; an effect id the registry does not know → 400 |
 | POST | `/cmd` | `{cmd, args?}` | `{ok, seq}`; document-owning commands add `changed`, `enabled` or `mirror` plus `settings`; unknown `cmd` → 400 |
 | POST | `/ack` | the page's status line; `{preview:true}` is dropped entirely | `{ok:true}` (`{ok:true, preview:true}` for a preview) |
@@ -102,9 +103,24 @@ is the lightning gesture, so no single intended behaviour could be wired without
 two fingertips do. The pane row and the setting are gone; the page keeps `palmTouch`.
 
 `/status` also carries `trackingSource` (the setting) and `effectiveSource`
-(`camera`|`synthetic`|`none`, the page's own anchor source). `auto` + `effectiveSource:"synthetic"`
-is the camera fallback — read `cameraError`/`relayError`/`cameraSource` for why — not the operator
-choosing synthetic.
+(`camera`|`synthetic`|`none`|`stale`, the page's own anchor source). `auto` +
+`effectiveSource:"synthetic"` is the camera fallback — read `cameraError`/`relayError`/
+`cameraSource` for why — not the operator choosing synthetic.
+
+**Freshness and build identity.** `lastAckAt` and `lastDrawAt` are the page's own stamps, and both
+ride its render loop. When the newer of the two is older than `PAGE_STALE_MS = 5000`
+(`server.js`), `/status` reports `stale: true` with `staleForMs`, and `effectiveSource` becomes
+`"stale"`; the last value the page actually acked is kept in `lastAckedSource` so nothing pretends
+to know what the page is doing now. Before any ack (`lastAckAt = 0`) the source stays `none`, never
+`stale` — a pane preview alone reports `none`.
+
+`build` is this server's bundle id: a sha-256 over `modules/handfx/pages/**`, derived at startup
+(the Windows deploy excludes `.git`, so a runtime sha would fall back to a constant). The page
+loads `js/overlay/main.js?v=<build>` (the inline loader in `pages/overlay.html` fetches
+`/api/handfx/build` first), keeps that value in `import.meta.url`, and sends it as `build` on
+`/ack`. `/status` echoes it as `clientBuild` and reports `buildMatches` (`null` until the first
+ack). A document OBS kept alive across a deploy reports the old build, so the mismatch is visible
+instead of reading healthy.
 
 ### Merge semantics (what wins when a page and the document disagree)
 

@@ -21,11 +21,45 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createPublisher } from './publish-pipe.mjs';
 import { BOUNDARY, createCameraRelay } from './camera-relay.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The build this server serves, and the one the page reports back on /ack.
+ *
+ * Derived, never hand-maintained: a hash over every file under `pages/` (the overlay, the body
+ * page, their engine and styles). It is a content identity, so it changes exactly when the bundle
+ * the browser runs changes, and it survives the Windows deploy, which excludes `.git` (a sha read
+ * at runtime would fall back to a constant there and never catch a stale bundle). The page is
+ * loaded with `?v=<BUILD>`, so a document left running from yesterday keeps yesterday's value and
+ * `/status.buildMatches` goes false.
+ */
+function bundleBuild() {
+  const h = crypto.createHash('sha256');
+  const walk = (dir) => {
+    const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else h.update(path.relative(HERE, file)).update('\0').update(fs.readFileSync(file));
+    }
+  };
+  try {
+    walk(path.join(HERE, 'pages'));
+    return h.digest('hex').slice(0, 12);
+  } catch {
+    return 'unknown';
+  }
+}
+
+export const BUILD = bundleBuild();
+
+/** A page that has not acked for this long is not reporting what it is doing: its source is `stale`. */
+const PAGE_STALE_MS = 5000;
 
 /**
  * Every command the bus accepts. `reload` and the effect cursor are handled by the page;
@@ -214,7 +248,7 @@ function build(ctx) {
   const body = { lastMaskAt: 0, pageOpen: false, lastPoseAt: 0 };
   // The overlay's draw truth, reported on /ack: how many frames it rendered, where the anchors came
   // from, and when the last frame landed. Counters and a name, never a frame.
-  const draw = { draws: 0, anchors: 'none', lastDrawAt: 0, lastAckAt: 0 };
+  const draw = { draws: 0, anchors: 'none', lastDrawAt: 0, lastAckAt: 0, build: '' };
   // Why the overlay's camera did not open (the page's own diagnostic object), the label of the
   // device it did open, which pipe is carrying frames (relay | device | synthetic | none) and why
   // the relay is not it. Reported on /ack, read back on /status; never a frame.
@@ -262,6 +296,13 @@ function build(ctx) {
     relay.sync();
     const s = settings.all();
     const model = findModel();
+    // Freshness: an ack (or draw stamp) older than 5 s is not this page's current answer. Both
+    // ride the page's render loop, so a hidden/paused OBS source goes stale on both. `none` stays
+    // `none` (no page ever reported — e.g. only the preview iframe is open), never `stale`.
+    const now = Date.now();
+    const beat = Math.max(draw.lastAckAt, draw.lastDrawAt);
+    const stale = beat > 0 && now - beat > PAGE_STALE_MS;
+    const staleForMs = stale ? now - beat : 0;
     return {
       cmds: CMDS,
       effects: EFFECTS,
@@ -274,7 +315,16 @@ function build(ctx) {
       // `cameraError`/`relayError`/`cameraSource` for why — and is not the same thing as the
       // operator asking for synthetic.
       trackingSource: ['camera', 'synthetic'].includes(settings.get('trackingSource')) ? settings.get('trackingSource') : 'auto',
-      effectiveSource: draw.anchors, // camera | synthetic | none — the page's anchors, not a guess
+      // The page's last-acked source, and whether it is still current. `stale` is not a source:
+      // it says the page has stopped reporting, so `effectiveSource` cannot be trusted either.
+      effectiveSource: stale ? 'stale' : draw.anchors, // camera | synthetic | none | stale
+      lastAckedSource: draw.anchors,
+      stale,
+      staleForMs,
+      // What the page is running vs what this server serves. `null` before the first ack.
+      build: BUILD,
+      clientBuild: draw.build || null,
+      buildMatches: draw.build ? draw.build === BUILD : null,
       // Whether the overlay is drawing at all, and on what: `none` means the page is open but no
       // loop has rendered (or no page is open), which is the state that looks like a dead source.
       draws: draw.draws,
@@ -316,6 +366,10 @@ function build(ctx) {
       // Everything the pane and the page need in one read: the settings document, the effect
       // registry, the bus contract and whether the vendored runtime is on disk.
       { path: '/status', method: 'GET', handler: (req, res) => send(res, 200, status()) },
+      // The build the page must load with (`?v=`) and report on /ack. Kept out of /status on
+      // purpose: a page that read its build from /status would always match the server, even when
+      // the document itself is a day old — the value has to come from the URL the page loaded.
+      { path: '/build', method: 'GET', handler: (req, res) => send(res, 200, { build: BUILD }) },
       // The bare list a client may expect from the page's own registry — `Object.keys(EFFECTS)`,
       // strings in renderer order. `/status` carries the same ids with their titles and gestures;
       // this one exists so "the effects" is never a shape a client has to unpack to get right.
@@ -481,6 +535,9 @@ function build(ctx) {
           if (Number.isFinite(bodyIn.lastDrawAt) && bodyIn.lastDrawAt > draw.lastDrawAt) {
             draw.lastDrawAt = Math.min(Date.now(), bodyIn.lastDrawAt);
           }
+          // The bundle this document was loaded from (`?v=`), so a page left running across a
+          // deploy is visible as a mismatch instead of looking healthy. Bounded: it is status.
+          if (typeof bodyIn.build === 'string' && bodyIn.build) draw.build = bodyIn.build.slice(0, 64);
           // When the page last spoke at all. `draws` only moves while the page paints, so a paused
           // browser source freezes it; this stamp keeps "ticking but not painting" readable from
           // /status instead of looking like a dead page next to live camera frames.

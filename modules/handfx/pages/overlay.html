@@ -27,6 +27,14 @@
       <button type="button" data-act="synthetic">Synthetic</button>
       <button type="button" data-act="stop">Stop</button>
     </div>
-    <script type="module" src="js/overlay/main.js"></script>
+    <script type="module">
+      // Load the bundle with the build the server is serving. The HTML itself is `no-store`, so a
+      // reload asks for a fresh build and the entry module URL changes with it; a document OBS
+      // keeps alive keeps its old `?v=` and reports that old build on /ack, which is how a stale
+      // source is caught instead of looking healthy.
+      const res = await fetch('/api/handfx/build', { cache: 'no-store' }).catch(() => null);
+      const build = res && res.ok ? String((await res.json()).build || '') : '';
+      await import(`./js/overlay/main.js${build ? `?v=${encodeURIComponent(build)}` : ''}`);
+    </script>
   </body>
 </html>
