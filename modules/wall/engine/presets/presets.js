@@ -27,11 +27,11 @@
     },
 
     // The saved v1 look, GPU edition: fire embers, random flashes.
-    // v1's state was orientation=portrait, 28 cols x 50 rows on 1080x1920, i.e.
-    // square cells at 38.6 px. v2 renders onto a 2560x1440 landscape canvas, so
-    // rows are auto (0) to keep those cells square: 28 x 16 at 91.4 px pitch.
+    // v1's state was orientation=portrait, 28 cols x 50 rows on 1080x1920. v2 ships the
+    // landscape grid every other look uses (112 cols, matching gridColsPortrait 63 at the
+    // same pitch), so a look applied on either ratio lands on the same size of dot.
     ember: {
-      gridCols: 28, gridRows: 0,
+      gridCols: 112, gridRows: 0,
       mode: 'pattern', pattern: 'random',
       speed: 1.35, transitionSpeed: 1.35,
       flashDensity: 0.12, waveFrequency: 3.0, persistence: 0.0,
