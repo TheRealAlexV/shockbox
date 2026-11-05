@@ -9,6 +9,12 @@
 
 import { createPlayer, DEFAULT_DIALOG_TONE } from '/mod/notifications/sound.mjs';
 
+// Preview panes mount this page in a small inert iframe (`?preview=1`). The page then draws one
+// sample alert through the real build path and never opens a stream or talks to the server, so
+// nothing here can register as a live dialog, schedule the auto-close sweep, or reach a second
+// tab. Without the param the query string is ignored and the page behaves exactly as before.
+const preview = new URLSearchParams(location.search).get('preview') === '1';
+
 const root = document.getElementById('stage');
 const els = new Map(); // id -> element
 const sizeSent = new Map(); // id -> "w:h"
@@ -77,6 +83,7 @@ function primaryIndex(buttons) {
 }
 
 function decide(entity, button) {
+  if (preview) return; // The sample is not a live dialog: never DELETE or POST from a preview.
   const id = entity.id;
   const action = button.action || 'close';
   if (action === 'none') return;
@@ -164,6 +171,7 @@ function place(el, entity) {
 }
 
 function reportSize(el, entity) {
+  if (preview) return; // A preview sample has no server record to measure.
   const w = Math.round(el.offsetWidth);
   const h = Math.round(el.offsetHeight);
   if (!w || !h) return;
@@ -303,10 +311,45 @@ function connect() {
   });
 }
 
-fetch('/api/dialogs/live')
-  .then((r) => r.json())
-  .then((d) => {
-    apply(d);
-    connect();
-  })
-  .catch(() => connect());
+/* ---------------------------------------------------------------- preview sample */
+
+// One representative alert, produced by `apply` → `build`: the same function that renders a real
+// alert. The layout of this page is fixed-pixel (unlike the toast page), so a pane-sized card can
+// be narrower or shorter than the dialog; a preview-only scale keeps it centred and unclipped.
+const PREVIEW_ALERT = {
+  id: '__preview__',
+  type: 'info',
+  icon: 'info',
+  title: 'ShockBox',
+  text: 'Alerts look like this on stream.',
+  buttons: [{ label: 'OK', action: 'close' }],
+  w: 380,
+};
+
+function fitPreview() {
+  const card = root.querySelector('.dialog');
+  if (!card) return;
+  const box = root.getBoundingClientRect();
+  const w = card.offsetWidth;
+  const h = card.offsetHeight;
+  if (!box.width || !box.height || !w || !h) return;
+  const scale = Math.min(1, (box.width - 32) / w, (box.height - 32) / h);
+  document.documentElement.style.setProperty('--preview-scale', String(Math.max(0.1, scale)));
+}
+
+if (preview) {
+  document.documentElement.classList.add('preview');
+  apply({ ratio: '16:9', live: [PREVIEW_ALERT] });
+  // The card is appended synchronously; one frame later it has its laid-out size and the enter
+  // transition has started. Re-fit on resize so a pane that grows or shrinks keeps it visible.
+  requestAnimationFrame(fitPreview);
+  new ResizeObserver(() => requestAnimationFrame(fitPreview)).observe(root);
+} else {
+  fetch('/api/dialogs/live')
+    .then((r) => r.json())
+    .then((d) => {
+      apply(d);
+      connect();
+    })
+    .catch(() => connect());
+}

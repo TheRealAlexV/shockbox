@@ -541,3 +541,16 @@ html[data-ratio='9:16'] #stage {
   transition: opacity 180ms ease;
   pointer-events: none;
 }
+
+/* Preview pane only (`?preview=1`). The page draws one sample alert at its real size; a pane
+ * card is a few hundred pixels, so the sample is scaled to fit it. The stage stops clipping so
+ * the un-scaled layout box cannot cut the card before the measured scale lands. The real page
+ * never gets the `preview` class, so nothing here changes on the OBS browser source. */
+html.preview #stage {
+  overflow: visible;
+}
+
+html.preview .dialog.in {
+  transform: scale(var(--preview-scale, 1));
+  transform-origin: center center;
+}

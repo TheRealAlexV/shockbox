@@ -10,6 +10,12 @@
 
 import { createPlayer, DEFAULT_NOTIFY_TONE } from '/mod/notifications/sound.mjs';
 
+// Preview panes mount this page in a small inert iframe (`?preview=1`). The page then draws one
+// sample toast through the real render path and never opens a stream or talks to the server, so
+// nothing here registers as a live notification, schedules the auto-close sweep, or reaches a
+// second tab. Without the param the query string is ignored and the page behaves exactly as before.
+const preview = new URLSearchParams(location.search).get('preview') === '1';
+
 // The canvas the server's records are expressed in. Only its height matters: every length on
 // the page is the record scaled by (live stage height / REF_H).
 const REF_H = 720;
@@ -30,7 +36,13 @@ const player = createPlayer({ instrument: true });
 // same arithmetic lands the column inside that window with no special case here.
 function stageBox() {
   const r = root.getBoundingClientRect();
-  return { w: r.width, h: r.height, s: r.height > 0 ? r.height / REF_H : 1 };
+  // A preview card is a few hundred pixels tall, so the true stage scale (height / 720) would draw
+  // a few-pixel toast. Preview mode instead fits the reference column to the card, keeping the
+  // sample readable while the real surface stays byte-identical.
+  const s = preview
+    ? Math.min(r.width / 405, r.height / 300) || 1
+    : r.height > 0 ? r.height / REF_H : 1;
+  return { w: r.width, h: r.height, s };
 }
 
 // Column geometry from the box, never from the viewport: the card keeps the reference band's
@@ -133,6 +145,7 @@ function render(entity) {
 
 function dismiss(id) {
   // Local close, then tell the server so the panel and other pages agree.
+  if (preview) return; // The sample is not a live toast: never DELETE from a preview.
   const view = seen.get(id);
   if (view) {
     view.el.classList.add('leaving');
@@ -175,7 +188,7 @@ function apply(snap) {
       view = { el: render(entity), sig: '', entity };
       root.appendChild(view.el);
       place(view, stageBox());
-      player.sync([{ id, sound: 'notify', tone: settings && settings.tone }]);
+      if (!preview) player.sync([{ id, sound: 'notify', tone: settings && settings.tone }]);
       // Force layout before the enter class so the slide-in transition runs.
       void view.el.offsetWidth;
       requestAnimationFrame(() => view.el.classList.add('in'));
@@ -266,11 +279,32 @@ function connect() {
   });
 }
 
-// First paint comes from HTTP so a page that is added mid-stream is already correct.
-fetch('/api/notifications/live')
-  .then((r) => r.json())
-  .then((d) => {
-    apply(d);
-    connect();
-  })
-  .catch(() => connect());
+/* ---------------------------------------------------------------- preview sample */
+
+// One representative toast, produced by `apply` → `render`: the same function that renders a real
+// toast. `stageBox` already fits the reference column to a preview card, so no extra scaling is
+// needed on this page; the toast is centred by `geometry` and clipped only by its own height.
+const PREVIEW_TOAST = {
+  id: '__preview__',
+  style: 'ios',
+  type: 'Notification',
+  title: 'ShockBox',
+  text: 'Notifications look like this on stream.',
+  x: 12,
+  y: 96,
+  w: 381,
+  h: 108,
+};
+
+if (preview) {
+  apply({ ratio: '16:9', live: [PREVIEW_TOAST] });
+} else {
+  // First paint comes from HTTP so a page that is added mid-stream is already correct.
+  fetch('/api/notifications/live')
+    .then((r) => r.json())
+    .then((d) => {
+      apply(d);
+      connect();
+    })
+    .catch(() => connect());
+}
