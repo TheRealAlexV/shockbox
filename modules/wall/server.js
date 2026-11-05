@@ -17,6 +17,7 @@
 import { HttpError } from '../../core/id.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { validateCommand, COMMANDS } from './commands.mjs';
 import { MAX_BYTES, acceptUpload, nameFor } from './image.mjs';
 
@@ -32,6 +33,30 @@ const HISTORY_MAX = 200;
 // last-known snapshot, so a message edited after the send would render stale — and a
 // `poolId` that resolves to nothing must fail at the POST, not silently on the wall.
 const WALL_POOL = 'wall';
+
+// The shipped looks, read from the engine's own catalogue (`engine/presets/presets.js`) rather
+// than a second hand-kept list: a preset added there is offered by the pane's dropdown on its
+// own. `ORDER_HINT` is a display order only — membership always comes from the catalogue, so a
+// preset missing from the hint still appears, appended in catalogue order.
+const ORDER_HINT = ['neonwave', 'arctic', 'chase', 'bassline', 'ember'];
+
+function shippedPresets() {
+  // presets.js is a classic browser script (`window.LEDWALL_PRESETS = {...}`), so it is run in a
+  // bare sandbox with a `window` stub; nothing else from the page is needed to list the names.
+  const file = new URL('./engine/presets/presets.js', import.meta.url);
+  const sandbox = { window: {} };
+  try {
+    vm.runInNewContext(fs.readFileSync(file, 'utf8'), sandbox, { filename: file.pathname, timeout: 1000 });
+  } catch (err) {
+    throw new Error(`wall: cannot read the preset catalogue at ${file.pathname}: ${err.message}`);
+  }
+  const names = Object.keys(sandbox.window.LEDWALL_PRESETS || {});
+  if (!names.length) throw new Error(`wall: the preset catalogue at ${file.pathname} defines no presets`);
+  const hinted = ORDER_HINT.filter((n) => names.indexOf(n) >= 0);
+  return hinted.concat(names.filter((n) => hinted.indexOf(n) < 0));
+}
+
+const SHIPPED_PRESETS = shippedPresets();
 
 // What a preset captures — the look of the wall. Deliberately excludes grid geometry (a property
 // of the installation, not of a look) and everything under `views.*.text` (a preset must never
@@ -466,7 +491,7 @@ export default {
    * saved look attached so the engine can apply it without another round trip.
    */
   presetsForPage() {
-    const shipped = ['neonwave', 'arctic', 'chase', 'bassline', 'ember'];
+    const shipped = SHIPPED_PRESETS;
     const saved = this.savedPresets || {};
     const names = shipped.concat(Object.keys(saved).filter((n) => shipped.indexOf(n) < 0));
     return { order: names, saved };
