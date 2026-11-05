@@ -60,8 +60,14 @@ C:\OBS\ShockBox\.tui-venv\        the TUI's virtualenv
 C:\OBS\ShockBox\config.json       port, host, stateDir, logDir, soundsDir, obs{url,password,enabled}
 C:\OBS\ShockBox\state\            core/, wall/, notifications/, dialogs/, handfx/, pool.json
 C:\OBS\ShockBox\logs\             shockbox-YYYY-MM-DD.log (+ .1 to .3); launcher-*.log from run.cmd only
-%LOCALAPPDATA%\ShockBox\runtime\  supervisor.lock, status.json, heartbeat, cmd.json, supervisor.pid, supervisor.log
+%PROGRAMDATA%\ShockBox\runtime\    supervisor.lock, status.json, heartbeat, cmd.json, supervisor.pid, supervisor.log
 ```
+
+The runtime dir is **per machine, not per account**. `%LOCALAPPDATA%` is per-account, and the
+supervisor is routinely owned by a different account from the one running the installer or the
+TUI on the rig (SYSTEM, session 0), so a command written there is never read. The app creates
+`%PROGRAMDATA%\ShockBox\runtime` with an ACL that lets both accounts write it; `install.ps1` and
+`uninstall.ps1` create the directory if it is missing and **leave an existing ACL alone**.
 
 State and logs live under the install tree: `Paths.logs_dir`/`state_dir` are
 `<app_dir>/logs` and `<app_dir>/state` (`paths.py:88-94`), and the runtime dir is the one thing
@@ -108,8 +114,14 @@ A crash loop is visible in `logs\shockbox-*.log` as `startup failed:` lines (wri
 ## 6. Install and upgrade
 
 Prerequisites: Node at `C:\Program Files\nodejs\node.exe` (a missing one is a warning, not a
-failure — `deploy/install.ps1:71-74`), and **Python 3.11+** for the TUI (`install.ps1:334-339`).
-No admin is needed: nothing is registered with Task Scheduler (`deploy/install.ps1:537`).
+failure), and **Python 3.11+** for the TUI. No admin is needed to write the tree or register
+anything — the installer registers no task.
+
+**One elevated action is needed when the running stack belongs to another account** (on the rig:
+SYSTEM, session 0). The installer asks that supervisor to shut down over `cmd.json`, which works
+across accounts; it cannot terminate the process itself. If the stack does not stop, the installer
+names the pid/owner, prints the single command to run elevated, and exits **non-zero without
+copying anything** — see §6.
 
 ```powershell
 # from the repo, on the host:
@@ -122,15 +134,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install.ps1 -WhatIf
 
 What `install.ps1` does, in order (line ranges in `deploy/install.ps1`):
 
-1. **Stop what it is about to replace, by evidence, never by name alone** (`183-244`):
-   - the **TUI supervisor**, found by its published state: a live `supervisor.pid` (else
-     `status.json`'s `supervisor_pid`), or a `heartbeat` younger than 10 s when no pid is on file
-     (`119-206`); asked to shut down over a control path if one exists,
-     then killed if it does not exit within 5 s (`151-212`);
-   - the legacy **`run.cmd` loop** — `cmd.exe` whose command line runs `run.cmd` from this folder
-     (`218-223`);
-   - the **node holding the port**, only if its command line runs *this* folder's `server.mjs`;
-     pid 4 (HTTP.sys) and strangers are reported and left alone (`225-237`, `99-107`).
+1. **Stop what it is about to replace — the app first, the process table only as a fallback:**
+   - the **TUI supervisor** is asked to shut down over its own control channel:
+     `install.ps1` writes `{"id":…,"action":"shutdown",…}` to
+     `<ProgramData>\ShockBox\runtime\cmd.json` (the file `supervisor.py` polls every tick), then
+     waits for the heartbeat counter to advance and the heartbeat to go stale (12 s) or the
+     published pid to exit. No fixed sleep, no pipe, no HTTP. This is the only stop path that
+     works when the supervisor belongs to another account;
+   - if it does not stop, the fallback is the legacy **`run.cmd` loop** (`cmd.exe` whose command
+     line runs `run.cmd` from this folder), then the **node holding the port**, only if its own
+     command line runs *this* folder's `server.mjs` or names the port. A pid whose command line
+     cannot be read (another account) is reported as *cannot inspect* and is never killed;
+   - if the port is still held after all of that, the install **fails non-zero before copying
+     anything** and prints the pid/owner plus the single command that resolves it. A copy over a
+     live tree would only take effect at the next start, and there is no next start while the
+     port is held, so exiting 0 there is a false success.
 2. Create `state\`, `logs\`, `backups\` (`249-254`).
 3. **Robocopy the tree** with `/E` — never `/MIR` — excluding `.git`, `state-dev`, `node_modules`,
    `backups`, `.tui-venv`, editor dirs, plus `*.log` and `config*.json`; the target's `state`,
@@ -153,28 +171,26 @@ install picks up new `tools\tui` code (`375-381`).
 
 Then start from the shortcut and check `http://127.0.0.1:8972/health` and `C:\OBS\ShockBox\logs\`.
 
-> **Known gap: `control.path` has a reader and no writer.** `install.ps1:151-181`
-> (`Send-SupervisorShutdown`) reads `%LOCALAPPDATA%\ShockBox\runtime\control.path` and, if it
-> exists, speaks a named pipe or POSTs `{"command":"shutdown"}` to it. **Nothing in this repo writes
-> that file.** `Paths.resolve()` derives the runtime dir itself — `SHOCKBOX_RUNTIME_DIR`, else
-> `%LOCALAPPDATA%\ShockBox\runtime`, else `$XDG_STATE_HOME/shockbox`
-> (`tools/tui/shockbox_tui/paths.py:68-77`) — and the supervisor's only command channel is
-> `cmd.json` (`supervisor.py:773-788`). So today the read never matches: `Send-SupervisorShutdown`
-> returns `$false` at the first `Test-Path` and the installer falls back to
-> `Stop-Process -Force` (`deploy/install.ps1:200-209`).
+> **How the stop works across accounts, and the one elevated action.** The supervisor's only
+> command channel is `<runtime>\cmd.json` (`supervisor.py`), and the runtime dir is
+> `%PROGRAMDATA%\ShockBox\runtime`, so a non-elevated installer can stop a supervisor owned by
+> another account by writing the file. `control.path` is gone from `install.ps1`: nothing ever
+> wrote it, so the read could only return false.
 >
-> That still works in practice: the forced exit is a hard kill, so `python -m shockbox_tui.supervisor`
-> cannot run its `finally` (`supervisor.py:1064-1068`) and `cleanup()` (`supervisor.py:982-995`). What
-> makes that safe is the **next** start: `_listener_pid()` finds node still listening,
-> `is_our_server()` accepts it, `_health_at(pid)` reports that same pid, and the new supervisor
-> **adopts** it instead of spawning a second server or failing with `EADDRINUSE`
-> (`supervisor.py:703-742`). The cost is that node runs one generation stale until the next restart.
-> **Owner action:** either have the supervisor write its endpoint into `control.path` at start-up
-> (and unlink it on exit), or delete the read from `install.ps1`. Until one is done, treat the
-> control path as dead code — and do not document it as a feature. If the writer is added, it must
-> speak the two shapes the installer already accepts: a named-pipe name (the script sends the line
-> `shutdown`) or an HTTP URL (the script POSTs `{"command":"shutdown"}`)
-> (`deploy/install.ps1:159-179`).
+> What a non-elevated caller still cannot do is **terminate** a process owned by another account:
+> `Win32_Process.CommandLine` is empty there, so no process-table rule can identify it, and
+> `Stop-Process` fails with "Access is denied". The installer therefore asks first and, if the
+> port is still held, prints:
+>
+> ```
+> port 8972 is still held: pid 45360 (node.exe, owner not readable) - a process we cannot inspect holds the port; it was not stopped
+> INSTALL DID NOT COMPLETE: ... Nothing was copied.
+> Run this from an elevated prompt, then re-run the installer: taskkill /F /PID 45360
+> ```
+>
+> That `taskkill`, from an **Administrator** PowerShell, is the one elevated action. It is also
+> the correct long-term shape: the supervisor is meant to run as the account that owns the tree,
+> so an install from that account needs no elevation at all.
 
 ## 7. Roll back
 
@@ -201,11 +217,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\uninstall.ps1
 # or, first: -WhatIf
 ```
 
-`uninstall.ps1` stops the supervisor (and the server it runs, by the same evidence rule), removes
-the desktop shortcut, removes `.tui-venv`, and unregisters `\ShockBox-Server` if a previous install
-left it (`deploy/uninstall.ps1:1-32`; shortcut at `140`, venv at `154`, task at `129`). It does
-**not** delete the folder, the state or the logs, and never touches another task
-(`deploy/uninstall.ps1:11-15`).
+`uninstall.ps1` stops the supervisor through the same control channel as the installer
+(`cmd.json` in the machine-wide runtime dir, then a wait for the heartbeat to go stale), removes
+the desktop shortcut, removes `.tui-venv`, and unregisters `\ShockBox-Server` if a previous
+install left it. It does **not** delete the folder, the state or the logs, and never touches
+another task. If the supervisor is still running afterwards — for example it belongs to another
+account and ignored the request — it exits non-zero before removing the venv, naming the pid and
+the elevated `taskkill` command, instead of leaving a half-uninstalled stack that reports success.
 
 ## 9. One-time retirement of the old tasks
 
@@ -233,7 +251,8 @@ at 8972 through a restart. This is the old page's procedure, unchanged
 |---|---|
 | nothing on 8972 | is the supervisor running? `runtime\status.json` and `runtime\heartbeat` (fresh mtime), then `logs\shockbox-*.log` and `runtime\supervisor.log` |
 | the shortcut opens and closes at once | `.tui-venv` is missing — the window prints the pip commands and waits (`deploy/ShockBox-TUI.cmd:36-48`) |
-| `EADDRINUSE` | something else owns 8972 — `Get-NetTCPConnection -LocalPort 8972 -State Listen`. `install.ps1` only stops it if it runs *this* `server.mjs` (`deploy/install.ps1:225-237`); the supervisor likewise refuses to adopt a stranger (`supervisor.py:712-719`) |
+| `EADDRINUSE` | something else owns 8972 — `Get-NetTCPConnection -LocalPort 8972 -State Listen`. `install.ps1` stops it only if it runs *this* `server.mjs`; if the port is still held it now **exits 1** and names the pid and owner, rather than warning and claiming success. The supervisor likewise refuses to adopt a stranger (`supervisor.py:712-719`) |
+| installer exits 1: `a process we cannot inspect holds the port; it was not stopped` | the stack belongs to another account (SYSTEM, session 0). Nothing was copied. From an **elevated** PowerShell: `taskkill /F /PID <pid>` (the pid is in the message), then re-run the installer. `taskkill` without elevation fails with "Access is denied" |
 | a WSL `node server.mjs` answers on 8972 | WSL shares loopback (see `docs/WIRING.md` §3). Compare `/health`'s `pid` with `Get-Process` on Windows |
 | two servers fighting | a leftover `\ShockBox-Server` task — `Get-ScheduledTask ShockBox-Server`; `install.ps1` removes it (`deploy/install.ps1:285-304`) |
 | pages load but no state | the `--state` path exists and is writable (`server.mjs:64`) |

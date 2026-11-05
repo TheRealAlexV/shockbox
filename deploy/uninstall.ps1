@@ -5,11 +5,15 @@
   TUI virtualenv, and the "\ShockBox-Server" task if an old install left it.
 
 .DESCRIPTION
-  Stops the TUI supervisor (and, through it or after it, the server on the port)
-  using the same evidence rules as install.ps1: a live pid from supervisor.pid or
-  status.json, else a heartbeat younger than 10s. Its command line is never
-  evidence of absence. The port's listener is stopped only if its command line
-  runs *this* install's server.mjs. It never kills an unrelated process.
+  Stops the TUI supervisor through its own control channel - a `shutdown` command in
+  `<ProgramData>\ShockBox\runtime\cmd.json`, the machine-wide directory the supervisor polls,
+  so a stack owned by SYSTEM in session 0 is stopped too - then waits for its heartbeat to go
+  stale. Only if that fails does it fall back to the process table, and then only to processes
+  whose own command line proves they are this install. A process it cannot inspect is reported
+  as such and never killed. If the supervisor is still running afterwards the uninstall fails
+  (non-zero) before removing the virtualenv or the shortcut, rather than claiming success.
+
+  The runtime directory is per machine, not per account: `%PROGRAMDATA%\ShockBox\runtime`.
 
   Every other task on the host - ErrorPopups-Server, LedWallAgent, anything else -
   is left alone. The installed folder is kept: state, logs, the copied tree and
@@ -50,14 +54,114 @@ function Get-ListenerPid([int]$Port) {
     return @($c | Select-Object -ExpandProperty OwningProcess -Unique)
 }
 
-function Test-IsOurs([int]$ProcId, [string]$AppDir) {
+function Get-ProcessOwnership([int]$ProcId, [string]$AppDir) {
+    # 'ours' | 'foreign' | 'unknown'. An empty CommandLine is unknown, NOT "not ours": across
+    # accounts Win32_Process hides it. Unknown still means "do not kill", but it must be
+    # reported as unknown instead of being treated as somebody else's process.
+    if ($ProcId -le 0) { return 'unknown' }
     try {
         $p = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcId" -ErrorAction Stop
     } catch {
+        return 'unknown'
+    }
+    if (-not $p) { return 'foreign' }
+    if (-not $p.CommandLine) { return 'unknown' }
+    if ($p.CommandLine -match 'server\.mjs' -and $p.CommandLine -match [regex]::Escape($AppDir)) { return 'ours' }
+    return 'foreign'
+}
+
+function Get-ProcessLabel([int]$ProcId, $Table) {
+    if ($ProcId -le 0) { return 'pid 0 (owner not published)' }
+    $name = 'name unreadable'
+    $row = @($Table | Where-Object { [int]$_.ProcessId -eq $ProcId })
+    if ($row.Count -gt 0 -and $row[0].Name) { $name = [string]$row[0].Name }
+    $owner = $null
+    try {
+        if ($row.Count -gt 0) {
+            $o = Invoke-CimMethod -InputObject $row[0] -MethodName GetOwner -ErrorAction Stop
+            if ($o -and $o.User) { $owner = "$($o.Domain)\$($o.User)" }
+        }
+    } catch {
+        $owner = $null
+    }
+    if ($owner) { return "pid $ProcId ($name, $owner)" }
+    return "pid $ProcId ($name, owner not readable)"
+}
+
+function Get-RuntimeDir {
+    # Machine-wide, deliberately: a supervisor owned by another account (SYSTEM, session 0)
+    # reads %PROGRAMDATA%\ShockBox\runtime, not the caller's %LOCALAPPDATA%. Create it if
+    # missing; leave an existing ACL alone - the app owns the ACL.
+    $base = $env:ProgramData
+    if (-not $base) { $base = 'C:\ProgramData' }
+    $runtime = Join-Path $base 'ShockBox\runtime'
+    if (-not (Test-Path -LiteralPath $runtime)) {
+        if ($PSCmdlet.ShouldProcess($runtime, 'create the machine-wide runtime directory')) {
+            New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+        }
+    }
+    return $runtime
+}
+
+function Get-HeartbeatSeq([string]$Runtime) {
+    $path = Join-Path $Runtime 'heartbeat'
+    if (-not (Test-Path -LiteralPath $path)) { return -1 }
+    try {
+        $text = [System.IO.File]::ReadAllText($path)
+    } catch {
+        return -1
+    }
+    $n = 0
+    if ([int]::TryParse((($text.Trim() -split '\s+')[0]), [ref]$n)) { return $n }
+    return -1
+}
+
+function Get-HeartbeatAge([string]$Runtime) {
+    $path = Join-Path $Runtime 'heartbeat'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        return [math]::Round(((Get-Date) - (Get-Item -LiteralPath $path).LastWriteTime).TotalSeconds, 1)
+    } catch {
+        return $null
+    }
+}
+
+function Request-SupervisorShutdown([string]$Runtime, [int]$SupervisorPid) {
+    # The app's own control channel: supervisor.py polls <runtime>\cmd.json every tick and bumps
+    # the heartbeat counter on the tick it executes a command. A file in the machine-wide runtime
+    # dir works across accounts; the old Stop-Process could not touch a SYSTEM-owned supervisor.
+    # Wait on evidence: ack = cmd.json gone or seq advanced; done = heartbeat stale (12s) or the
+    # published pid exited.
+    $age = Get-HeartbeatAge $Runtime
+    if ($null -eq $age -or $age -gt 10) { return $false }
+    $cmd = Join-Path $Runtime 'cmd.json'
+    $seq = Get-HeartbeatSeq $Runtime
+    try {
+        $body = @{
+            id     = [guid]::NewGuid().ToString('N')
+            action = 'shutdown'
+            at     = (Get-Date).ToString('o')
+        } | ConvertTo-Json -Compress
+        $tmp = "$cmd.$PID.tmp"
+        [System.IO.File]::WriteAllText($tmp, $body)
+        Move-Item -LiteralPath $tmp -Destination $cmd -Force
+    } catch {
+        Write-Warning "could not write the shutdown command to $cmd : $($_.Exception.Message)"
         return $false
     }
-    if (-not $p -or -not $p.CommandLine) { return $false }
-    return ($p.CommandLine -match 'server\.mjs' -and $p.CommandLine -match [regex]::Escape($AppDir))
+    $deadline = (Get-Date).AddSeconds(30)
+    $acked = $false
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+        if (-not (Test-Path -LiteralPath $cmd)) { $acked = $true }
+        if ((Get-HeartbeatSeq $Runtime) -gt $seq) { $acked = $true }
+        if ($acked) {
+            $after = Get-HeartbeatAge $Runtime
+            $exited = $SupervisorPid -gt 0 -and -not (Get-Process -Id $SupervisorPid -ErrorAction SilentlyContinue)
+            if ($null -eq $after -or $after -gt 12 -or $exited) { return $true }
+        }
+    }
+    return $false
 }
 
 function Read-RuntimePid([string]$Path) {
@@ -93,7 +197,7 @@ function Get-SupervisorState {
     # here matched `shockbox_tui` to the app dir, so a supervisor launched with a relative path,
     # a wrapper, or a venv-shimmed python was invisible and the uninstall said "no TUI supervisor
     # running" over a live one.
-    $runtime = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime'
+    $runtime = Get-RuntimeDir
     $live = @{}
     # pid -> command line, for the same reason as install.ps1: a pid that is alive is not
     # necessarily a supervisor, and this runtime file outlives the process that wrote it.
@@ -134,42 +238,102 @@ function Get-SupervisorState {
 
 # ---- 1. stop the supervisor and the server ----------------------------------
 Step 'stop'
-if ($PSCmdlet.ShouldProcess($Target, 'stop the TUI supervisor and the server it runs')) {
-    $state = Get-SupervisorState
-    if ($state.Alive) {
-        if ($state.Pid -gt 0) {
-            Stop-Process -Id $state.Pid -Force -ErrorAction SilentlyContinue
-            Note ("stopped TUI supervisor pid " + $state.Pid + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
-        } else {
-            Write-Warning ("a TUI supervisor is running but published no pid (" + $state.Why + ", heartbeat $($state.Age)s old); stop it from the TUI or Task Manager")
-        }
-        Start-Sleep -Milliseconds 700
+$runtime = Get-RuntimeDir
+$table = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+$state = Get-SupervisorState
+if ($state.Alive) {
+    if ($state.Pid -gt 0) {
+        Note ("TUI supervisor running as pid " + $state.Pid + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
     } else {
-        Note ("no TUI supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
+        Note ("TUI supervisor running but its pid is not published (" + $state.Why + ", heartbeat $($state.Age)s old)")
+    }
+} else {
+    Note ("no TUI supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
+}
+
+$loops = @($table | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -and $_.CommandLine -match 'run\.cmd' -and $_.CommandLine -match [regex]::Escape($Target) })
+$listeners = @(Get-ListenerPid $Port)
+$oursOnPort = @()
+$foreignOnPort = @()
+foreach ($listener in $listeners) {
+    if ($listener -le 0) { continue }
+    switch (Get-ProcessOwnership $listener $Target) {
+        'ours' { $oursOnPort += $listener; Note "server pid $listener listens on port $Port" }
+        'unknown' { Note "port $Port listener $(Get-ProcessLabel $listener $table) cannot be inspected - leaving it" }
+        default {
+            if ($listener -eq 4) {
+                Write-Warning "port $Port is held by HTTP.sys (pid 4), not ShockBox - leaving it"
+            } else {
+                $foreignOnPort += $listener
+            }
+        }
+    }
+}
+
+$asked = $false
+if ($PSCmdlet.ShouldProcess($Target, 'stop the TUI supervisor and the server it runs')) {
+    New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+
+    # 1. the app first. Cross-account safe: a file in the machine-wide runtime dir, not a handle
+    #    in this session. Stop-Process could never touch a supervisor owned by SYSTEM.
+    if ($state.Alive) {
+        if (Request-SupervisorShutdown $runtime $state.Pid) {
+            $asked = $true
+            Note 'the supervisor shut down on request'
+        } else {
+            Write-Warning "the supervisor did not shut down on request (heartbeat $((Get-HeartbeatAge $runtime))s old); falling back to the process table"
+        }
     }
 
-    $loops = @(Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -match 'run\.cmd' -and $_.CommandLine -match [regex]::Escape($Target) })
+    # 2. fallback: only what our own command line proves is ours.
+    if (-not $asked -and $state.Pid -gt 0) {
+        $row = @($table | Where-Object { [int]$_.ProcessId -eq $state.Pid })
+        if ($row.Count -gt 0 -and $row[0].CommandLine -match 'shockbox_tui') {
+            Stop-Process -Id $state.Pid -Force -ErrorAction SilentlyContinue
+            Note ("stopped TUI supervisor pid " + $state.Pid)
+        } elseif (Get-Process -Id $state.Pid -ErrorAction SilentlyContinue) {
+            Note "supervisor pid $($state.Pid) is alive but its command line cannot be read - leaving it"
+        }
+    }
+
     foreach ($loop in $loops) {
         Stop-Process -Id $loop.ProcessId -Force -ErrorAction SilentlyContinue
         Note "stopped run.cmd launcher pid $($loop.ProcessId)"
     }
 
-    $killPort = 0
-    foreach ($listener in @(Get-ListenerPid $Port)) {
-        if (Test-IsOurs $listener $Target) {
-            Stop-Process -Id $listener -Force -ErrorAction SilentlyContinue
-            Note "stopped server pid $listener (port $Port)"
-            $killPort += 1
-        } elseif ($listener -eq 4) {
-            Write-Warning "port $Port is held by HTTP.sys (pid 4), not ShockBox - leaving it"
-        } else {
-            Write-Warning "port $Port is held by pid $listener which is not this install - leaving it"
-        }
+    foreach ($listener in $oursOnPort) {
+        Stop-Process -Id $listener -Force -ErrorAction SilentlyContinue
+        Note "stopped server pid $listener (port $Port)"
     }
-    if ($state.Alive -or $loops.Count -gt 0 -or $killPort -gt 0) { Note 'stopped what was running' } else { Note 'nothing was running' }
+    Start-Sleep -Milliseconds 700
 } else {
-    Note "stop the TUI supervisor (a live supervisor.pid or status.json supervisor_pid, or a heartbeat younger than 10s), the run.cmd launcher, and the node serving $Port if it runs $Target\server.mjs"
+    Note "stop the TUI supervisor (write {\"action\":\"shutdown\"} to $runtime\cmd.json), the run.cmd launcher, and the node serving $Port if it runs $Target\server.mjs"
+}
+
+# ---- 1b. do not remove the venv under a stack that is still running ----------
+# Removing .tui-venv and the shortcut while the supervisor lives leaves a stack that cannot be
+# restarted cleanly, and exiting 0 over it is the same false success the installer had. A
+# foreign listener on the port is not a reason to fail: this uninstall does not need the port.
+if (-not $WhatIfPreference) {
+    $stillSup = $state.Pid -gt 0 -and (Get-Process -Id $state.Pid -ErrorAction SilentlyContinue)
+    $oursLeft = @($oursOnPort | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    $unknownSup = $state.Pid -le 0 -and -not $asked -and ((Get-HeartbeatAge $runtime) -ne $null) -and ((Get-HeartbeatAge $runtime) -lt 10)
+    if ($stillSup -or $oursLeft.Count -gt 0 -or $unknownSup) {
+        $block = if ($state.Pid -gt 0) { $state.Pid } elseif ($oursLeft.Count -gt 0) { [int]$oursLeft[0] } else { 0 }
+        $blockLabel = Get-ProcessLabel $block $table
+        Write-Host ''
+        Write-Host "the stack is still running: $blockLabel - it was not stopped" -ForegroundColor Red
+        Write-Host 'UNINSTALL DID NOT COMPLETE: removing the virtualenv and the shortcut under a live supervisor leaves a stack that cannot be restarted cleanly. Nothing was removed.' -ForegroundColor Red
+        if ($block -gt 0) {
+            Write-Host "Run this from an elevated prompt, then re-run the uninstaller: taskkill /F /PID $block" -ForegroundColor Red
+        } else {
+            Write-Host "Run the uninstaller from an elevated prompt: Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$PSCommandPath'" -ForegroundColor Red
+        }
+        exit 1
+    }
+    if ($foreignOnPort.Count -gt 0) {
+        Write-Warning "port $Port is held by pid $($foreignOnPort -join ', '), which is not this install - it is not touched; the uninstall does not need the port"
+    }
 }
 
 # ---- 2. the old scheduled task, if a previous install left one ---------------

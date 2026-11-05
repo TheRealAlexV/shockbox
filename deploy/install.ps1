@@ -133,14 +133,17 @@ if (-not (Test-Path -LiteralPath $NodeExe)) {
 # Four things can be running the old code, and each is found by evidence:
 #   1. the TUI supervisor, by its published state: a live `supervisor.pid` (or the
 #      `supervisor_pid` in status.json) plus a heartbeat younger than 10s. It is asked to shut
-#      down over its control path, not killed, so it takes its server down in order. Its command
-#      line is deliberately not evidence - a wrapper, a relaunch or `python -m` hides it.
+#      down FIRST, through `cmd.json` in the machine-wide runtime dir - the only channel it
+#      reads, and one that works when the stack belongs to another account (SYSTEM, session 0).
+#      Its command line is deliberately not evidence - a wrapper, a relaunch or `python -m`
+#      hides it.
 #   2. the legacy run.cmd launcher loop (cmd.exe), by command line.
 #   3. the node holding the port, only if its command line runs *our* server.mjs.
 #   4. the same node found by command line alone, for the rig where the listener's owning pid
 #      is reported as 0 and the server's own command line says `server.mjs`, not its full path.
-# The supervisor may have started the server through run.cmd, so 2 to 4 run
-# after 1 either way - killing a child before its parent spares nothing.
+# 2 to 4 are the fallback after 1 fails or finds nothing; an empty command line (another
+# account) is "cannot inspect", never "not ours", and such a process is never killed.
+# If the port is still held afterwards the install fails - see 0b below.
 function Get-ListenerPid([int]$Port) {
     try {
         $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
@@ -150,14 +153,57 @@ function Get-ListenerPid([int]$Port) {
     return @($c | Select-Object -ExpandProperty OwningProcess -Unique)
 }
 
-function Test-IsOurs([int]$ProcId, [string]$AppDir) {
+function Test-PortAnswered([int]$Port) {
+    # The listener table on this rig has been wrong twice: it reported the owner as pid 0, and
+    # during the PowerShell lane's test it listed nothing at all while /health answered 200.
+    # A TCP connect is the ground truth the table is supposed to describe.
     try {
-        $p = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcId" -ErrorAction Stop
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne(500)) { $client.Close(); return $false }
+        $client.EndConnect($iar)
+        $client.Close()
+        return $true
     } catch {
         return $false
     }
-    if (-not $p -or -not $p.CommandLine) { return $false }
-    return ($p.CommandLine -match 'server\.mjs' -and $p.CommandLine -match [regex]::Escape($AppDir))
+}
+
+function Get-ProcessOwnership([int]$ProcId, [string]$AppDir) {
+    # 'ours' | 'foreign' | 'unknown'. An empty CommandLine is unknown, NOT "not ours": across
+    # accounts (the rig runs the stack as SYSTEM in session 0) Win32_Process hides it, and the
+    # old false return is what turned a live listener into a benign warning. Unknown still means
+    # "do not kill" - but it must be reported as unknown, not as somebody else's process.
+    if ($ProcId -le 0) { return 'unknown' }
+    try {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcId" -ErrorAction Stop
+    } catch {
+        return 'unknown'
+    }
+    if (-not $p) { return 'foreign' }
+    if (-not $p.CommandLine) { return 'unknown' }
+    if ($p.CommandLine -match 'server\.mjs' -and $p.CommandLine -match [regex]::Escape($AppDir)) { return 'ours' }
+    return 'foreign'
+}
+
+function Get-ProcessLabel([int]$ProcId, $Table) {
+    # Best effort for a message: pid, image name, owner. Never throws - the point is to say
+    # exactly what is known and no more.
+    if ($ProcId -le 0) { return 'pid 0 (owner not published)' }
+    $name = 'name unreadable'
+    $row = @($Table | Where-Object { [int]$_.ProcessId -eq $ProcId })
+    if ($row.Count -gt 0 -and $row[0].Name) { $name = [string]$row[0].Name }
+    $owner = $null
+    try {
+        if ($row.Count -gt 0) {
+            $o = Invoke-CimMethod -InputObject $row[0] -MethodName GetOwner -ErrorAction Stop
+            if ($o -and $o.User) { $owner = "$($o.Domain)\$($o.User)" }
+        }
+    } catch {
+        $owner = $null
+    }
+    if ($owner) { return "pid $ProcId ($name, $owner)" }
+    return "pid $ProcId ($name, owner not readable)"
 }
 
 function Get-ProcessTable {
@@ -172,7 +218,7 @@ function Get-ProcessTable {
 
 function Get-NodeProcess([string]$AppDir, [int]$Port, $Table) {
     # The port's owning pid is not evidence on this rig: netstat -ano and Get-NetTCPConnection
-    # both report the 8972 listener as pid 0, so Test-IsOurs declines. The server is started
+    # both report the 8972 listener as pid 0, so Get-ProcessOwnership declines. The server is started
     # with a bare relative 'server.mjs', so its command line does not name the script either -
     # it names the install dir in --state/--log-dir instead. That, or this port, is the rule:
     # a process is stopped only when its own command line claims this install or this port.
@@ -210,6 +256,45 @@ function Read-RuntimePid([string]$Path) {
     return 0
 }
 
+function Get-RuntimeDir {
+    # Machine-wide, deliberately: the stack is often owned by SYSTEM in session 0, and
+    # %LOCALAPPDATA% is per-account, so a control command written there is never read by the
+    # supervisor. Create it if missing and leave an existing ACL alone - the app owns the ACL.
+    $base = $env:ProgramData
+    if (-not $base) { $base = 'C:\ProgramData' }
+    $runtime = Join-Path $base 'ShockBox\runtime'
+    if (-not (Test-Path -LiteralPath $runtime)) {
+        if ($PSCmdlet.ShouldProcess($runtime, 'create the machine-wide runtime directory')) {
+            New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+        }
+    }
+    return $runtime
+}
+
+function Get-HeartbeatSeq([string]$Runtime) {
+    # The first token of <runtime>\heartbeat is a counter the supervisor bumps every tick.
+    $path = Join-Path $Runtime 'heartbeat'
+    if (-not (Test-Path -LiteralPath $path)) { return -1 }
+    try {
+        $text = [System.IO.File]::ReadAllText($path)
+    } catch {
+        return -1
+    }
+    $n = 0
+    if ([int]::TryParse((($text.Trim() -split '\s+')[0]), [ref]$n)) { return $n }
+    return -1
+}
+
+function Get-HeartbeatAge([string]$Runtime) {
+    $path = Join-Path $Runtime 'heartbeat'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        return [math]::Round(((Get-Date) - (Get-Item -LiteralPath $path).LastWriteTime).TotalSeconds, 1)
+    } catch {
+        return $null
+    }
+}
+
 function Get-SupervisorState([string]$AppDir, $Table) {
     # Ask the live process, not its command line. Precedence, and which signal wins:
     #   1. a pid that names a live process: supervisor.pid, then status.json's supervisor_pid
@@ -223,7 +308,7 @@ function Get-SupervisorState([string]$AppDir, $Table) {
     # A command line that does not name this app dir is *not* evidence of absence - that is the
     # bug this replaces. A wrapper, a relaunch, `python -m`, a renamed exe and a venv path all
     # miss it, and an install once printed "no TUI supervisor running" over a live supervisor.
-    $runtime = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime'
+    $runtime = Get-RuntimeDir
     $live = @{}
     # pid -> command line. A pid alone is not proof: pids are reused, and a stale
     # supervisor.pid once named a pid that had belonged to another program for days.
@@ -280,41 +365,51 @@ function Get-SupervisorState([string]$AppDir, $Table) {
     return @{ Alive = $false; Pid = 0; Age = $age; Why = 'no live pid and the heartbeat is stale or missing' }
 }
 
-function Send-SupervisorShutdown([string]$AppDir, $Table) {
-    # Best effort and best-evidence: ask over the control path if the supervisor
-    # publishes one, then wait briefly for the server it owns to let go of the
-    # port. Never fatal - a supervisor that ignores the request is killed below.
-    $pathFile = Join-Path $env:LOCALAPPDATA 'ShockBox\runtime\control.path'
-    if (-not (Test-Path -LiteralPath $pathFile)) { return $false }
-    $control = ([string](Get-Content -LiteralPath $pathFile -Raw -ErrorAction SilentlyContinue)).Trim()
-    if (-not $control) { return $false }
+function Request-SupervisorShutdown([string]$Runtime, [int]$SupervisorPid) {
+    # The app's own control channel, and the only one it reads: supervisor.py polls
+    # <runtime>\cmd.json every tick ({id, action, at}) and bumps the heartbeat counter on the
+    # tick it executes a command. There is no pipe or HTTP endpoint (control.path has a reader
+    # and no writer). Cross-account safe: the command is a file in the machine-wide runtime dir.
+    #
+    # The wait is on evidence, never a fixed sleep: ack = cmd.json gone or the heartbeat seq
+    # advanced; done = the heartbeat went stale (12s, control.STATUS_STALE_S) or the published
+    # supervisor pid exited.
+    $age = Get-HeartbeatAge $Runtime
+    if ($null -eq $age -or $age -gt 10) { return $false }   # nothing live is reading it
+    $cmd = Join-Path $Runtime 'cmd.json'
+    $seq = Get-HeartbeatSeq $Runtime
     try {
-        if ($control -match '^[A-Za-z]:\\' -or $control.StartsWith('\\')) {
-            # A named pipe: a Win32 pipe name, no host part.
-            $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', (Split-Path -Leaf $control), [System.IO.Pipes.PipeDirection]::InOut)
-            $pipe.Connect(1500)
-            $w = New-Object System.IO.StreamWriter($pipe)
-            $w.WriteLine('shutdown')
-            $w.Flush()
-            $pipe.Dispose()
-            return $true
-        }
-        if ($control -match '^(http|https)://') {
-            Invoke-RestMethod -Method Post -Uri $control -Body '{"command":"shutdown"}' -ContentType 'application/json' -TimeoutSec 3 | Out-Null
-            return $true
-        }
-        $uri = 'http://' + $control
-        Invoke-RestMethod -Method Post -Uri $uri -Body '{"command":"shutdown"}' -ContentType 'application/json' -TimeoutSec 3 | Out-Null
-        return $true
+        $body = @{
+            id     = [guid]::NewGuid().ToString('N')
+            action = 'shutdown'
+            at     = (Get-Date).ToString('o')
+        } | ConvertTo-Json -Compress
+        $tmp = "$cmd.$PID.tmp"
+        [System.IO.File]::WriteAllText($tmp, $body)
+        Move-Item -LiteralPath $tmp -Destination $cmd -Force
     } catch {
-        Write-Warning "supervisor control path $control did not accept a shutdown: $($_.Exception.Message)"
+        Write-Warning "could not write the shutdown command to $cmd : $($_.Exception.Message)"
         return $false
     }
+    $deadline = (Get-Date).AddSeconds(30)
+    $acked = $false
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+        if (-not (Test-Path -LiteralPath $cmd)) { $acked = $true }
+        if ((Get-HeartbeatSeq $Runtime) -gt $seq) { $acked = $true }
+        if ($acked) {
+            $after = Get-HeartbeatAge $Runtime
+            $exited = $SupervisorPid -gt 0 -and -not (Get-Process -Id $SupervisorPid -ErrorAction SilentlyContinue)
+            if ($null -eq $after -or $after -gt 12 -or $exited) { return $true }
+        }
+    }
+    return $false
 }
 
 Step 'stop'
 $stopped = @()
 $AppDir = $Target
+$runtime = Get-RuntimeDir
 
 # Everything above the ShouldProcess guard only reads: it works out what is running and prints
 # the pids and command lines it would stop. That is what makes -WhatIf a real dry run, and it
@@ -344,53 +439,59 @@ if ($state.Alive) {
 $loops = @($table | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -and $_.CommandLine -match 'run\.cmd' -and $_.CommandLine -match [regex]::Escape($AppDir) })
 foreach ($loop in $loops) { Note "launcher pid $($loop.ProcessId): $($loop.CommandLine)" }
 
-# 3. the port's listener, under the evidence rule. On this rig both netstat -ano and
-# Get-NetTCPConnection report the port's owner as pid 0, so this finds nothing and 4 does the
-# work; it still catches a foreign process that does name itself.
+# 3. the port's listener, classified - not killed. Nothing here is evidence that the app is
+# gone, so the app is asked to stop first (below) and this is only the fallback and the
+# message. An empty CommandLine (another account) is 'unknown', never "not ours".
 $listeners = @(Get-ListenerPid $Port)
 $oursOnPort = @()
 foreach ($listener in $listeners) {
     if ($listener -le 0) { continue }
-    if (Test-IsOurs $listener $AppDir) {
-        $oursOnPort += $listener
-        Note "server pid $listener listens on port $Port"
-    } elseif ($listener -eq 4) {
-        Write-Warning "port $Port is held by the HTTP.sys service (pid 4), not ShockBox - leaving it"
-    } else {
-        $line = ($table | Where-Object { $_.ProcessId -eq $listener }).CommandLine
-        Write-Warning "port $Port is held by pid $listener which is not this install ($line) - leaving it; the next start will report EADDRINUSE"
+    switch (Get-ProcessOwnership $listener $AppDir) {
+        'ours' { $oursOnPort += $listener; Note "server pid $listener listens on port $Port" }
+        'unknown' { Note "port $Port listener $(Get-ProcessLabel $listener $table) cannot be inspected - leaving it" }
+        default {
+            if ($listener -eq 4) {
+                Write-Warning "port $Port is held by the HTTP.sys service (pid 4), not ShockBox - leaving it"
+            }
+        }
     }
-}
-if ($listeners.Count -gt 0 -and @($listeners | Where-Object { $_ -gt 0 }).Count -eq 0) {
-    Note "port $Port listener reports pid 0 (owner not published) - matching node.exe by command line"
 }
 
 # 4. node.exe by command line. The listener's pid is not evidence here, and the server is
-# started with a bare relative 'server.mjs', so Test-IsOurs cannot see it either. A process is
-# ours when its own command line names this install dir or this port. Nothing else is stopped.
+# started with a bare relative 'server.mjs', so Get-ProcessOwnership cannot see it either. A
+# process is ours when its own command line names this install dir or this port. Nothing else
+# is stopped.
 $nodes = @(Get-NodeProcess $AppDir $Port $table)
 foreach ($n in $nodes) { Note ("node.exe pid " + $n.ProcessId + ": " + $n.CommandLine) }
 if ($nodes.Count -eq 0) { Note "no node.exe names $AppDir or --port $Port" }
 
 if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launcher loop and the node serving the port')) {
+    New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+
+    # 1. the app first, over the only channel it reads, and only that. Cross-account safe: the
+    #    command is a file in the machine-wide runtime dir, not a handle in our session.
     $asked = $false
-    if ($sup.Count -gt 0) {
-        if (Send-SupervisorShutdown $AppDir $table) {
+    if ($state.Alive) {
+        if (Request-SupervisorShutdown $runtime $state.Pid) {
             $asked = $true
-            Note 'asked the supervisor to shut down'
-            for ($i = 0; $i -lt 20; $i++) {
-                if (-not ($sup | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })) { break }
-                Start-Sleep -Milliseconds 250
-            }
+            Note 'the supervisor shut down on request'
+            $stopped += 'supervisor'
+        } else {
+            Write-Warning "the supervisor did not shut down on request (heartbeat $((Get-HeartbeatAge $runtime))s old); falling back to the process table"
         }
+    }
+
+    # 2. fallback: a supervisor pid is only killed when its own command line proves it is the
+    #    supervisor. A pid we cannot inspect is left alone and reported below.
+    if (-not $asked) {
         foreach ($s in $sup) {
-            if (Get-Process -Id $s -ErrorAction SilentlyContinue) {
+            $row = @($table | Where-Object { [int]$_.ProcessId -eq $s })
+            if ($row.Count -gt 0 -and $row[0].CommandLine -match 'shockbox_tui') {
                 Stop-Process -Id $s -Force -ErrorAction SilentlyContinue
                 Note "stopped supervisor pid $s"
                 $stopped += "supervisor $s"
-            } else {
-                Note "supervisor pid $s exited on request"
-                $stopped += "supervisor $s"
+            } elseif (Get-Process -Id $s -ErrorAction SilentlyContinue) {
+                Note "supervisor pid $s is alive but its command line cannot be read - leaving it"
             }
         }
     }
@@ -410,9 +511,9 @@ if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launc
     if ($nodes.Count -gt 0) {
         # Politeness first: a supervisor that was not already asked above may still be the
         # parent, and its shutdown takes the server down in order rather than yanking it.
-        if (-not $asked -and (Send-SupervisorShutdown $AppDir $table)) {
-            Note 'asked the supervisor to shut down'
-            Start-Sleep -Milliseconds 500
+        if (-not $asked -and $state.Alive -and (Request-SupervisorShutdown $runtime $state.Pid)) {
+            $asked = $true
+            Note 'the supervisor shut down on request'
         }
         $ids = @($nodes | ForEach-Object { [int]$_.ProcessId })
         $left = @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
@@ -447,7 +548,54 @@ if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launc
     Start-Sleep -Milliseconds 700
 } else {
     Note 'nothing was stopped (WhatIf)'
-    Note 'to do it by hand: send "shutdown" to the live supervisor, end the run.cmd loop, then stop the node whose command line names this install dir or this port'
+    Note 'to do it by hand: write {"action":"shutdown"} to the cmd.json in <ProgramData>\ShockBox\runtime (the supervisor polls it), end the run.cmd loop, then stop the node whose command line names this install dir or this port'
+}
+
+# ---- 0b. the install is not done while the port is taken --------------------
+# A copy over a live tree only takes effect at the next start, and there is no next start while
+# the port is held. Warning and exiting 0 anyway is the defect this replaces: a SYSTEM-owned
+# stack printed "WARNING: port 8972 is held by pid 45360 which is not this install" and
+# claimed success. Nothing is copied in that case - fail before touching the tree.
+if (-not $WhatIfPreference) {
+    # Three independent signals, because the listener table alone has lied on this rig: pid 0
+    # once, and no row at all another time while /health answered 200. Either way the port is
+    # held, and a copy would never be loaded.
+    $tableAfter = Get-ProcessTable
+    $deadline = (Get-Date).AddSeconds(5)
+    while ($true) {
+        $still = @(Get-ListenerPid $Port)
+        $answered = Test-PortAnswered $Port
+        $leftNodes = @(Get-NodeProcess $AppDir $Port $tableAfter)
+        $held = $still.Count -gt 0 -or $answered -or $leftNodes.Count -gt 0
+        if (-not $held -or (Get-Date) -ge $deadline) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($held) {
+        $block = if ($still.Count -gt 0) {
+            [int]($still | Select-Object -First 1)
+        } elseif ($leftNodes.Count -gt 0) {
+            [int]$leftNodes[0].ProcessId
+        } else {
+            0
+        }
+        $label = Get-ProcessLabel $block $tableAfter
+        $how = if ($block -gt 0) { Get-ProcessOwnership $block $AppDir } else { 'unknown' }
+        Write-Host ''
+        if ($how -eq 'unknown' -or $block -le 0) {
+            Write-Host "port $Port is still held: $label - a process we cannot inspect holds the port; it was not stopped" -ForegroundColor Red
+        } elseif ($how -eq 'ours') {
+            Write-Host "port $Port is still held: $label - this install's server did not stop" -ForegroundColor Red
+        } else {
+            Write-Host "port $Port is still held: $label - it is not this install; it was not stopped" -ForegroundColor Red
+        }
+        Write-Host 'INSTALL DID NOT COMPLETE: the running stack was not stopped, so the new code would never be loaded. Nothing was copied.' -ForegroundColor Red
+        if ($block -gt 0) {
+            Write-Host "Run this from an elevated prompt, then re-run the installer: taskkill /F /PID $block" -ForegroundColor Red
+        } else {
+            Write-Host "Run the installer from an elevated prompt: Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$PSCommandPath'" -ForegroundColor Red
+        }
+        exit 1
+    }
 }
 
 # ---- 1. directories ----------------------------------------------------------
