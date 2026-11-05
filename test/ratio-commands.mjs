@@ -10,6 +10,7 @@
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,8 +20,18 @@ const SCRATCH = process.env.SHOCKBOX_SCRATCH || os.tmpdir();
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
+// Per-run state dir, so the cycle starts from the shipped 'default' and never from a settings
+// document a previous run left behind.
 const state = fs.mkdtempSync(path.join(SCRATCH, 'sb-ratio-'));
-const port = 8993 + Math.floor(Math.random() * 200);
+// The port is claimed from the OS instead of guessed out of a range: 8993-9192 overlapped a live
+// listener, and a stale server answering /health would have asserted against the wrong state dir.
+const port = await new Promise((resolve, reject) => {
+  const s = net.createServer();
+  s.on('error', reject).listen(0, '127.0.0.1', () => {
+    const p = s.address().port;
+    s.close(() => resolve(p));
+  });
+});
 
 const results = [];
 function ok(name, pass, detail = '') {
@@ -68,15 +79,21 @@ try {
   if (!up) throw new Error('server did not start');
 
   const start = await ratio();
-  ok('ratio starts at the default', start === '16:9', start);
+  ok('ratio starts at the cycle entry (stored default resolves to 16:9)', start === '16:9', start);
 
-  const a = await cmd({ cmd: 'ratio.toggle' });
+  // Four-state cycle since f313e16: default -> 16:9 -> 9:16 -> both -> default. The wall reports
+  // the *effective* ratio, so from the shipped 'default' a fresh run walks
+  // 16:9 -> 9:16 -> both -> 16:9 and the fourth toggle wraps.
+  const CYCLE = ['9:16', 'both', '16:9', '9:16'];
+  let a;
+  for (let i = 0; i < CYCLE.length; i++) {
+    a = await cmd({ cmd: 'ratio.toggle' });
+    const got = await ratio();
+    ok(`toggle ${i + 1} lands on ${CYCLE[i]}`, a.body.ok === true && got === CYCLE[i], got);
+  }
   ok('toggle answers as a command, not a bus forward', a.body.ok === true && a.body.note !== 'delivered counts SSE writes, not acknowledgements', JSON.stringify(a.body));
-  ok('toggle flipped the ratio', (await ratio()) === '9:16', await ratio());
 
-  const b = await cmd({ cmd: 'ratio.toggle' });
-  ok('toggle flips back', b.body.ok === true && (await ratio()) === '16:9', await ratio());
-
+  // Sit on 9:16 so the forcing command has to move the wall.
   await cmd({ cmd: 'ratio.toggle' });
   const c = await cmd({ cmd: 'ratio.force16x9' });
   ok('force16x9 is a command', c.body.ok === true && (await ratio()) === '16:9', JSON.stringify(c.body));
