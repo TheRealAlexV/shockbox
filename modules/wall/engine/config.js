@@ -286,7 +286,7 @@
                 'matrix', 'spectrum', 'orbits', 'rain', 'equalizer', 'static',
                 'heartbeat'],
       palette: Object.keys(window.LEDWALL_PALETTES),
-      ratio: ['16:9', '9:16'],
+      ratio: ['16:9', '9:16', 'both'],
       view: ['landscape', 'portrait'],
       'text.safeArea': ['off', '9x16'],
       'text.paras[].align': ['left', 'center', 'right']

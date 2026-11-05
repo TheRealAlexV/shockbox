@@ -516,7 +516,7 @@
     // canvas (1280x720 or 720x1280, both ×scale) and therefore the cell pitch;
     // view picks which `views{}` block the page honours.
     var ratioQ = opts.ratio || (this.s.deckDefault && this.s.deckDefault.ratio) || '16:9';
-    this.ratio = (ratioQ === '9:16') ? '9:16' : '16:9';
+    this.ratio = ratioQ === '9:16' ? '9:16' : '16:9';
     this.view = opts.view || (this.ratio === '9:16' ? 'portrait' : 'landscape');
     if (this.view !== 'portrait') this.view = 'landscape';
     var baseW = this.ratio === '9:16' ? 720 : 1280;
@@ -2404,7 +2404,7 @@
   // Deck cycling order. `sign` was a text behaviour bolted onto the preset bank and is gone:
   // it carried no look of its own, so `preset.next` landed on a preset that did not exist and
   // the wall flickered through an empty look. Operator-saved presets are appended after these.
-  var PRESET_ORDER = ['neonwave', 'arctic', 'chase', 'bassline', 'ember'];
+  var PRESET_ORDER = ['neonwave', 'arctic', 'chase', 'bassline', 'ember', 'sign'];
 
   /**
    * One command, from the deck through services/ledwall-agent.  Returns

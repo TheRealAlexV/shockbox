@@ -505,6 +505,7 @@ export default {
   effectiveRatio() {
     const s = this.ctx.settings;
     const own = s && typeof s.get === 'function' ? s.get('ratio') : 'default';
+    if (own === 'both') return 'both';
     if (own === '9:16' || own === '16:9') return own;
     const core = this.ctx.core && this.ctx.core.settings;
     const global = core && typeof core.get === 'function' ? core.get('ratio') : null;
@@ -522,7 +523,7 @@ export default {
    * scale or grid changed, and the pane dragged a window the page then ignored.
    */
   derivedFence(ratio = this.effectiveRatio()) {
-    if (ratio !== '9:16') return null;
+    if (ratio !== '9:16' && ratio !== 'both') return null;
     const s = this.ctx.settings;
     const cols = Math.max(4, Math.round(Number(s ? s.get('gridCols') : 0) || 112));
     const scale = 2; // the engine's default scale; the page reports its real one on heartbeat
@@ -762,12 +763,19 @@ export default {
     ];
   },
 
-  /** 9:16 <-> 16:9, refused inside a forcing scene. */  _ratioToggle() {
+  /**
+   * Cycle `default` -> `16:9` -> `9:16` -> `both`. `both` keeps the full 16:9 canvas (that frame
+   * is the 16:9 guide) and draws the centred 9:16 fence over it; only `9:16` is refused inside a
+   * forcing scene, since `both` still renders the 16:9 surface.
+   */
+  _ratioToggle() {
     // The ratio the wall is running, not the stored token: the shipped value is 'default',
     // which resolves to 16:9, so toggling the raw setting would answer 9:16 while the wall
     // stayed at 16:9 and need a second press to reach portrait.
     const cur = this.effectiveRatio();
-    const next = cur === '16:9' ? '9:16' : '16:9';
+    const order = ['default', '16:9', '9:16', 'both'];
+    const at = Math.max(0, order.indexOf(cur));
+    const next = order[(at + 1) % order.length];
     if (next === '9:16' && this.ratio && this.ratio.state.forcing) {
       this.log.info(`ratio: ${this.ratio.state.lastScene} forces 16:9 — toggle ignored`);
       return { seq: this.seq, delivered: 0, ok: false, note: 'refused: scene forces 16:9', ratio: cur };

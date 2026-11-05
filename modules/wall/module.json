@@ -61,10 +61,11 @@
       "enum": [
         "default",
         "16:9",
-        "9:16"
+        "9:16",
+        "both"
       ],
       "label": "Wall ratio",
-      "note": "default follows the global core ratio; 9:16 draws the portrait window inside the full-surface 16:9 page",
+      "note": "default follows the global core ratio; 16:9 is the whole wall; 9:16 draws the portrait window as the full 9:16 page; both keeps the 16:9 canvas and draws the centred 9:16 fence over it",
       "group": "fence"
     },
     "fence": {

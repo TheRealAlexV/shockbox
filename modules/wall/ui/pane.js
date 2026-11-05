@@ -238,13 +238,14 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   const ratioWrap = el('div', { class: 'wall-ratio' });
   const ratioSeg = el('div', { class: 'segmented', role: 'radiogroup', 'aria-label': 'Wall ratio' });
   // The ratio is a setting: `Default (global)` leaves the wall to its own document (a forcing
-  // scene can still pin 16:9), and the other two pin it. Each button PATCHes `ratio` and nothing
+  // scene can still pin 16:9), and the other three pin it. Each button PATCHes `ratio` and nothing
   // else — the 9:16 window is derived from the ratio, so there is no rect to send and no stale
   // fence left behind by a second key in the patch.
   const RATIO_CHOICES = [
     ['default', 'Default', 'Default (global): the wall’s own ratio setting'],
     ['16:9', '16:9', 'Whole wall'],
     ['9:16', '9:16', '9:16 window inside the wall'],
+    ['both', 'Both', '16:9 guide plus 9:16 fence'],
   ];
   const ratioSegBtn = {};
   let ratioChoice = null; // the stored setting: default | 16:9 | 9:16
@@ -1206,7 +1207,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       if (!(preview && preview.isDragging && preview.isDragging())) applyFenceDoc(s.fence);
       // an absent ratio means the server has no opinion yet (fresh state, windowed default);
       // only an explicit '16:9' should put the pane into whole-wall mode
-      if (s.ratio === '9:16' || s.ratio === '16:9') ratioSelection = s.ratio;
+      if (s.ratio === '9:16' || s.ratio === '16:9' || s.ratio === 'both') ratioSelection = s.ratio;
     }
     paintQueued();
     paintAll();
@@ -1362,10 +1363,10 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
 
   function paintRatio() {
     // Two different facts, painted separately: `ratioChoice` is what the document says
-    // (default / 16:9 / 9:16) and `ratioSelection` is what the wall is actually running — a
+    // (default / 16:9 / 9:16 / both) and `ratioSelection` is what the wall is actually running — a
     // forcing scene pins 16:9 without touching the operator's own setting.
     const own = String(metaValue('ratio') ?? 'default');
-    ratioChoice = (own === '16:9' || own === '9:16') ? own : 'default';
+    ratioChoice = (own === '16:9' || own === '9:16' || own === 'both') ? own : 'default';
     for (const [value, btn] of Object.entries(ratioSegBtn)) {
       btn.setAttribute('aria-checked', String(value === ratioChoice));
       btn.dataset.effective = String(value === ratioChoice && ratioSelection && ratioSelection !== value);
@@ -1491,7 +1492,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     // frame), and a 16:9 wall shows the whole picture even if a rect is remembered for later
     // `null` = no live frame yet: the pane booted and this paint is the first, so keep the
     // windowed default rather than guessing 'whole wall' and flashing the full picture
-    const shown = ratioSelection === null ? true : ratioSelection === '9:16';
+    const shown = ratioSelection === null ? true : ratioSelection === '9:16' || ratioSelection === 'both';
     pv.setFenceVisible(shown);
     // the component republishes the frame's own size so a pane-scale fallback is never needed
     if (pv.frame) frameEl = pv.frame;
@@ -1509,7 +1510,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       pxOut.lastChild.textContent = `${fmtPx(r.x)}, ${fmtPx(r.y)} · ${fmtPx(r.w)}×${fmtPx(r.h)}`;
     } else {
       cellsOut.lastChild.textContent = '—';
-      pxOut.lastChild.textContent = ratioSelection === '16:9' ? 'wall is whole' : 'no window';
+      pxOut.lastChild.textContent = ratioSelection === '16:9' ? 'wall is whole' : ratioSelection === 'both' ? '16:9 guide + 9:16 fence' : 'no window';
     }
     // rulers on both edges: ticks are in wall px, so the rect has a frame of reference
     clear(gutter);
@@ -1541,7 +1542,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   function paintFenceFields() {
     // The window exists when the wall runs 9:16, and the server derives its rect from the wall's
     // own geometry — so these fields are a readout, never an edit.
-    const on = Boolean(fencePx) && ratioSelection === '9:16';
+    const on = Boolean(fencePx) && (ratioSelection === '9:16' || ratioSelection === 'both');
     fenceStateOut.textContent = on ? `${Math.round(fencePx.w)}×${Math.round(fencePx.h)} px` : 'whole wall';
     fencePanel.dataset.fence = on ? 'on' : 'off';
     const r = fencePx || centredFence();
@@ -1624,7 +1625,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     }
     look = nextLook;
     if ('fence' in patch) fencePx = patch.fence ? { ...patch.fence } : null;
-    if ('ratio' in patch) ratioSelection = patch.ratio === '9:16' ? '9:16' : '16:9';
+    if ('ratio' in patch) ratioSelection = patch.ratio === '9:16' ? '9:16' : patch.ratio === 'both' ? 'both' : '16:9';
     if (settingsMeta) {
       const next = { ...settingsMeta };
       for (const [k, v] of Object.entries(patch)) {
@@ -1645,7 +1646,11 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       else if (c.name === 'look.pattern' && c.args?.name) synth = { ...synth, pattern: c.args.name };
       else if (c.name === 'preset.set' && c.args?.name) synth = { ...synth, preset: c.args.name };
       else if (c.name === 'ratio.force16x9') ratioSelection = '16:9';
-      else if (c.name === 'ratio.toggle' && ratioSelection) ratioSelection = ratioSelection === '9:16' ? '16:9' : '9:16';
+      else if (c.name === 'ratio.toggle' && ratioSelection) {
+    const order = ['default', '16:9', '9:16', 'both'];
+    const at = Math.max(0, order.indexOf(ratioSelection));
+    ratioSelection = order[(at + 1) % order.length];
+  }
     }
   }
 
@@ -1790,7 +1795,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   }
 
   async function chooseRatio(next) {
-    const want = (next === '16:9' || next === '9:16') ? next : 'default';
+    const want = (next === '16:9' || next === '9:16' || next === 'both') ? next : 'default';
     if (want === ratioChoice) return;
     // A forcing scene pins 16:9 in the server's watcher; say so instead of writing a value that
     // will be overridden on the next scene edge.
@@ -1974,7 +1979,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     // the pushed document carries the ratio too: a forcing scene (or the fence switch) flips
     // it without a click. Adopt it and re-read /live, which carries the ratio *state* — that
     // is where the forcing lock lives, and the preview needs both to agree
-    if (snap.ratio === '16:9' || snap.ratio === '9:16') {
+    if (snap.ratio === '16:9' || snap.ratio === '9:16' || snap.ratio === 'both') {
       ratioSelection = snap.ratio;
       refreshQuiet();
     }
