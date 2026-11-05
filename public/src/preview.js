@@ -56,6 +56,26 @@ function hashStr(s) {
   return Math.abs(h);
 }
 
+/**
+ * Every page mounted here is a preview, so `preview=1` goes on the src. The rest of the URL is
+ * kept verbatim: an existing query keeps its order and a hash stays after the query. The wall's
+ * `/wall/render?scale=1` becomes `/wall/render?scale=1&preview=1`; the page reads only `scale`, so
+ * its render is unchanged. Called on mount AND on setSrc so a later call cannot drop the flag.
+ */
+export function withPreviewFlag(url) {
+  const s = String(url ?? '');
+  if (!s) return s;
+  const hashAt = s.indexOf('#');
+  const beforeHash = hashAt === -1 ? s : s.slice(0, hashAt);
+  const hash = hashAt === -1 ? '' : s.slice(hashAt);
+  const qAt = beforeHash.indexOf('?');
+  const path = qAt === -1 ? beforeHash : beforeHash.slice(0, qAt);
+  const query = qAt === -1 ? '' : beforeHash.slice(qAt + 1);
+  const params = query ? query.split('&') : [];
+  if (params.some((p) => p.split('=')[0] === 'preview')) return s;
+  return `${path}?${query ? `${query}&` : ''}preview=1${hash}`;
+}
+
 /** Pattern names still map to a stable shape word; the show preview reads it for its wall tag. */
 const PATTERN_SHAPES = ['wave', 'bars', 'dots', 'sweep', 'plasma'];
 export function shapeFor(pattern) {
@@ -106,7 +126,7 @@ export function mountPreview(host, opts = {}) {
   const iframe = src
     ? el('iframe', {
         class: 'pv-iframe',
-        src,
+        src: withPreviewFlag(src),
         title: `${title} — live page`,
         scrolling: 'no',
         tabindex: '-1',
@@ -145,6 +165,19 @@ export function mountPreview(host, opts = {}) {
   // preview.css.
   const stage = el('div', { class: 'pv-stage' }, frame);
 
+  // One plain line under the picture: which surface it is, where the crop falls, and that the
+  // page shows a sample. It reads `title` (already the pane's own name) and the geometry the
+  // caller already passed, so no pane needs a parallel field. Real text, not a tooltip.
+  const captionNote = !fenceOn
+    ? 'full 16:9 · sample on a transparent surface'
+    : shape === 'window'
+      ? '9:16 crop · live overlay'
+      : '16:9 picture · 9:16 crop guide';
+  const caption = el('p', { class: 'pv-caption' },
+    el('span', { class: 'pv-caption-what', text: title }),
+    el('span', { class: 'pv-caption-note', text: captionNote }),
+  );
+
   const badgeEl = el('span', { class: 'pv-badge' });
   const dimOut = el('span', { class: 'pv-dimout mono dim', text: '' });
   const dimSlider = el('input', { type: 'range', min: '0', max: '100', step: '1', class: 'pv-dim', 'aria-label': 'dim outside the window' });
@@ -172,6 +205,7 @@ export function mountPreview(host, opts = {}) {
       headRight,
     ),
     stage,
+    caption,
   );
   clear(host);
   host.append(panel);
@@ -266,6 +300,24 @@ export function mountPreview(host, opts = {}) {
         })
       : null;
   ro?.observe(stage);
+
+  // Mounted detached: panes build their preview before the shell inserts the host, so the first
+  // layout sees a 0-wide stage. The observer above settles the geometry once the pane has a
+  // width; this one covers the insertion moment itself, so the crop guide is right the first time
+  // the operator sees it. A host that is already connected needs nothing extra.
+  let mountIO = null;
+  if (!panel.isConnected || !stage.clientWidth) {
+    if (typeof IntersectionObserver !== 'undefined') {
+      mountIO = new IntersectionObserver((entries) => {
+        if (!entries.some((e) => e.isIntersecting)) return;
+        mountIO?.disconnect();
+        layout();
+      });
+      mountIO.observe(stage);
+    } else {
+      queueMicrotask(layout);
+    }
+  }
 
   /* -------------------------------------------------------------------- drag */
 
@@ -389,8 +441,9 @@ export function mountPreview(host, opts = {}) {
    * iframe is the same node; only its `src` changes, so a pane that repaints is not rebuilding it.
    */
   function setSrc(next) {
-    if (!iframe || !next || iframe.getAttribute('src') === next) return;
-    iframe.setAttribute('src', next);
+    const target = withPreviewFlag(next);
+    if (!iframe || !target || iframe.getAttribute('src') === target) return;
+    iframe.setAttribute('src', target);
   }
 
   /** A status word in the header: 'live', 'offline', 'not connected'… */
@@ -439,6 +492,7 @@ export function mountPreview(host, opts = {}) {
     running = false;
     cancelAnimationFrame(raf);
     ro?.disconnect();
+    mountIO?.disconnect();
     if (interactive) {
       frame.removeEventListener('pointerdown', onPointerDown);
       frame.removeEventListener('pointermove', onPointerMove);
