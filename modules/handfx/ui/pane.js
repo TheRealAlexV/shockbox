@@ -16,6 +16,7 @@
 // The pane lives off the shell's own tokens (public/src/shell.css) and a small pane.css.
 
 import { el, frag, clear, actionButton } from '/src/ui.js';
+import { mountPreview } from '/src/preview.js';
 import { EFFECTS as ENGINE_EFFECTS } from '../pages/js/engine/fx.js';
 
 // What this build can actually draw. The page's registry is the truth (it is the same module the
