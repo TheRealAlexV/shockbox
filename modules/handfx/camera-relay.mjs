@@ -20,7 +20,7 @@
 //   idle     enabled, but no page is reading — there is nothing for the relay to do
 //   starting ffmpeg is running and no complete frame has arrived yet
 //   live     a complete frame arrived within the last 2 s
-//   error    ffmpeg opened but produced no frame in 2 s, frames stopped for 2 s with clients
+//   error    ffmpeg opened but produced no frame in 8 s, frames stopped for 2 s with clients
 //            attached, or ffmpeg exited. `error` carries its stderr tail.
 // A stalled producer keeps its last frame (`/camera/latest.jpg` still answers) and the status marks
 // it `stale`; it is never reported `live`.
@@ -41,6 +41,12 @@ const MAX_PENDING = 8 * 1024 * 1024;
 const STOP_AFTER_MS = 5000;
 /** A producer that opens and then says nothing is broken, not live: 2 s of silence says so. */
 const STALL_MS = 2000;
+/**
+ * The first frame is a device open, not a stall: dshow delivered byte one at 1.97 s on the rig
+ * (1280x720 yuyv422), so a 2 s deadline killed healthy opens and every kill left the Media
+ * Foundation source wedged. Frames after the first keep the 2 s rule.
+ */
+const START_GRACE_MS = 8000;
 const WATCHDOG_MS = 500;
 const MAX_BACKOFF = 10000;
 const SIZES = ['640x360', '960x540', '1280x720'];
@@ -226,6 +232,11 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     proc.once('close', () => clearTimeout(kill));
   }
 
+  /** How long silence may last: the startup grace until this producer delivers its first frame. */
+  function stallLimit() {
+    return counters.lastFrameAt >= spawnedAt ? STALL_MS : START_GRACE_MS;
+  }
+
   /** Milliseconds since the running producer last produced a frame, or since it spawned. */
   function silenceFor(now = Date.now()) {
     if (!child) return 0;
@@ -256,7 +267,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       stopWatchdog();
       return;
     }
-    if (silenceFor() > STALL_MS) stall();
+    if (silenceFor() > stallLimit()) stall();
   }
 
   function startWatchdog() {
@@ -485,7 +496,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
      * past its freshness, and `error` carries ffmpeg's stderr tail when there is one.
      */
     status() {
-      const silent = silenceFor() > STALL_MS;
+      const silent = silenceFor() > stallLimit();
       const reported = silent ? 'error' : state;
       const error =
         silent && !counters.error
