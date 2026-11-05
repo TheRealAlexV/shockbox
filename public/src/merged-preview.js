@@ -231,14 +231,14 @@ export function setLookApi(api) {
 /* ---------------------------------------------------------------- the column */
 
 /**
- * The strip OBS shows, in the wall's own pixels.
+ * The strip OBS shows, in its own pixels.
  *
- * OBS cuts a 405×720 window out of the centre of the 1280×720 wall (`V: Main Live`), and both
- * overlays are authored against that window: notifications at 405×720, alerts on an 810×1440
- * desk, which is the same box at 2×. The surface below IS that window — one frame, every module
- * painted into it in the order the show stacks them — so a thing sits here where OBS draws it.
+ * OBS stacks the overlays inside a 405×720 window (`V: Main Live`), and both overlays are
+ * authored against that box: notifications at 405×720, alerts on an 810×1440 desk, which is the
+ * same box at 2×. The surface below IS that window — one frame, every module painted into it in
+ * the order the show stacks them — so a thing sits here where OBS draws it.
  */
-export const STRIP = { w: 405, h: 720, left: 437.5, frameW: 1280, frameH: 720 };
+export const STRIP = { w: 405, h: 720 };
 
 /**
  * The base rules for a module's layer. The module's own stylesheet is linked next to them inside

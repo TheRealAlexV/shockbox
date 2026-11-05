@@ -105,13 +105,13 @@
   background: #000;
 }
 
-/* The wall layer is the whole 1280×720 picture with the strip's left edge cut off: the crop is a
-   window onto the wall, not a wall that has been resized. */
+/* The wall layer is the portrait page itself, drawn at 720×1280 and scaled 0.5625 to the strip's
+   405×720, so it lands pixel-exact on the scene. Nothing is cropped: the page is the strip. */
 .mx-wall {
   position: absolute;
-  left: -437.5px;
+  left: 0;
   top: 0;
-  width: 1280px;
+  width: 405px;
   height: 720px;
   pointer-events: none;
 }
