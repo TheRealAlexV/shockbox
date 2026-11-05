@@ -116,23 +116,28 @@ what the document used to say (`control.py:226-229`). With no document at all it
 
 ## 4. The rest of the runtime directory
 
-`Paths` resolves the runtime dir to `%LOCALAPPDATA%\ShockBox\runtime` on Windows and
+`Paths` resolves the runtime dir to `%PROGRAMDATA%\ShockBox\runtime` on Windows and
 `$XDG_STATE_HOME/shockbox` (usually `~/.local/state/shockbox`) on POSIX
-(`tools/tui/shockbox_tui/paths.py:68-77`). It is deliberately outside the install tree, because
-`install.ps1` robocopies over that tree (`paths.py:11-13`, `deploy/install.ps1:267-272`).
+(`tools/tui/shockbox_tui/paths.py:154-176`). The Windows default is machine-wide because the
+supervisor runs as SYSTEM while the window runs as the installing account: a per-account dir
+split them, so each side saw an empty runtime dir and started a second supervisor
+(`paths.py:11-18`). `ensure()` creates it and, on Windows, applies an inheritable ACL granting
+SYSTEM and the installing account modify (`paths.py:87-117`, applied at `230-252`); a directory that already has the
+wrong owner is reported through `Paths.runtime_warning`, never fatal. It is deliberately
+outside the install tree, because `install.ps1` robocopies over that tree (`paths.py:20-23`).
 
 | file | property | written by | read by |
 |---|---|---|---|
-| `supervisor.lock` | `paths.py:103-104` | held with `flock`/`LockFileEx` for the process's life (`supervisor.py:394-421`, `1040-1043`) | the next supervisor (single instance) |
-| `status.json` | `paths.py:107-108` | the supervisor (§3) | `Control.status()` |
-| `heartbeat` | `paths.py:111-119` | the supervisor, every write: `<counter> <iso>\n` (`supervisor.py:533`, `539`) | `Control.supervisor_responding()` / `_status_age()` (`control.py:161-173`, `196-205`) |
-| `cmd.json` | `paths.py:122-123` | `Control.send()` — temp file, fsync, `chmod 0600`, `os.replace` (`control.py:245-263`) | the supervisor's `_read_command()` (`supervisor.py:773-788`) |
-| `supervisor.pid` | `paths.py:126-127` | the supervisor once, at startup (`supervisor.py:1059`) | `install.ps1` (`Get-SupervisorState`) |
-| `supervisor.log` | `paths.py:130-132` | the supervisor: its own lifecycle lines (start, adopt/spawn, restart reason, signal, exit code) through `LogFile`, 2 MB, one rotation; stdout/stderr are appended to the same file by the launcher (`control.py:140`, `145-146`) | the operator, when the supervisor died before writing `status.json`, and for the chain of supervisors that came and went |
+| `supervisor.lock` | `paths.py:196-197` | held with `flock`/`LockFileEx` for the process's life (`supervisor.py:394-421`, `1040-1043`) | the next supervisor (single instance) |
+| `status.json` | `paths.py:200-201` | the supervisor (§3) | `Control.status()` |
+| `heartbeat` | `paths.py:204-212` | the supervisor, every write: `<counter> <iso>\n` (`supervisor.py:533`, `539`) | `Control.supervisor_responding()` / `_status_age()` (`control.py:161-173`, `196-205`) |
+| `cmd.json` | `paths.py:215-216` | `Control.send()` — temp file, fsync, `chmod 0600`, `os.replace` (`control.py:245-263`) | the supervisor's `_read_command()` (`supervisor.py:773-788`) |
+| `supervisor.pid` | `paths.py:219-220` | the supervisor once, at startup (`supervisor.py:1059`) | `install.ps1` (`Get-SupervisorState`) |
+| `supervisor.log` | `paths.py:223-225` | the supervisor: its own lifecycle lines (start, adopt/spawn, restart reason, signal, exit code) through `LogFile`, 2 MB, one rotation; stdout/stderr are appended to the same file by the launcher (`control.py:140`, `145-146`) | the operator, when the supervisor died before writing `status.json`, and for the chain of supervisors that came and went |
 
 **Why the heartbeat is a separate file.** `status.json` only changes when something changes, so
 it carries no freshness signal; the heartbeat is rewritten every cycle with a counter and a fresh
-mtime, and the UI reads *it* to tell "alive" from "wedged" (`paths.py:112-118`,
+mtime, and the UI reads *it* to tell "alive" from "wedged" (`paths.py:204-212`,
 `supervisor.py:534-539`, `control.py:196-201`). `Control.send()` accepts either acknowledgement:
 the command file disappearing, **or** the heartbeat counter advancing past the value it had when
 the command was written — the supervisor bumps the counter on the same tick it executes a command
@@ -199,8 +204,8 @@ name `<app-dir>/server.mjs` (`supervisor.py:271-288`). This is the same evidence
 Node's stdout and stderr are merged into `<app>\logs\shockbox-<local day>.log` through
 `LogFile`, which mirrors `core/log.mjs`: 8 MiB per generation, four kept (`supervisor.py:33-35`,
 `tools/tui/shockbox_tui/logtail.py:1-17`). The supervisor's own `launcher:` lines share that file
-(`supervisor.py:544-550`). The date is the **local** day (`paths.py:43-52`). A crash before
-`status.json` exists is visible only in `runtime\supervisor.log` (`paths.py:130-132`).
+(`supervisor.py:544-550`). The date is the **local** day (`paths.py:131-139`). A crash before
+`status.json` exists is visible only in `runtime\supervisor.log` (`paths.py:223-225`).
 
 `deploy/run.cmd` is a separate, manual path and writes both `shockbox-*.log` and
 `launcher-*.log` (`deploy/run.cmd:19-27`, `64`, `74`); the supervisor does not use it.
@@ -217,9 +222,9 @@ deploy\ShockBox-TUI.cmd            # == the desktop shortcut
 
 | flag | default | source |
 |---|---|---|
-| `--app-dir` | this repo (parent of `tools/tui`) | `app.py:1267`, `paths.py:38-40` |
+| `--app-dir` | this repo (parent of `tools/tui`) | `app.py:1267`, `paths.py:51-53` |
 | `--port` | `config.json`'s `port`, else 8972 | `app.py:1268`, `paths.py:31`, `settings.py:184-189` |
-| `--runtime-dir` | the per-user state dir | `app.py:1269`, `paths.py:68-77` |
+| `--runtime-dir` | machine-wide `%PROGRAMDATA%\ShockBox\runtime` on Windows, `~/.local/state/shockbox` elsewhere | `app.py:1269`, `paths.py:73-84` |
 | `--poll` | `1.5` s | `app.py:1270` |
 | `--no-start` | off — by default the window starts the server on open | `app.py:1271`, `1290-1294` |
 

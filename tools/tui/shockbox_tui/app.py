@@ -1266,7 +1266,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--app-dir", default=None, help="the ShockBox checkout holding server.mjs (default: this repo)")
     parser.add_argument("--port", type=int, default=None, help=f"the server's port (default: config.json, else {DEFAULT_PORT})")
-    parser.add_argument("--runtime-dir", default=None, help="where status.json/cmd.json/lock live (default: per-user state dir)")
+    parser.add_argument("--runtime-dir", default=None, help="where status.json/cmd.json/lock live (default: machine-wide ProgramData\\ShockBox\\runtime on Windows, ~/.local/state/shockbox elsewhere)")
     parser.add_argument("--poll", type=float, default=1.5, help="refresh period in seconds (default: 1.5)")
     parser.add_argument("--no-start", action="store_true", help="open the window without starting the server")
     return parser

@@ -59,7 +59,7 @@ from typing import Any
 
 from . import apiclient
 from .logtail import LogFile
-from .paths import Paths
+from .paths import HEARTBEAT_STALE_S, Paths
 
 # The restart policy of deploy/run.cmd, unchanged: 2s, 4s, 8s, 16s, 30s, 60s, then 60s while
 # crashes keep coming; a run that lasts HEALTHY_S resets it.
@@ -121,12 +121,18 @@ def pid_alive(pid: int | None) -> bool:
             import ctypes
 
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            ERROR_ACCESS_DENIED = 5
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
             if not handle:
-                return False
+                # Access denied is *evidence of a live pid we may not inspect*, not evidence of
+                # death: a non-elevated TUI cannot open a SYSTEM supervisor, and treating that
+                # as "dead" was what made it unlink a live supervisor's pid file (and fail to
+                # adopt a live node). Owner-agnostic: alive, just not readable.
+                return k32.GetLastError() == ERROR_ACCESS_DENIED
             exit_code = ctypes.c_ulong(0)
-            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            ctypes.windll.kernel32.CloseHandle(handle)
+            ok = k32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            k32.CloseHandle(handle)
             return bool(ok) and exit_code.value == 259  # STILL_ACTIVE
         os.kill(int(pid), 0)
         return True
@@ -254,54 +260,95 @@ def _listen_inodes(port: int) -> set[str]:
     return inodes
 
 
-def is_our_server(pid: int, app_dir: Path) -> bool:
-    """The install.ps1 Test-IsOurs rule: the command line runs *our* server.mjs.
+def shockbox_health(port: int, pid: int | None = None) -> dict:
+    """``/health`` that belongs to ``pid`` and answers as a ShockBox server, else ``{}``.
+
+    Owner-agnostic identity: HTTP needs no cross-account process access, so this is the one
+    probe that works when the listener runs as SYSTEM and its command line is unreadable.
+    ``service: shockbox`` is required as well as the pid — a stranger that happens to expose a
+    pid is not ours, so "cannot inspect" never turns into "it is ours".
+    """
+    try:
+        data = apiclient.ApiClient(port, timeout=2.0).health()
+    except (apiclient.ApiError, apiclient.ApiUnreachable):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if str(data.get("service") or "").lower() != "shockbox":
+        return {}
+    if pid is not None and int(data.get("pid") or 0) != int(pid):
+        return {}
+    return data
+
+
+def is_our_server(pid: int, app_dir: Path, port: int | None = None) -> bool:
+    """The install.ps1 Test-IsOurs rule, owner-agnostic.
 
     POSIX: the command line names ``<app-dir>/server.mjs`` (absolute, or relative to that
-    process's own cwd). A server this launcher did not start itself (an adoption candidate) must
-    pass this. Windows cannot read another process's command line without WMI/CIM, so there the
-    evidence is the listener pid answering /health with a ShockBox payload — and only after the
-    port was already confirmed to belong to that pid.
+    process's own cwd). A server this launcher did not start itself (an adoption candidate)
+    must pass this. Windows cannot read another process's command line without WMI/CIM, and a
+    SYSTEM process's command line is unreadable to the installing account, so there the
+    evidence is the listener pid answering ``/health`` with a ShockBox payload — only after the
+    port was already confirmed to belong to that pid. A stranger still fails: wrong pid or no
+    ``service: shockbox``. Without a port (a hint-only caller) the old Windows leniency stays.
     """
     mock = _mock_server_pid(pid, app_dir)
     if mock is not None:
         return True
     line = _proc_cmdline(pid)
-    if not line:
-        return False
-    if sys.platform == "win32":
-        return True
-    server_name = "server.mjs"
-    lowered = line.replace("\\", "/").lower()
-    if server_name not in lowered:
-        return False
-    app = app_dir.resolve()
-    absolute = str(app).replace("\\", "/").lower() + "/" + server_name
-    if absolute in lowered:
-        return True
-    # `node server.mjs` with the cwd set to the app dir: the brief's evidence as a relative
-    # invocation. Resolve it against the process's own cwd, not ours.
-    try:
-        cwd = Path(os.readlink(f"/proc/{int(pid)}/cwd")).resolve()
-    except OSError:
-        return False
-    try:
-        return (cwd / server_name).resolve() == (app / server_name).resolve()
-    except OSError:
-        return False
+    if line and sys.platform != "win32":
+        server_name = "server.mjs"
+        lowered = line.replace("\\", "/").lower()
+        if server_name not in lowered:
+            return False
+        app = app_dir.resolve()
+        absolute = str(app).replace("\\", "/").lower() + "/" + server_name
+        if absolute in lowered:
+            return True
+        # `node server.mjs` with the cwd set to the app dir: the brief's evidence as a relative
+        # invocation. Resolve it against the process's own cwd, not ours.
+        try:
+            cwd = Path(os.readlink(f"/proc/{int(pid)}/cwd")).resolve()
+        except OSError:
+            cwd = None
+        if cwd is not None:
+            try:
+                return (cwd / server_name).resolve() == (app / server_name).resolve()
+            except OSError:
+                pass
+    # Windows image name, or an unreadable command line: ask the port itself. This is also the
+    # cross-account case (SYSTEM node), where /health is readable but the process is not.
+    if port is not None:
+        return bool(shockbox_health(port, pid))
+    return sys.platform == "win32" and bool(line)
 
 
-def is_supervisor_process(pid: int | None) -> bool:
-    """True when ``pid`` is alive *and* looks like a ShockBox TUI supervisor.
+def is_supervisor_process(pid: int | None, runtime_dir: Path | None = None) -> bool:
+    """True when ``pid`` is alive *and* this runtime dir's supervisor, whoever owns it.
 
     A pid file is a hint, never proof: it outlives its writer (SIGKILL, or a machine that was
     rebooted) and the OS reuses pids, so trusting the number alone reported a supervisor that
-    did not exist. The test stays broad on purpose — the module name on POSIX, the image name
-    on Windows — because a wrapper, a venv shim and ``python -m`` all have to match, and it is
-    never the app dir. An unreadable command line is "unknown", not "not ours".
+    did not exist. Identity is now taken from evidence that works for every owner: the pid is
+    alive and the supervisor's heartbeat is fresh, with ``status.json`` naming the same pid when
+    it names one. The command line is only a fallback when no runtime dir is given: on Windows
+    a SYSTEM supervisor's command line is unreadable to the installing account, and requiring
+    it turned "cannot inspect" into "not ours" — which unlinked a live supervisor's pid file.
+    A stale heartbeat still fails, so a pid reused after a crash is not adopted.
     """
     if not pid_alive(pid):
         return False
+    if runtime_dir is not None:
+        try:
+            age = time.time() - (runtime_dir / "heartbeat").stat().st_mtime
+        except OSError:
+            return False
+        if age > HEARTBEAT_STALE_S:
+            return False
+        named = read_json(runtime_dir / "status.json").get("supervisor_pid")
+        try:
+            return not named or int(named) == int(pid)
+        except (TypeError, ValueError):
+            return False
     line = _proc_cmdline(int(pid))
     if not line:
         return True
@@ -772,7 +819,7 @@ class Supervisor:
         pid = self._listener_pid()
         if pid is None:
             return False
-        if not is_our_server(pid, self.paths.app_dir):
+        if not is_our_server(pid, self.paths.app_dir, self.port):
             self.status["last_error"] = f"port {self.port} is held by pid {pid}, which is not this install"
             self.note(self.status["last_error"])
             self._set_state("failed")
@@ -1097,6 +1144,10 @@ def main(argv: list[str] | None = None) -> int:
 
     paths = Paths.resolve(args.app_dir, args.runtime_dir)
     paths.ensure()
+    if paths.runtime_warning:
+        # Report, do not exit: a wrong-owner runtime dir is exactly the condition this fix is
+        # for, and a supervisor that refuses to start cannot be adopted by the other account.
+        print(f"shockbox supervisor: {paths.runtime_warning}", file=sys.stderr)
     life = lifecycle_log(paths)
     # Who owned this runtime before us. This is the line that names a silent replacement: a
     # supervisor dying unnoticed now leaves "start ... previous pid N (dead)" behind it.

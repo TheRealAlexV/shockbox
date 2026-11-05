@@ -32,13 +32,13 @@ from typing import Any
 from . import apiclient
 from .apiclient import ApiClient, ApiError, ApiUnreachable
 from .logtail import tail as _tail
-from .paths import DEFAULT_PORT, Paths
+from .paths import DEFAULT_PORT, HEARTBEAT_STALE_S, Paths
 from .settings import Settings, read_config
 
 NO_SUPERVISOR = "no-supervisor"
 # A supervisor rewrites its heartbeat at least every 2s; 12s of silence means wedged or dead.
 # Six intervals, so a paused VM, a loaded disk or a scheduler hiccup cannot fake a death.
-STATUS_STALE_S = 12.0
+STATUS_STALE_S = HEARTBEAT_STALE_S
 ACTION_TIMEOUT_S = 20.0
 
 
@@ -46,17 +46,21 @@ def _alive(pid: int | None) -> bool:
     """Process exists and is not a zombie."""
     if not pid:
         return False
+    if sys.platform == "win32":
+        # os.kill(pid, 0) on Windows *terminates* the target. Use the same owner-agnostic probe
+        # as the supervisor: an access-denied handle means alive-but-uninspectable, not dead.
+        from .supervisor import pid_alive
+
+        return pid_alive(int(pid))
     try:
         os.kill(int(pid), 0)
     except OSError:
         return False
-    if sys.platform != "win32":
-        try:
-            state = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            return state != "Z"
-        except (OSError, IndexError):
-            return True
-    return True
+    try:
+        state = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except (OSError, IndexError):
+        return True
 
 
 class ControlError(Exception):
@@ -128,10 +132,19 @@ class Control:
         02:46:34 relaunch. So a dead pid, a stale heartbeat, or a fresh heartbeat with no live
         pid all mean spawn.
 
+        The pid is taken from wherever this account can read it: the published pid file, or
+        ``status.json`` (which the supervisor writes with its own ``os.getpid()``). No command
+        line is inspected, so a supervisor owned by SYSTEM is adopted exactly like one owned by
+        this account — the account that owns the process is not part of the contract.
+
         Two TUI instances racing here is harmless: the supervisor's OS lock lets exactly one
         win, and the loser exits immediately.
         """
         self.paths.ensure()
+        if self.paths.runtime_warning:
+            # Reported once per start: a runtime dir split by account is the root cause of the
+            # double-supervisor failure, and it is not something the code can fix silently.
+            self._life_note(f"runtime dir: {self.paths.runtime_warning}")
         pid = self.supervisor_pid()
         fresh = self.supervisor_responding()
         if pid and fresh:
@@ -240,9 +253,10 @@ class Control:
         One sat in this runtime dir from 2026-10-30 naming a pid that had been dead for days,
         while the live supervisor published a different number — the same class of lie as
         trusting a command line, in reverse. The number is believed only when that pid is alive
-        *and* names this package (``install.ps1``/``uninstall.ps1`` apply the same rule);
-        otherwise the file is removed, so the next reader sees "nothing published" instead of a
-        supervisor that does not exist.
+        *and* this runtime dir's heartbeat is fresh; no command line is read, because a SYSTEM
+        supervisor's is unreadable to the installing account and "unreadable" must not mean
+        "not ours" (that deleted a live supervisor's pid file). A stale heartbeat still means
+        the file is a lie, so the next reader sees "nothing published".
         """
         try:
             pid = int(self.paths.supervisor_pid_file.read_text(encoding="ascii").strip() or "0")
@@ -252,7 +266,7 @@ class Control:
             return None
         from .supervisor import is_supervisor_process
 
-        if is_supervisor_process(pid):
+        if is_supervisor_process(pid, self.paths.runtime_dir):
             return pid
         try:
             self.paths.supervisor_pid_file.unlink()
