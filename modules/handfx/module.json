@@ -82,7 +82,15 @@
       "default": "WebcamSwitcher Virtual Camera (Windows Virtual Camera)",
       "maxLength": 200,
       "label": "Camera relay source (ffmpeg dshow device name)",
-      "help": "The DirectShow friendly name ffmpeg opens, exactly as dshow lists it. WebcamSwitcher's virtual camera works while the app holds the physical camera; a real camera name works only when nothing else has it open. The short name fails with \"Could not find video device\".",
+      "help": "The DirectShow friendly name ffmpeg opens, exactly as dshow lists it. Used only by the dshow capture path; the pipe path reads WebcamSwitcher's frame pipe instead.",
+      "group": "general"
+    },
+    "cameraRelayCapture": {
+      "type": "enum",
+      "default": "auto",
+      "values": ["auto", "pipe", "dshow"],
+      "label": "Camera relay capture: auto | pipe | dshow",
+      "help": "auto reads WebcamSwitcher's frame pipe first and falls back to the dshow device only after a pipe attempt fails, recording both the mode in use and why the pipe was abandoned on /api/handfx/status. pipe and dshow force one path. The pipe path is the one that works when the Media Foundation virtual device delivers no packets.",
       "group": "general"
     },
     "cameraRelayFps": {

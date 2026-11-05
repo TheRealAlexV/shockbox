@@ -260,9 +260,10 @@ function build(ctx) {
   // The ShockBox Virtual Camera pipe (publish-pipe.mjs). `off` opens nothing at all: no listener,
   // no buffer, no conversion. The pane's select is the only writer; the page sends the pictures.
   const pipe = createPublisher({ log });
-  // The camera feed the overlay page cannot open itself: ffmpeg reads the device WebcamSwitcher
-  // holds and this relays JPEG frames over multipart. Nothing spawns until a client asks for the
-  // stream, and `cameraRelay: off` never spawns at all.
+  // The camera feed the overlay page cannot open itself. ffmpeg either reads WebcamSwitcher's frame
+  // pipe (`capture: auto|pipe`) or the dshow device it publishes (`dshow`); this relays JPEG frames
+  // over multipart. Nothing spawns until a client asks for the stream, and `cameraRelay: off` never
+  // spawns at all.
   const relay = createCameraRelay({
     log,
     read: () => ({
@@ -271,6 +272,7 @@ function build(ctx) {
       fps: settings.get('cameraRelayFps'),
       size: settings.get('cameraRelaySize'),
       ffmpegPath: settings.get('ffmpegPath'),
+      capture: settings.get('cameraRelayCapture'),
     }),
   });
   const unsubRelay = settings.subscribe((changed) => {

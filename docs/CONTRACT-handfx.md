@@ -122,6 +122,53 @@ loads `js/overlay/main.js?v=<build>` (the inline loader in `pages/overlay.html` 
 ack). A document OBS kept alive across a deploy reports the old build, so the mismatch is visible
 instead of reading healthy.
 
+### Camera relay capture (`cameraFeed`)
+
+The overlay page cannot open a virtual device, so the server runs one ffmpeg and relays its MJPEG
+output over multipart. There are two input paths, chosen by the `cameraRelayCapture` setting:
+
+| setting value | behaviour |
+|---|---|
+| `auto` (default) | try the switcher's frame pipe first; fall back to the dshow device **only after a pipe attempt fails**, recording `capture.fallback` |
+| `pipe` | use the pipe only; a failure is an error and is retried with the same 1 s → 10 s backoff |
+| `dshow` | use `ffmpeg -f dshow -i video="<cameraRelaySource>"` only (the original path) |
+
+Pipe mode reads `\\.\pipe\WebcamSwitcher.Frames.v1` (per-device variants add `.p<slot>`), the
+publisher documented in WebcamSwitcher's `WebcamSwitcherProtocol.h`. `#pragma pack(1)`, little-endian,
+no subscribe handshake: connect and the server pushes a config message, then frames.
+
+| message | payload |
+|---|---|
+| header (12 B) | magic `0x57564353`, version `1`, type, `payloadLen` |
+| `type=1` config (24 B) | width, height, stride, format, fpsNum, fpsDen — sent once per connection |
+| `type=2` frame (`40 + payloadBytes`) | sequence, timestampQpc, width, height, stride, format, payloadBytes, flags, then raw **NV12** pixels (`w*h*3/2`, stride == width, top-down) |
+
+The relay parses by declared length across arbitrary chunk boundaries, refuses a non-NV12 or padded
+config, and feeds the payloads to `ffmpeg -f rawvideo -pix_fmt nv12 -s <w>x<h> -framerate <n>/<d>
+-i pipe:0` with the same `-vf fps`, `-s`, `-f mjpeg -q:v 5` output. At most one frame may sit in
+ffmpeg's stdin write buffer: beyond it the newest frame is dropped and counted (`inputDropped`), never
+queued. `flags & 1` is `NoSignal` (a black frame) and is fed normally, because it proves the
+publisher is alive and must not trip the stall watchdog.
+
+`/api/handfx/status.cameraFeed` keeps its existing fields (`state`, `source`, `fps`, `size`, `frames`,
+`dropped`, `clients`, `lastFrameAt`, `stale`, `error`) and adds:
+
+| field | meaning |
+|---|---|
+| `capture.setting` | `auto` \| `pipe` \| `dshow`, as configured |
+| `capture.mode` | `pipe` \| `dshow` \| `null` — the path actually running, never the one merely configured |
+| `capture.pipe` | the pipe name this relay reads |
+| `capture.format` | `nv12` once a config message was accepted, else `null` |
+| `capture.width` / `capture.height` / `capture.fps` | the publisher's negotiated geometry and rate (`"30/1"`), `null` before config |
+| `capture.inputFrames` | messages of type 2 accepted from the publisher |
+| `capture.inputDropped` | frames refused because ffmpeg's stdin was backed up (or pre-spawn) |
+| `capture.lastInputAt` | when the last publisher frame arrived |
+| `capture.fallback` | the pipe failure `auto` recorded before choosing dshow; `null` when the pipe works or was never tried |
+
+A pipe failure is reported in `error` with the pipe name and the reason (`connect failed (ENOENT…)`,
+`connected but no config in 3 s`, `publisher closed the connection`, `protocol error: …`). It is never
+a silent switch to dshow: the mode in use and the fallback reason are on every status read.
+
 ### Merge semantics (what wins when a page and the document disagree)
 
 The page receives settings on two paths — the snapshot/`/status` seed and every `settings` bus
