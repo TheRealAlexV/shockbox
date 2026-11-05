@@ -550,6 +550,13 @@ html.preview #stage {
   overflow: visible;
 }
 
+/* Keep the dialog at its live layout width and let the scale shrink it as a whole: a 9:16 stage
+ * in a pane card is narrower than the buttons' min-width, and a clamped card would reflow and
+ * clip them instead of showing what the portrait stage really looks like. */
+html.preview .dialog {
+  max-width: none;
+}
+
 html.preview .dialog.in {
   transform: scale(var(--preview-scale, 1));
   transform-origin: center center;

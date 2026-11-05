@@ -337,12 +337,38 @@ function fitPreview() {
   document.documentElement.style.setProperty('--preview-scale', String(Math.max(0.1, scale)));
 }
 
+// Draw the sample with the module's current look. GET /api/dialogs/live is the same read-only
+// snapshot the live page opens with; only its look fields reach `apply`, so the preview cannot
+// preload the alert clip and never writes. A slow or absent hub falls back to the page's own
+// defaults (win11, 16:9) instead of leaving the pane blank.
+function drawPreview(snapshot) {
+  const settings = snapshot && snapshot.settings;
+  apply({
+    ratio: snapshot && snapshot.ratio === '9:16' ? '9:16' : '16:9',
+    settings: settings && settings.theme ? { theme: settings.theme, scale: settings.scale } : undefined,
+    live: [PREVIEW_ALERT],
+  });
+  // `apply` rewrites the root class for the skin, so the preview flag is re-asserted after it.
+  document.documentElement.classList.add('preview');
+  requestAnimationFrame(fitPreview);
+}
+
 if (preview) {
   document.documentElement.classList.add('preview');
-  apply({ ratio: '16:9', live: [PREVIEW_ALERT] });
-  // The card is appended synchronously; one frame later it has its laid-out size and the enter
-  // transition has started. Re-fit on resize so a pane that grows or shrinks keeps it visible.
-  requestAnimationFrame(fitPreview);
+  let drawn = false;
+  const draw = (snapshot) => {
+    if (drawn) return;
+    drawn = true;
+    drawPreview(snapshot);
+  };
+  // Read-only read, bounded: abort after 1.5 s and draw the defaults rather than stay empty.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1500);
+  fetch('/api/dialogs/live', { signal: ctrl.signal })
+    .then((r) => r.json())
+    .then(draw)
+    .catch(() => draw(null))
+    .finally(() => clearTimeout(timer));
   new ResizeObserver(() => requestAnimationFrame(fitPreview)).observe(root);
 } else {
   fetch('/api/dialogs/live')
