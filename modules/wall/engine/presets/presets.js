@@ -93,7 +93,7 @@
 
     // Text / signage.
     sign: {
-      gridCols: 96, gridRows: 0,
+      gridCols: 112, gridRows: 0,
       // Text lives in the per-view blocks now (v2.1), so each page renders its
       // own layout: 16:9 is wide and roomy, 9:16 stacks shorter lines.
       views: {
