@@ -37,15 +37,21 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
  * at runtime would fall back to a constant there and never catch a stale bundle). The page is
  * loaded with `?v=<BUILD>`, so a document left running from yesterday keeps yesterday's value and
  * `/status.buildMatches` goes false.
+ *
+ * The identity is the *content*, so everything fed into the hash must be platform-free: the name
+ * goes in as a POSIX path (a Windows `path.relative` returns `pages\js\...`, which used to make
+ * the rig's install hash differently from a checkout of the same commit) and the sort is by code
+ * unit, not `localeCompare` (which reads the process locale). Only `pages/` — the bundle the
+ * browser runs — is hashed; `vendor/`, `models/` and anything else outside it is not source.
  */
 function bundleBuild() {
   const h = crypto.createHash('sha256');
   const walk = (dir) => {
-    const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of entries) {
       const file = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(file);
-      else h.update(path.relative(HERE, file)).update('\0').update(fs.readFileSync(file));
+      else h.update(path.relative(HERE, file).split(/[\\/]/).join('/')).update('\0').update(fs.readFileSync(file));
     }
   };
   try {
