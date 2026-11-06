@@ -334,9 +334,35 @@ export async function render(container, ctx) {
     return { tone: 'idle', text: 'nothing drawn yet' };
   }
 
+  /**
+    * The overlay's paint loop, from /status (`renderLoop`, computed there from the page's own paint
+    * clock). `stale` used to cover two different faults at once: a page that stopped reporting and a
+    * page Chrome stopped compositing. `running` is the healthy reading; `stopped` is a page alive and
+    * acking whose document gets no frames — an occluded OBS source draws nothing on air, which is not
+    * an error in the page and must not read as one; `unknown` is no page reporting, so nothing is
+    * known about its loop. The `why` comes from what the page itself last reported (`hidden`,
+    * `visibility`) so the operator never has to guess which of the two happened.
+    */
+  function renderLoop() {
+    const st = s.status || {};
+    const loop = st.renderLoop || 'unknown';
+    const idle = Number(st.loopIdleMs);
+    if (loop === 'running') return { tone: 'ok', text: 'running' };
+    if (loop === 'unknown') return { tone: 'idle', text: 'unknown', note: 'no page reporting, so its loop is unknown' };
+    const why = st.hidden === true ? 'page hidden'
+      : (st.visibility && st.visibility !== 'visible') ? `page ${st.visibility}`
+        : 'page not painting';
+    return {
+      tone: 'warn',
+      text: 'stopped',
+      note: Number.isFinite(idle) ? `${why}, not painting — last frame ${Math.round(idle / 1000)} s ago` : `${why}, not painting`,
+    };
+  }
+
   function trackingCard() {
     const card = el('section', { class: 'panel' });
     const src = effectiveSource();
+    const loop = renderLoop();
     card.append(el('div', { class: 'panel-head' },
       el('span', { class: 'panel-title', text: 'Tracking' }),
       el('span', { class: 'hfx-pill', 'data-tone': src.tone, text: src.text }),
@@ -348,6 +374,10 @@ export async function render(container, ctx) {
       // that fell back to the rig is visible without reading the camera error.
       row('hand source', selectControl('trackingSource', s.settings.trackingSource || 'auto', (s.status?.settings?.trackingSource?.values) || ['auto', 'camera', 'synthetic'], (v) => patch('trackingSource', v))),
       ...(src.why ? [el('div', { class: 'hfx-note', text: `camera: ${String(src.why).slice(0, 160)}` })] : []),
+      // The paint loop beside the source that feeds it: the page can be alive and acking while its
+      // document gets no frames, and the rows above would still read healthy without this.
+      row('render loop', el('span', { class: 'hfx-pill', 'data-tone': loop.tone, text: loop.text })),
+      ...(loop.note ? [el('div', { class: 'hfx-note', text: loop.note })] : []),
       // The source (the overlay page) and this preview read the same flag, so the operator can
       // never tune effects that the OBS source is not drawing.
       row('effects in OBS', switchControl('obsHandFx', s.settings.obsHandFx !== false, async (v) => patch('obsHandFx', v))),

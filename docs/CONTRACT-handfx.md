@@ -45,7 +45,7 @@ are getters that build the API on first touch (`self(ctx)`), because the context
 
 | method | path | params | reply |
 |---|---|---|---|
-| GET | `/status` | — | `{cmds[], effects[{id,title,gesture,from}], model{local,name,url}, bodyModels{pose,segmenter,local}, body{lastMaskAt,pageOpen,lastPoseAt}, trackingSource, effectiveSource, lastAckedSource, stale, staleForMs, build, clientBuild, buildMatches, draws, anchors, lastDrawAt, lastAckAt, runtime{vendored,simdWasm,nosimdWasm,base}, page, bodyPage, isolation{…}, settings, lastCmd}` |
+| GET | `/status` | — | `{cmds[], effects[{id,title,gesture,from}], model{local,name,url}, bodyModels{pose,segmenter,local}, body{lastMaskAt,pageOpen,lastPoseAt}, trackingSource, effectiveSource, lastAckedSource, stale, staleForMs, build, clientBuild, buildMatches, draws, anchors, lastDrawAt, lastAckAt, renderLoop, loopIdleMs, loopTicks, lastLoopAt, hidden, visibility, runtime{vendored,simdWasm,nosimdWasm,base}, page, bodyPage, isolation{…}, settings, lastCmd}` |
 | GET | `/build` | — | `{build}` — the bundle id the page loads with (`?v=`) and reports on `/ack` |
 | PATCH | `/settings` | any subset of the settings keys | `{ok, changed[], settings}`; an effect id the registry does not know → 400 |
 | POST | `/cmd` | `{cmd, args?}` | `{ok, seq}`; document-owning commands add `changed`, `enabled` or `mirror` plus `settings`; unknown `cmd` → 400 |
@@ -107,12 +107,59 @@ two fingertips do. The pane row and the setting are gone; the page keeps `palmTo
 `effectiveSource:"synthetic"` is the camera fallback — read `cameraError`/`relayError`/
 `cameraSource` for why — not the operator choosing synthetic.
 
-**Freshness and build identity.** `lastAckAt` and `lastDrawAt` are the page's own stamps, and both
-ride its render loop. When the newer of the two is older than `PAGE_STALE_MS = 5000`
-(`server.js`), `/status` reports `stale: true` with `staleForMs`, and `effectiveSource` becomes
-`"stale"`; the last value the page actually acked is kept in `lastAckedSource` so nothing pretends
-to know what the page is doing now. Before any ack (`lastAckAt = 0`) the source stays `none`, never
-`stale` — a pane preview alone reports `none`.
+**Freshness and build identity.** `lastAckAt` is the page's own beat; `lastDrawAt` is its last drawn
+frame. The beat does **not** ride the render loop: `main.js` posts `/ack` from a `setInterval`
+(`ACK_MS = 500`), because Chrome delivers no `requestAnimationFrame` to a document it is not
+compositing — an occluded OBS source, or a hidden tab. `lastAckAt` advancing therefore means the page
+is alive, and nothing more; whether it is drawing is `renderLoop` (below). When `lastAckAt` is older
+than `PAGE_STALE_MS = 5000` (`server.js`), `/status` reports `stale: true` with `staleForMs`, and
+`effectiveSource` becomes `"stale"`; the last value the page actually acked is kept in
+`lastAckedSource` so nothing pretends to know what the page is doing now. Before any ack
+(`lastAckAt = 0`) the source stays `none`, never `stale` — a pane preview alone reports `none`.
+
+### Render loop (`renderLoop`)
+
+Beside the beat, the page reports its paint clock on `/ack`:
+
+| `/ack` field | meaning |
+|---|---|
+| `loopTicks` | frames the loop has begun; a monotonic counter (the server keeps the highest value seen) |
+| `lastLoopAt` | `Date.now()` of the newest tick |
+| `hidden` | `document.hidden` when the ack was posted (`null` until the first) |
+| `visibility` | `document.visibilityState` when the ack was posted (`visible`, `hidden`) |
+
+`/status` reads that clock as one value rather than leaving the operator to compare two timestamps:
+
+| `/status` field | meaning |
+|---|---|
+| `renderLoop` | `running` \| `stopped` \| `unknown` |
+| `loopIdleMs` | ms since `lastLoopAt`; `null` before the first tick |
+| `loopTicks`, `lastLoopAt`, `hidden`, `visibility` | the last values the page reported, `0`/`null`/`''` before any |
+
+`LOOP_STALE_MS = 2000` (`server.js`) is the threshold. The loop runs at display rate, so 2 s is over
+a hundred missed frames — past a GC pause, and short enough that the operator sees it before air. It
+is deliberately independent of `PAGE_STALE_MS`: a page can be alive and acking while Chrome gives its
+document nothing to draw, and those two facts must stay separable.
+
+| `renderLoop` | computed as | what the operator sees in the pane (Tracking → `render loop`) |
+|---|---|---|
+| `running` | ack fresh and `loopIdleMs <= LOOP_STALE_MS` | green `running` pill, no note |
+| `stopped` | ack fresh, a tick exists, `loopIdleMs > LOOP_STALE_MS` | amber `stopped` pill and `page hidden, not painting — last frame 42 s ago` |
+| `unknown` | no ack ever, the last ack older than `PAGE_STALE_MS`, or a fresh ack that has never carried a tick (`lastLoopAt = 0`) | neutral `unknown` pill and `no page reporting, so its loop is unknown` |
+
+`stopped` is not an error: the page is up and reporting honestly, its document simply is not being
+composited, so the why is read from `hidden`/`visibility` rather than guessed from the gap. `unknown`
+says only that nothing is known — no page ever reported, or the page stopped reporting — and must
+never be read as `running`.
+
+**One trap this will hit again.** Chrome applies *intensive timer throttling* to a document that has
+been hidden for a long time: after roughly five minutes hidden, timers are aligned to about once per
+minute. An OBS source left occluded that long acks around once a minute, `lastAckAt` ages past
+`PAGE_STALE_MS`, and `/status` reads `stale` with `renderLoop: "unknown"` again — the loop was
+already `stopped`, and the throttle is why even the timer-driven beat slowed down. That is the
+throttle, not a dead page and not a regression in the beat; do not "fix" it by putting `/ack` back on
+`requestAnimationFrame`, which is exactly the fault the timer replaced. A source that must keep
+reporting has to stay visible.
 
 `build` is this server's bundle id: a sha-256 over `modules/handfx/pages/**`, derived at startup
 (the Windows deploy excludes `.git`, so a runtime sha would fall back to a constant). The page
@@ -194,7 +241,7 @@ event — and the renderer merges each one onto what it already has in `setSetti
 
 | route | file | expects |
 |---|---|---|
-| `/shockfx` | `pages/overlay.html` + `js/overlay/main.js` | isolated document; camera + MediaPipe `HandLandmarker`; SSE `/events?channels=handfx`; reads `/api/handfx/status`; posts `/ack` with effect/tracking/model/hands/gesture; receives body masks from the body page over its own channel |
+| `/shockfx` | `pages/overlay.html` + `js/overlay/main.js` | isolated document; camera + MediaPipe `HandLandmarker`; SSE `/events?channels=handfx`; reads `/api/handfx/status`; posts `/ack` with effect/tracking/model/hands/gesture plus the paint clock (`loopTicks`, `lastLoopAt`, `hidden`, `visibility`) from a 500 ms timer, not from the loop; receives body masks from the body page over its own channel |
 | `/shockfx/body` | `pages/body.html` | isolated; MediaPipe pose + selfie segmenter; posts `{source:'body', open:true}` to `/ack` as a heartbeat; sends the mask to the overlay page |
 
 Engine modules (`pages/js/engine/`), importable by page and pane: `tracker.js` (camera, MediaPipe,
@@ -253,7 +300,10 @@ order, skin switch, per-device camera list, settings form (`PATCH /api/handfx/se
 through `POST /api/handfx/cmd`, `/status` polling. The Tracking card has a `hand source` select
 (`auto`|`camera`|`synthetic`, persisted like the underlay switch) and a pill that reads
 `/status.effectiveSource` — e.g. `synthetic — auto fallback (…cameraError…)` — so `auto` that fell
-back to the rig is visible, not implied.
+back to the rig is visible, not implied. Beside it, a `render loop` row reads `/status.renderLoop` in
+the same pill-and-note language: `running` (ok), `stopped` (warn, with `hidden`/`visibility` and
+`loopIdleMs` in the note), `unknown` (idle, no page reporting). A stopped loop is shown as a warning,
+not an error, because an occluded source is a normal condition on air.
 
 ## Preview isolation (`?preview=1`)
 
@@ -270,7 +320,8 @@ preview is a viewer, never a source:
 - the pane labels it (`synthetic hands, underlay off in this preview`) rather than pretending the
   preview is the OBS source, and it shows the 9:16 collision fence the particles collide with.
 
-With only a preview open, `/status` reports `draws: 0`, `effectiveSource: "none"`.
+With only a preview open, `/status` reports `draws: 0`, `effectiveSource: "none"`,
+`renderLoop: "unknown"` (a preview never acks, so there is no paint clock to read).
 
 ## Honest states (page and pane must not fake these)
 
@@ -278,6 +329,8 @@ With only a preview open, `/status` reports `draws: 0`, `effectiveSource: "none"
   messages, never "tracking" when it is not.
 - model: `idle`, `loading`, `ready`, `failed`, `cached` (downloaded from the CDN once).
 - no hands is `hands: 0, gesture: 'none'`.
+- render loop: `running`, `stopped` (page alive, not painting — name `hidden`/`visibility` and
+  `loopIdleMs`), `unknown` (no page). `stopped` is never shown as an error and never as healthy.
 - synthetic replay is labelled as such; `auto` failing over to it is shown as a fallback, not as a
   chosen mode.
 

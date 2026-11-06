@@ -60,6 +60,13 @@ export const BUILD = bundleBuild();
 
 /** A page that has not acked for this long is not reporting what it is doing: its source is `stale`. */
 const PAGE_STALE_MS = 5000;
+/**
+ * A render loop silent for this long is not ticking. The loop runs at display rate (60+/s); 2 s is
+ * over a hundred missed frames, well past a GC pause, and short enough that an operator sees it
+ * before the show does. Its beat is independent of `PAGE_STALE_MS`: the page can be alive and
+ * reporting while Chrome gives its document no frames to draw.
+ */
+const LOOP_STALE_MS = 2000;
 
 /**
  * Every command the bus accepts. `reload` and the effect cursor are handled by the page;
@@ -247,8 +254,13 @@ function build(ctx) {
   // the body page's own /ack. Read back on /status so the pane can say whether a mask is arriving.
   const body = { lastMaskAt: 0, pageOpen: false, lastPoseAt: 0 };
   // The overlay's draw truth, reported on /ack: how many frames it rendered, where the anchors came
-  // from, and when the last frame landed. Counters and a name, never a frame.
-  const draw = { draws: 0, anchors: 'none', lastDrawAt: 0, lastAckAt: 0, build: '' };
+  // from, and when the last frame landed. Counters and a name, never a frame. `loopTicks`/
+  // `lastLoopAt` are the paint clock beside /ack: they freeze when Chrome stops compositing the
+  // document, while `lastAckAt` keeps moving, which is what separates "not drawing" from "gone".
+  const draw = {
+    draws: 0, anchors: 'none', lastDrawAt: 0, lastAckAt: 0, build: '',
+    loopTicks: 0, lastLoopAt: 0, hidden: null, visibility: '',
+  };
   // Why the overlay's camera did not open (the page's own diagnostic object), the label of the
   // device it did open, which pipe is carrying frames (relay | device | synthetic | none) and why
   // the relay is not it. Reported on /ack, read back on /status; never a frame.
@@ -298,13 +310,23 @@ function build(ctx) {
     relay.sync();
     const s = settings.all();
     const model = findModel();
-    // Freshness: an ack (or draw stamp) older than 5 s is not this page's current answer. Both
-    // ride the page's render loop, so a hidden/paused OBS source goes stale on both. `none` stays
-    // `none` (no page ever reported — e.g. only the preview iframe is open), never `stale`.
+    // Freshness: an ack (or draw stamp) older than 5 s is not this page's current answer. The
+    // overlay's beat is its own timer (`main.js` heartbeat), so `stale` now means the page itself
+    // stopped reporting — a gone page — and not a document Chrome declined to paint. That case is
+    // `renderLoop: 'stopped'` below. `none` stays `none` (no page ever reported — e.g. only the
+    // preview iframe is open), never `stale`.
     const now = Date.now();
     const beat = Math.max(draw.lastAckAt, draw.lastDrawAt);
     const stale = beat > 0 && now - beat > PAGE_STALE_MS;
     const staleForMs = stale ? now - beat : 0;
+    // The paint clock, read as its own state. `ackFresh` is the difference that matters: an acking
+    // page whose loop is silent is alive and not painting (an occluded OBS source — Chrome sends a
+    // document it does not composite no `requestAnimationFrame` at all), which is a real fault on
+    // air and must not read as `stale`. `unknown` is the honest answer when no page ever reported,
+    // or when the page stopped reporting altogether: then nothing is known about its loop.
+    const loopIdleMs = draw.lastLoopAt > 0 ? Math.max(0, now - draw.lastLoopAt) : null;
+    const ackFresh = draw.lastAckAt > 0 && now - draw.lastAckAt <= PAGE_STALE_MS;
+    const renderLoop = !ackFresh || draw.lastLoopAt === 0 ? 'unknown' : loopIdleMs > LOOP_STALE_MS ? 'stopped' : 'running';
     return {
       cmds: CMDS,
       effects: EFFECTS,
@@ -332,9 +354,16 @@ function build(ctx) {
       draws: draw.draws,
       anchors: draw.anchors,
       lastDrawAt: draw.lastDrawAt,
-      // The page's own beat: `draws` frozen with this fresh is a page that cannot paint (hidden
-      // OBS source), not a dead page. Both frozen is a page that stopped ticking.
+      // The page's own beat: fresh here with `draws` frozen is a page that cannot paint. `renderLoop`
+      // is that reading done properly — `running` | `stopped` | `unknown` — with `loopIdleMs` and
+      // `hidden` saying how long and whether Chrome has marked the document as not composited.
       lastAckAt: draw.lastAckAt,
+      renderLoop,
+      loopIdleMs,
+      loopTicks: draw.loopTicks,
+      lastLoopAt: draw.lastLoopAt,
+      hidden: draw.hidden,
+      visibility: draw.visibility || null,
       // The overlay's camera answer: why it did not open (object or null) and what it did open.
       cameraError: camera.error,
       cameraLabel: camera.label,
@@ -537,12 +566,21 @@ function build(ctx) {
           if (Number.isFinite(bodyIn.lastDrawAt) && bodyIn.lastDrawAt > draw.lastDrawAt) {
             draw.lastDrawAt = Math.min(Date.now(), bodyIn.lastDrawAt);
           }
+          // The paint clock: monotonic ticks and their last wall-clock stamp. A page reports these
+          // whether or not it is painting, which is the whole point — a frozen pair here next to a
+          // fresh `lastAckAt` is a document Chrome is not compositing, not a dead page.
+          if (Number.isFinite(bodyIn.loopTicks)) draw.loopTicks = Math.max(draw.loopTicks, Math.max(0, bodyIn.loopTicks | 0));
+          if (Number.isFinite(bodyIn.lastLoopAt) && bodyIn.lastLoopAt > draw.lastLoopAt) {
+            draw.lastLoopAt = Math.min(Date.now(), bodyIn.lastLoopAt);
+          }
+          if (typeof bodyIn.hidden === 'boolean') draw.hidden = bodyIn.hidden;
+          if (typeof bodyIn.visibility === 'string' && bodyIn.visibility.length <= 16) draw.visibility = bodyIn.visibility;
           // The bundle this document was loaded from (`?v=`), so a page left running across a
           // deploy is visible as a mismatch instead of looking healthy. Bounded: it is status.
           if (typeof bodyIn.build === 'string' && bodyIn.build) draw.build = bodyIn.build.slice(0, 64);
-          // When the page last spoke at all. `draws` only moves while the page paints, so a paused
-          // browser source freezes it; this stamp keeps "ticking but not painting" readable from
-          // /status instead of looking like a dead page next to live camera frames.
+          // When the page last spoke at all. It is the page's own timer (`main.js` heartbeat), not
+          // its render loop, so this stamp keeps moving in a document Chrome refuses to composite;
+          // `draws`/`loopTicks` are what stay frozen there.
           draw.lastAckAt = Date.now();
           // Per-frame publish cost, as the page measured it: readback, conversion, upload and the
           // round trip. Clamped numbers only, so /status cannot carry a page's stray strings.

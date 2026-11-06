@@ -89,6 +89,11 @@ const state = {
   anchors: 'none', // camera | synthetic | none — where the current frame's anchors came from
   draws: 0, // frames the renderer actually drew: the loop's own counter, reported on /ack
   lastDrawAt: 0,
+  // The paint clock, reported beside `draws`: a monotonic tick count and its wall-clock stamp.
+  // They are what lets /status tell "page alive, loop stopped" from "page gone" — the two used to
+  // look identical because the loop also carried the ack.
+  loopTicks: 0,
+  lastLoopAt: 0,
   lastAck: 0,
   startedAt: Date.now(),
   bodyAt: 0, // last body-mask message (performance.now)
@@ -943,6 +948,13 @@ function ack(now = performance.now()) {
       draws: state.draws,
       anchors: state.anchors,
       lastDrawAt: state.lastDrawAt,
+      // The paint clock itself, not just its output: `loopTicks` frozen with `lastAckAt` fresh is
+      // a page whose document is not being composited (Chrome delivers no rAF to it), which is a
+      // different fault from a dead page. `hidden` says whether Chrome has marked the document so.
+      loopTicks: state.loopTicks,
+      lastLoopAt: state.lastLoopAt,
+      hidden: document.hidden,
+      visibility: document.visibilityState,
       // Where a slow publish frame goes: compose, readback, NV12 conversion, upload. Numbers only.
       publishTiming: publisher.timing(),
     }),
@@ -1053,6 +1065,10 @@ function loop(now) {
   // One frame may fail (a GL hiccup, a body bitmap, a broken effect); the loop may not. The frame
   // is what the page has instead of a sign of life, so the next one is always scheduled, and the
   // throw still reaches the console instead of being swallowed here.
+  // The paint clock, stamped before anything can throw: /ack reports both, so the server can say
+  // "not ticking" without guessing.
+  state.loopTicks += 1;
+  state.lastLoopAt = Date.now();
   try {
     // The body mask expires 1 s after its last message; checked twice a second, not per frame.
     if (now - bodyTickAt > 500) {
@@ -1091,13 +1107,28 @@ function loop(now) {
     // `onFrame` was driven by this page's own rAF, so its `/ack` beat came free; a relayed frame
     // instead arrives from the stream reader (relay.js `drain`), and a reader that stalls (or a
     // throw inside `onFrame` before its own ack) left the loop drawing and counting while
-    // `/ack` went quiet, so `/status` showed a frozen `draws` next to a live `publish`. The loop
-    // is what counts draws, so the loop reports them; ack() still throttles to 2/s.
-    ack(now);
+    // `/ack` went quiet, so `/status` showed a frozen `draws` next to a live `publish`.
+    //
+    // /ack is NOT called here any more. It rode this loop, and this loop only exists while Chrome
+    // paints the document: an occluded OBS source delivers no rAF, so the beat went silent while
+    // the page was alive, and /status said `stale` — the wrong fact, hiding the true one (nothing
+    // is being drawn). The beat is the timer below; this loop only reports its own clock.
   } finally {
     requestAnimationFrame(loop);
   }
 }
+
+/**
+ * The liveness beat: a timer, deliberately not the render loop.
+ *
+ * Chrome delivers no `requestAnimationFrame` to a document it is not compositing — a hidden tab,
+ * and an OBS browser source whose layer nothing can see. Timers keep running there (measured at
+ * this repo: rAF +0 in 3 s while setInterval advanced), so the page can still report honestly:
+ * `draws`/`loopTicks` frozen says the loop is stopped, `lastAckAt` advancing says the page is not
+ * gone. `ack()` keeps its own 2/s throttle, so a burst of event-driven calls changes nothing.
+ */
+const ACK_MS = 500;
+if (!PREVIEW) setInterval(() => ack(), ACK_MS);
 
 /* ---------------------------------------------------------------- buttons */
 
