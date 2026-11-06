@@ -33,6 +33,14 @@
     }
   },
   "pages": [
-    { "route": "/dialogs", "title": "Alert overlay", "file": "overlay/index.html" }
+    {
+      "route": "/dialogs",
+      "title": "Alert overlay",
+      "file": "overlay/index.html",
+      "headers": {
+        "cross-origin-opener-policy": "same-origin",
+        "cross-origin-embedder-policy": "require-corp"
+      }
+    }
   ]
 }

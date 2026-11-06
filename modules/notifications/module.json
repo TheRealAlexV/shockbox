@@ -34,6 +34,14 @@
     }
   },
   "pages": [
-    { "route": "/notify", "title": "Notification overlay", "file": "overlay/index.html" }
+    {
+      "route": "/notify",
+      "title": "Notification overlay",
+      "file": "overlay/index.html",
+      "headers": {
+        "cross-origin-opener-policy": "same-origin",
+        "cross-origin-embedder-policy": "require-corp"
+      }
+    }
   ]
 }
