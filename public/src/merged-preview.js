@@ -403,7 +403,9 @@ export function mountMergedColumn(host, opts = {}) {
    * element and its classes stay — layout still targets it. */
   const wallEl = el('div', { class: 'mx-wall pv-stage', 'data-shape': 'wave' },
     el('iframe', {
-      src: '/wall/portrait',
+      // `preview=1` is the same flag the panes' iframes carry: the strip shows the wall as the
+      // operator has it, applied or still held behind Auto Apply. The OBS source has no flag.
+      src: '/wall/portrait?preview=1',
       scrolling: 'no',
       title: 'Show wall',
       /* pointer-events:none keeps the stage under the frame receiving the pointer, so a press

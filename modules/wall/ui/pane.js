@@ -195,6 +195,10 @@ export async function render(container, ctx) {
   // Every write path funnels through patchSettings() and cmd(). Auto Apply off makes those two
   // collect instead of send (settings in pendingPatch, page commands in pendingCmds); one Apply
   // flushes both and re-reads the wall. The pane has no prefs store, so localStorage remembers it.
+  //
+  // This gate is about the OBS wall source, never about the preview: the preview renders the
+  // pane's current state either way (see `syncPreview` below), because "hold this until Apply" is
+  // a statement about what OBS shows, not about what the operator is looking at.
   const AUTO_KEY = 'wall.autoApply';
   let autoApply = true;
   try {
@@ -210,12 +214,12 @@ export async function render(container, ctx) {
   autoApplyBox.checked = autoApply;
   const applyBtn = el('button', {
     type: 'button', class: 'btn btn-sm', text: 'Apply',
-    title: 'Send the collected settings and commands, then re-read the wall',
+    title: 'Send the collected settings and commands to the OBS wall source, then re-read it',
   });
   applyBtn.disabled = autoApply;
   const applyGate = el('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
-    el('label', { class: 'switch-inline', for: 'wall-auto-apply', title: 'On: every change applies at once. Off: collect edits and send them with Apply.' },
-      autoApplyBox, el('span', { text: 'Auto Apply' })),
+    el('label', { class: 'switch-inline', for: 'wall-auto-apply', title: 'Controls the OBS wall source, not the preview: on, every change reaches the source at once; off, changes are held and reach it with Apply. The preview is always live.' },
+      autoApplyBox, el('span', { text: 'Auto Apply to OBS' })),
     applyBtn,
   );
 
@@ -227,7 +231,7 @@ export async function render(container, ctx) {
         el('h1', { class: 'pane-title', text: 'LED wall control' }),
         applyGate,
       ),
-      el('p', { class: 'pane-desc', text: 'Drag the 9:16 window on the preview, or pick a look. Everything here is the live document the OBS page follows.' }),
+      el('p', { class: 'pane-desc', text: 'The preview is always live. These controls write the document the OBS page follows; with Auto Apply off the source keeps the applied state until you press Apply.' }),
     ),
     headStatus,
   );
@@ -1443,6 +1447,56 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   let previewScale = 1;
 
   /**
+   * The show preview is never gated.
+   *
+   * Auto Apply says whether a change reaches the OBS wall source now or with Apply. It never said
+   * anything about the preview, yet the preview is an iframe of the real render page, and that page
+   * renders the *server's* document — so with the gate off the preview showed the last applied
+   * snapshot while the pane showed the new value. That is the whole defect: the preview lagged,
+   * not the pane.
+   *
+   * `syncPreview()` closes it. The pane's current visual state, committed or merely queued, goes to
+   * `POST /api/wall/preview` — memory-only on the server, never persisted, never broadcast — and
+   * the mounted page is told to re-read it. Only `?preview=1` requests read that document, which is
+   * exactly the panes' iframes, so the OBS source's answer does not move by a byte.
+   */
+  let previewSyncTimer = 0;
+  let previewSent = ''; // last body sent: a repaint with no change is not a write
+
+  function previewDoc() {
+    const doc = { look: { ...look } };
+    // the page's own answers (`synth`) are the latest word on palette/pattern/preset: the settings
+    // document has no palette at all and only a guessed pattern
+    if (cleanLookName(synth.palette)) doc.look.palette = synth.palette;
+    if (cleanLookName(synth.pattern)) doc.look.pattern = synth.pattern;
+    if (cleanLookName(synth.preset)) doc.look.preset = synth.preset;
+    if (ratioSelection === '16:9' || ratioSelection === '9:16' || ratioSelection === 'both') doc.ratio = ratioSelection;
+    return doc;
+  }
+
+  function pokePreview() {
+    try {
+      preview?.iframe?.contentWindow?.LEDWALL_INSTANCE?.reapplyServerLook?.();
+    } catch {
+      /* not the wall page yet, or it never mounted: the next paint pokes again */
+    }
+  }
+
+  function syncPreview({ immediate = false, force = false } = {}) {
+    clearTimeout(previewSyncTimer);
+    const send = () => {
+      const doc = previewDoc();
+      const body = JSON.stringify(doc);
+      if (!force && body === previewSent) return;
+      previewSent = body;
+      // fire and forget: a preview write must never fail a command the operator made
+      api.post('/api/wall/preview', doc).then(pokePreview, () => { /* the applied document still renders */ });
+    };
+    if (immediate) send();
+    else previewSyncTimer = setTimeout(send, 80);
+  }
+
+  /**
    * The wall pane's bridge to the shared preview component (public/src/preview.js).
    *
    * The component owns the geometry: a 16:9 frame with the 9:16 window inside it, sized from the
@@ -1462,6 +1516,10 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       dim: Number(lookValue('fenceOutDim') ?? 0.18),
     });
     preview.host = previewHost;
+    // The page boots with whatever the preview document held and then follows nothing (there is no
+    // broadcast for it, by design). Every load re-sends the pane's state and pokes the fresh page,
+    // so a reload can never come up one snapshot behind.
+    if (preview.iframe) preview.iframe.addEventListener('load', () => syncPreview({ immediate: true, force: true }));
     return preview;
   }
 
@@ -1486,6 +1544,9 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   }
 
   function paintPreview() {
+    // the preview renders the pane, not the applied document: this is the call that keeps it live
+    // whether or not the gate above is holding a change
+    syncPreview();
     const pv = mountWallPreview();
     // the mode is decided from the wall's RATIO, not from whether a rect happens to be cached:
     // a 9:16 wall with no rect yet still shows a window (the server supplies the rect on the next
@@ -1868,6 +1929,13 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       title: 'Look',
       signal,
       externalGate: true,
+      onPending: (patch) => {
+        // collected, not sent: mirror it on the pane and let the preview paint it (it never waits
+        // for Apply — the gate above is about the OBS source)
+        mirrorQueuedPatch(patch);
+        paintAll();
+        paintPending();
+      },
       onSave: async (patch) => {
         const out = await api.patch('/api/wall/settings', patch);
         if (out && out.settings) {
@@ -2066,6 +2134,9 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
 
   return () => {
     clearTimeout(quietTimer);
+    clearTimeout(previewSyncTimer);
+    // the pane is gone: drop its preview document so the next pane starts from what is applied
+    api.del('/api/wall/preview').catch(() => { /* nothing to drop, or the server is gone */ });
     for (const u of unsubs) {
       try {
         u?.();

@@ -167,6 +167,9 @@ export function renderSettingsForm(container, opts) {
     if (manual) {
       pendingPatch[key] = shown.value;
       row.dataset.dirty = 'true';
+      // The host owns the Apply gate, which gates its live page and not its preview: hand it what
+      // is being collected so the preview can show the value before anything is applied.
+      opts.onPending?.({ [key]: shown.value });
       return;
     }
     row.dataset.busy = 'true';

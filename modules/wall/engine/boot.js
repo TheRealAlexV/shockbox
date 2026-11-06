@@ -31,6 +31,8 @@
   // the window is a mod-8 fence rectangle. A `?view=` on the URL overrides it further down.
 
   var qs = new URLSearchParams(location.search);
+  // Every preview request carries `?preview=1`. Classic script, so this is a plain helper.
+  function previewQ() { return qs.get('preview') === '1' ? '?preview=1' : ''; }
   var DEFAULTS = window.LEDWALL_DEFAULTS || {};
   var PRESETS = window.LEDWALL_PRESETS || {};
 
@@ -231,7 +233,10 @@
     return applied;
   };
   if (window.LEDWALL_SERVER_MODE) {
-    fetch('/api/wall/render', { headers: { Accept: 'application/json' } })
+    // `?preview=1` marks a pane's iframe (public/src/preview.js appends it): that page renders the
+    // *preview* document, the applied one plus whatever the pane is still holding behind its Apply
+    // gate. The OBS source loads this page without the flag and keeps reading the applied document.
+    fetch('/api/wall/render' + previewQ(), { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (body) { applyLook(body && body.settings); })
       .catch(function () { /* keep rendering the URL look */ });
@@ -240,10 +245,17 @@
   // Re-apply the server's look on demand: the same path a `state.snapshot` frame takes. The
   // picture probe steps frames by hand, so the SSE handler cannot run between two writes.
   inst.reapplyServerLook = function () {
-    return fetch('/api/wall/render', { headers: { Accept: 'application/json' } })
+    return fetch('/api/wall/render' + previewQ(), { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (body) { applyLook(body && body.settings); return true; });
   };
+  // A preview page follows the preview document, which no broadcast carries (it is memory-only
+  // and must never reach the OBS source). The pane pokes its own iframe after every edit; the
+  // show strip has no pane, so a preview page re-reads on its own. It also heals a document the
+  // pane dropped on close. The OBS source has no `preview` flag and never polls this.
+  if (previewQ()) {
+    setInterval(function () { inst.reapplyServerLook().catch(function () { /* keep the last frame */ }); }, 1000);
+  }
   // A duration timer must not outlive the page: cancel it before the reload
   // from the admin UI's `reload` command tears the document down.
   if (window.addEventListener) {

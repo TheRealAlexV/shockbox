@@ -138,6 +138,10 @@ export default {
     this.lastSnapshot = null;
     this.ratioState = null;
     this.renderRev = 0;
+    // The show preview's own document (see `previewSettings`): the pane's uncommitted edits, held
+    // in memory only. Deliberately not persisted with the wall's state and never broadcast: it is
+    // what a *preview* renders, not what the OBS source follows.
+    this.previewDoc = null;
     // Operator-saved presets (`preset.save`). Kept beside the module state, not inside the
     // wall's settings document: a preset is a *look*, and the shipped ones live in the engine
     // (engine/presets/presets.js). This is the only place a saved look is stored.
@@ -495,6 +499,36 @@ export default {
     const saved = this.savedPresets || {};
     const names = shipped.concat(Object.keys(saved).filter((n) => shipped.indexOf(n) < 0));
     return { order: names, saved };
+  },
+
+  /**
+   * The show preview's document: the applied document with the pane's *uncommitted* edits laid
+   * over it.
+   *
+   * Auto Apply is a gate on the OBS wall source, never on the preview. The pane's preview is an
+   * iframe of the real render page, and that page renders `renderSettings()` — so with the gate
+   * off it kept drawing the last applied snapshot while the pane already showed the new value.
+   * This merge is what lets the preview follow the pane immediately, with nothing applied.
+   *
+   * `previewDoc` is memory-only: written by `POST /preview`, never persisted, never broadcast,
+   * and read only by `?preview=1` requests — the panes' iframes. The OBS source loads the page
+   * without the flag and gets `renderSettings()` unchanged.
+   */
+  previewSettings() {
+    const base = this.renderSettings();
+    const p = this.previewDoc;
+    // The document only stands for as long as the applied document has not moved. Any committed
+    // change bumps `renderRev`, and a preview written before it is a stale claim about the show:
+    // fall back to the applied document until the pane posts its current state again.
+    if (!p || p.rev !== this.renderRev) return base;
+    const ratio = (p.ratio === '16:9' || p.ratio === '9:16' || p.ratio === 'both') ? p.ratio : base.ratio;
+    return {
+      ...base,
+      look: p.look && typeof p.look === 'object' ? { ...base.look, ...p.look } : base.look,
+      ratio,
+      // the window is a property of the ratio, so a previewed ratio change moves it too
+      fence: this.derivedFence(ratio),
+    };
   },
 
   /**
@@ -985,8 +1019,51 @@ export default {
       {
         method: 'GET',
         path: '/render',
+        handler(req, res, url) {
+          // `?preview=1` marks the panes' iframes (public/src/preview.js appends it). Those render
+          // the preview document — the applied one plus anything the pane is still holding. The
+          // OBS source loads the page without the flag and keeps getting `renderSettings()`.
+          const preview = !!url && typeof url.searchParams.get === 'function' && url.searchParams.get('preview') === '1';
+          return { ok: true, settings: preview ? mod.previewSettings() : mod.renderSettings(), online: { landscape: mod.online('landscape'), portrait: mod.online('portrait') }, seq: mod.seq };
+        },
+      },
+      {
+        // The preview document, as the pane's iframe and a human both read it. Memory-only: this
+        // never touches the settings document, so an unapplied change cannot reach the OBS source.
+        method: 'GET',
+        path: '/preview',
         handler() {
-          return { ok: true, settings: mod.renderSettings(), online: { landscape: mod.online('landscape'), portrait: mod.online('portrait') }, seq: mod.seq };
+          return { ok: true, settings: mod.previewSettings() };
+        },
+      },
+      {
+        method: 'POST',
+        path: '/preview',
+        handler(req, res, url, body) {
+          if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'body must be a JSON object');
+          const doc = {};
+          if (body.look !== undefined) {
+            if (!body.look || typeof body.look !== 'object' || Array.isArray(body.look)) throw new HttpError(400, 'look must be an object');
+            doc.look = { ...body.look };
+          }
+          if (body.ratio !== undefined) {
+            if (body.ratio !== '16:9' && body.ratio !== '9:16' && body.ratio !== 'both') throw new HttpError(400, 'ratio must be 16:9 | 9:16 | both');
+            doc.ratio = body.ratio;
+          }
+          // `rev` pins the document to the applied state it was written against: see
+          // `previewSettings`.
+          doc.rev = mod.renderRev;
+          mod.previewDoc = (doc.look || doc.ratio) ? doc : null;
+          return { ok: true };
+        },
+      },
+      {
+        // The pane closed: drop its preview so the next one starts from the applied document.
+        method: 'DELETE',
+        path: '/preview',
+        handler() {
+          mod.previewDoc = null;
+          return { ok: true };
         },
       },
       {
