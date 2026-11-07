@@ -3,38 +3,79 @@
  *
  * The main thread hands over its latest payload; this worker posts it on its own timer. A main
  * thread blocked by decode work therefore shows up as "ack fresh, draws stale" in the server's
- * truth table instead of as a dead page, which is what three previous fixes were judged by a
- * signal that died with the thing it was measuring.
+ * truth table instead of as a dead page.
  *
- * Nothing here reads the DOM or the page state: it only carries the body it was last given.
+ * Both POSTs here have the same shape: at most one in flight, skipped while one is outstanding,
+ * a 4 s abort, and a `.finally` that clears the latch. Neither carries `keepalive`; see the tick
+ * interval for why.
  */
 let payload = null;
 let timer = 0;
 let intervalMs = 500;
 let timeoutMs = 4000;
-let inflight = false;
 
-const stats = { attempts: 0, ok: 0, abort: 0, type: 0, other: 0, skipped: 0, lastStatus: 0, lastMs: 0 };
+const stats = {
+  attempts: 0,
+  ok: 0,
+  abort: 0,
+  type: 0,
+  other: 0,
+  skipped: 0,
+  latchBreaks: 0,
+  tickSkipped: 0,
+  tickLatchBreaks: 0,
+  lastStatus: 0,
+  lastMs: 0,
+};
+
+/** Abort lifetime plus margin: past this a latch has no request behind it. */
+const grace = () => timeoutMs * 3;
+
+let inflight = false;
+let inflightSince = 0;
+let tickInflight = false;
+let tickSince = 0;
 
 function tick() {
-  // `skipped` is the case the tick counter alone cannot see: no payload, so no ack is attempted.
-  if (!payload || inflight) {
+  if (!payload) {
     stats.skipped += 1;
     return;
   }
+  const now = Date.now();
+  if (inflight) {
+    // The abort settles the promise per spec, so a hung request cannot stick this. A `fetch` that
+    // throws before returning its promise skips `.finally` entirely, and then this latch would skip
+    // every later tick with no error anywhere. Break it, count it, and say so once.
+    if (now - inflightSince <= grace()) {
+      stats.skipped += 1;
+      return;
+    }
+    stats.latchBreaks += 1;
+    postMessage({ type: 'latch-break', kind: 'ack', heldMs: now - inflightSince });
+  }
   inflight = true;
-  stats.attempts += 1;
+  inflightSince = now;
   const started = Date.now();
   const ctrl = new AbortController();
   const timerId = setTimeout(() => ctrl.abort(), timeoutMs);
-  fetch('/api/handfx/ack', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-handfx-via': 'worker' },
-    body: payload,
-    signal: ctrl.signal,
-  })
+  let req;
+  try {
+    req = fetch('/api/handfx/ack', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-handfx-via': 'worker' },
+      body: payload,
+      signal: ctrl.signal,
+    });
+  } catch (err) {
+    clearTimeout(timerId);
+    inflight = false;
+    inflightSince = 0;
+    stats.other += 1;
+    postMessage({ type: 'ack-fail', error: (err && err.name) || 'sync' });
+    return;
+  }
+  req
     .then((res) => {
-      clearTimeout(timerId);
       stats.lastStatus = res.status;
       stats.lastMs = Date.now() - started;
       if (res.ok) {
@@ -45,7 +86,6 @@ function tick() {
       } else postMessage({ type: 'ack-fail', status: res.status });
     })
     .catch((err) => {
-      clearTimeout(timerId);
       stats.lastMs = Date.now() - started;
       const name = (err && err.name) || 'Error';
       if (name === 'AbortError') stats.abort += 1;
@@ -54,7 +94,9 @@ function tick() {
       postMessage({ type: 'ack-fail', error: name });
     })
     .finally(() => {
+      clearTimeout(timerId);
       inflight = false;
+      inflightSince = 0;
     });
 }
 
@@ -76,9 +118,13 @@ onmessage = (event) => {
 
 /**
  * The worker's own clock. It posts a tick every 500 ms whether or not an ack succeeds, so the
- * server holds a timeline written by a thread the render loop cannot occupy. A main thread frozen
- * while these ticks keep arriving is a thread-level stall; ticks stopping with it is a wedged
- * renderer process. Nothing else can tell those two apart.
+ * server holds a timeline written by a thread the render loop cannot occupy.
+ *
+ * Deliberately no `keepalive`: this runs at 2/s for the lifetime of an overlay source and has no
+ * unload-survival need. Keepalive requests draw on a separate 64 KiB per-fetch-group quota that a
+ * hanging request drains, after which new keepalive fetches fail immediately rather than queueing -
+ * a second starvation surface sitting on the channel that carries this worker's own diagnostics.
+ * Do not add it back.
  */
 let ticks = 0;
 let lastTickAt = 0;
@@ -90,22 +136,30 @@ setInterval(() => {
   const gapMs = lastTickAt ? now - lastTickAt : 0;
   lastTickAt = now;
   ticksSinceOk += 1;
+  if (tickInflight) {
+    if (now - tickSince <= grace()) {
+      stats.tickSkipped += 1;
+      return;
+    }
+    stats.tickLatchBreaks += 1;
+    postMessage({ type: 'latch-break', kind: 'tick', heldMs: now - tickSince });
+  }
+  tickInflight = true;
+  tickSince = now;
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+  let req;
   try {
-    void fetch('/api/handfx/page-event', {
+    req = fetch('/api/handfx/page-event', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         kind: 'worker-tick',
         phase: 'tick',
         message: String(ticks),
-        // What the server cannot see from outside: this worker's own inter-tick gap, and how many
-        // ticks have passed with no successful POST. Without them a large server-side tick age
-        // cannot tell "the worker stopped" from "the worker is ticking and its POST cannot land".
         gapMs,
         sinceOk: ticksSinceOk,
         lastOkAt,
-        // The worker's side of the ack. Without this the server sees only its own arrivals and
-        // cannot tell an ack that never left from one that left and was not credited.
         ack: {
           ...stats,
           clientId: (() => {
@@ -117,9 +171,20 @@ setInterval(() => {
           })(),
         },
       }),
-      keepalive: true,
-    }).catch(() => {});
+      signal: ctrl.signal,
+    });
   } catch {
-    /* the tick ledger must never break the thread it measures */
+    clearTimeout(tid);
+    tickInflight = false;
+    tickSince = 0;
+    stats.tickLatchBreaks += 1;
+    return;
   }
+  req
+    .catch(() => {})
+    .finally(() => {
+      clearTimeout(tid);
+      tickInflight = false;
+      tickSince = 0;
+    });
 }, 500);
