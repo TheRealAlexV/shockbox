@@ -92,7 +92,12 @@ function createBus() {
 
   function connect() {
     if (es) es.close();
-    es = new EventSource('/events');
+    // `?role=` names this document to the server (`core/events.mjs` `attach`), so a reload ends
+    // its own predecessor's response instead of leaving it in the browser's six-socket pool. The
+    // shell is served at both `/` and `/control`; both are one document identity, so the role is
+    // fixed and not the pathname (two live shell tabs would then both be `/control` and the newer
+    // would correct the older, which is what the rule is for).
+    es = new EventSource('/events?role=shell');
     es.onopen = () => {
       retry = 0;
       statusCb?.('open');

@@ -2898,7 +2898,24 @@
     // ShockBox: one SSE hub on /events, scoped with ?channels&view. The hub replays its ring and
     // sends a `reset` frame when our cursor is older than that ring (see core/events.mjs), which
     // is what the old agent lacked: a client could believe it was current while missing frames.
-    var url = this.base + '/events?channels=wall&view=' + encodeURIComponent(this.inst.view);
+    //
+    // `role=` is this document's identity for the hub's supersede rule: a reload ends its own
+    // predecessor's bus response instead of leaving it in the browser's six-per-origin pool. The
+    // page's path is the identity, so `/wall/render` and `/wall/portrait` never touch each other.
+    // A preview iframe (`?preview=1`) declares NO role: it renders the same pathname as the OBS
+    // source, and a pathname role would let the pane's copy supersede the source's bus, so the
+    // source would stop receiving commands for as long as the pane stayed open. A viewer must
+    // never win a supersede against the thing it views; the cost is that a preview reload can
+    // hold an extra response until the 180 s reaper, which is what it does today.
+    var role = '';
+    try {
+      if (!/[?&]preview=1(?:&|$)/.test((typeof location !== 'undefined' && location.search) || '')) {
+        var path = (typeof location !== 'undefined' && location.pathname) || '';
+        if (/^\/wall\/[A-Za-z0-9._-]+\/?$/.test(path)) role = path.replace(/\/+$/, '');
+      }
+    } catch (e) { role = ''; }
+    var url = this.base + '/events?channels=wall&view=' + encodeURIComponent(this.inst.view)
+      + (role ? '&role=' + encodeURIComponent(role) : '');
     var es;
     try {
       // EventSource is a classic-script API, so a file:// page reaches it too.

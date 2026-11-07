@@ -275,7 +275,10 @@ function drawPointer(p) {
 /* ---------------------------------------------------------------- wiring */
 
 function connect() {
-  const es = new EventSource('/events?channels=dialogs,pointer&client=alerts-overlay');
+  // `role=` is this document's identity for the server's supersede rule (`core/events.mjs`):
+  // a reload ends its own predecessor's bus response instead of leaving it in the browser's
+  // six-per-origin pool. The page's path, as `/shockfx` uses; `client=` stays a human label.
+  const es = new EventSource('/events?channels=dialogs,pointer&client=alerts-overlay&role=/dialogs');
   es.addEventListener('reset', () => {
     fetch('/api/dialogs/live')
       .then((r) => r.json())

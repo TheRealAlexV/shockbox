@@ -232,7 +232,9 @@ function drawPointer(p) {
 }
 
 function connect() {
-  const es = new EventSource('/events?channels=notifications,pointer&client=notify-overlay');
+  // `role=` is this document's identity for the server's supersede rule (`core/events.mjs`):
+  // a reload ends its own predecessor's bus instead of leaving it in the six-per-origin pool.
+  const es = new EventSource('/events?channels=notifications,pointer&client=notify-overlay&role=/notify');
   // The hub sends every frame twice (typed event + `message`) and an EventSource here collapses
   // them into `message` only, so the typed listeners are not what runs. Re-read on `message`:
   // one HTTP read of the full record, applied once.
