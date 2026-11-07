@@ -141,6 +141,10 @@ const state = {
   ackOkAt: 0,
   ackFails: 0,
   ackFailAt: 0,
+  // When this document first decoded a relay frame. A document that got this far has already
+  // proven it can reach the server, so a wedge must never replace it: the reload opens a third
+  // long-lived stream instead of freeing a socket (rig 03:06:56).
+  relayAttachedAt: 0,
   startedAt: Date.now(),
   bodyAt: 0, // last body-mask message (performance.now)
   bodySeen: false,
@@ -152,9 +156,33 @@ const tracker = new Tracker({ onFrame: onFrame, onState: onTrackerState });
 // The relayed camera: the server's ffmpeg feed of the WebcamSwitcher virtual camera. The page
 // cannot open that device itself (WebcamSwitcher holds it), so it reads the MJPEG stream instead
 // and feeds each decoded frame to the tracker's own detect path.
+/**
+ * One line per relay transition, posted to `/api/handfx/page-event` so it reaches the node log as
+ * `handfx page: relay <phase> <message>`. Fire and forget: never awaited, never able to throw.
+ */
+function reportRelayEvent(transition, detail = '') {
+  try {
+    void fetch('/api/handfx/page-event', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'relay',
+        phase: String(transition || 'note').slice(0, 40),
+        message: String(detail || '').slice(0, 300),
+        build: BUILD,
+        t: Date.now(),
+      }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* a report must never break the stream it describes */
+  }
+}
+
 const relay = createRelay({
   // `?role=` on the stream too, so a predecessor's leaked stream is ended when this one attaches.
   url: `/api/handfx/camera/stream?role=${encodeURIComponent(ROLE)}`,
+  onEvent: reportRelayEvent,
   onFrame: (bitmap) => tracker.pushFrame(bitmap),
   onState: (s) => {
     state.relayError = s.error || null;
@@ -162,6 +190,7 @@ const relay = createRelay({
     if (s.state === 'live') {
       // Frames are flowing: the backoff starts over, so the next drop retries after 2 s.
       cameraLive();
+      state.relayAttachedAt = Date.now();
       diag.phase('relay-attached');
       return;
     }
@@ -428,7 +457,7 @@ function applyBusCommand(msg) {
     scheduleRefresh();
   } else if (cmd === 'reload') {
     // A deploy's push (`POST /api/handfx/page/reload`), over the bus this page already holds.
-    camLog('reload: pushed');
+    camLog('page reload: reason=pushed');
     location.reload();
   }
 }
@@ -560,8 +589,13 @@ function lastSelfReloadAt() {
   }
 }
 
-/** Reload at most once per 5 minutes, so a page that wedges on boot cannot become a reload loop. */
-function selfReload(reason, freeSockets = false) {
+/**
+ * Reload at most once per 5 minutes, so a page that wedges on boot cannot become a reload loop.
+ * `reason` is a machine token (`ack-wedge`, `loop-wedge`) and `detail` the human clause, so the one
+ * line written here says which actor fired without a code read — the thing the 03:2x probe could
+ * not tell apart (a 25 s build poll and a 12 s ack wedge both looked like one 26 s clock).
+ */
+function selfReload(reason, detail = '', freeSockets = false) {
   const now = Date.now();
   const last = lastSelfReloadAt();
   if (last && now - last < RELOAD_GAP_MS) return false;
@@ -571,12 +605,10 @@ function selfReload(reason, freeSockets = false) {
   } catch {
     /* the in-memory flag above is the fallback */
   }
-  // One line per detection naming the condition, so a log reader can tell which fault fired.
-  camLog(`wedge: ${reason}`);
+  camLog(`page reload: reason=${reason}${detail ? ` (${detail})` : ''}`);
   // A network wedge reloads into a document that would otherwise compete with the dead sockets
   // for the browser's six-per-origin budget: drop them first.
   if (freeSockets) releaseSockets();
-  camLog('self-reload');
   location.reload();
   return true;
 }
@@ -629,7 +661,7 @@ const buildCheck = createBuildCheck({
     }
   })(),
   reload: () => {
-    camLog('build-reload');
+    camLog('page reload: reason=build-stale');
     location.reload();
   },
 });
@@ -681,20 +713,28 @@ function checkWedge(now) {
   // as hidden, and reloading it there would fight the source instead of healing it.
   if (document.visibilityState === 'hidden') return false;
 
-  // Condition 1: the document is not being composited. The loop's own clock stopped.
-  const seenAt = state.lastLoopAt || state.startedAt;
-  if (seenAt && now - seenAt >= WEDGE_MS) {
-    return selfReload(`loop stopped for ${Math.round((now - seenAt) / 1000)}s`);
+  // Condition 1: the document is not being composited. `lastLoopAt === 0` means the boot has not
+  // reached loop-start yet — a slow boot, not a stopped loop. Reading `startedAt` as the loop's
+  // clock made every boot longer than WEDGE_MS reload itself before it could finish (a status read
+  // that waits on a socket takes exactly that long).
+  if (state.lastLoopAt && now - state.lastLoopAt >= WEDGE_MS) {
+    return selfReload('loop-wedge', `loop stopped for ${Math.round((now - state.lastLoopAt) / 1000)}s`);
   }
 
   // Condition 2, independent of the loop: it keeps ticking at full rate through a dead network,
   // so only the acks can see this fault. Acks are still being attempted when a failure landed
   // within the last two timeouts, and none succeeded for ACK_WEDGE_MS.
-  if (state.ackFails > 0 && !recovering) {
+  //
+  // Never for a document that attached the relay: it reached the server already, and reloading it
+  // opens a third long-lived stream instead of freeing one (rig 03:06:56). The connection watchdog
+  // re-arms that document without a navigation. And never before the first ack was tried: with no
+  // attempt, `sinceOk` is measured from `startedAt`, so the condition would be "expired" the
+  // instant the boot finally sent one.
+  if (state.ackFails > 0 && !state.relayAttachedAt && !recovering) {
     const sinceOk = now - (state.ackOkAt || state.startedAt);
     const stillTrying = now - state.ackFailAt <= ACK_TIMEOUT_MS * 2;
     if (sinceOk >= ACK_WEDGE_MS && stillTrying) {
-      return selfReload(`acks failing for ${Math.round(sinceOk / 1000)}s`, true);
+      return selfReload('ack-wedge', `acks failing for ${Math.round(sinceOk / 1000)}s`, true);
     }
   }
   return false;
@@ -708,7 +748,7 @@ setInterval(() => {
   if (document.visibilityState === 'hidden') return;
   // Not gated on `booted`: a boot that hangs on `loadStatus` (a server that is gone, a fetch that
   // never resolves) would otherwise freeze the page before its own recovery could start.
-  if (booted) void watchdog.tick();
+  void watchdog.tick();
   // A latch nobody is serving is reported and released before it can look like a dead network.
   checkAckGate(Date.now());
   // /ack keeps running on its own timer while the loop is dead, so the connection watchdog would
@@ -890,6 +930,15 @@ async function autoCamera() {
  * with either, so the caller must not make one.
  */
 async function startRelay(opts) {
+  // The stream is the LAST thing this document may take. Two long-lived responses (the bus, this
+  // stream) plus the ack is 3 of the browser's 6 sockets per origin; a page that took the stream
+  // before it had been heard once left the ack queued behind it for the full camera cap and looked
+  // dead the whole time. The boot's ack is now first, so this is only ever a deferral: the retry
+  // path re-enters in 2 s, and `camAttempted` stays false because nothing was attempted.
+  if (!state.ackOkAt) {
+    state.relayError = 'relay: no ack yet — holding the stream for the socket';
+    return false;
+  }
   camAttempted = true; // a relay failure is a camera failure: the synthetic rig gets the view back
   const live = await relay.start();
   if (!live) {
@@ -984,7 +1033,12 @@ function stopTracking({ manual = true, keepView = false } = {}) {
   }
   camWasLive = false;
   tracker.stop();
-  relay.stop();
+  // `forget: manual` is the cause fix, not another guard. The operator's Stop really does end the
+  // page's intent, but an automatic teardown (manual: false, from the stall drop at autoCamera and
+  // the synthetic fallback) must keep `wanted`: it is what every re-open path tests. The default
+  // `forget: true` erased it here, so one 120 s cap close became permanent — relay.js's
+  // `wantReopen` timer then bailed on `!wanted` and nothing asked for the stream again.
+  relay.stop({ forget: manual });
   state.cameraSource = 'none';
   state.tracking = false;
   state.synthetic = false; // the rig's frame loop is gone with the tracker; the flag goes with it
@@ -1284,8 +1338,10 @@ function ack(now = performance.now()) {
   // The gate is one request in flight, not a clock: the 500 ms throttle below paces, it never
   // retires a hung request.
   if (ackInFlight) return;
-  // At most 2/s: this is a status line, not telemetry.
-  if (now - state.lastAck < 500) return;
+  // At most 2/s: this is a status line, not telemetry. `lastAck === 0` is "never acked", not
+  // "acked at time zero": the throttle used to swallow the boot's own first ack on every load,
+  // because a document always starts inside the first 500 ms.
+  if (state.lastAck && now - state.lastAck < 500) return;
   state.lastAck = now;
   // The body is built BEFORE the latch is taken, inside a try. The latch used to be set above the
   // body, with the body's field reads unguarded: one throwing getter meant fetch was never called,
@@ -1726,6 +1782,12 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   const ok = fx.init();
   if (!ok) setBanner(fx.error, 'bad');
   let heard = false;
+  // The first ack goes out BEFORE the boot's first await. The boot's own reads queue behind the
+  // bus and the camera stream on the browser's six-per-origin sockets, and a document that is
+  // still queued for one produces no ack, no beat and no loop-start — indistinguishable from a
+  // dead page until the camera's 120 s cap frees a slot. The ack is one short POST; the status
+  // read it used to wait behind has a late refresh path (`scheduleRefresh`, the boot-step below).
+  ack();
   try {
     const status = await loadStatus();
     applySettings(status);

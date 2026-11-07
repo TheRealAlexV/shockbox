@@ -990,7 +990,7 @@ function build(ctx) {
         method: 'GET',
         handler: (req, res) => {
           const ip = String((req.socket && (req.socket.remoteAddress || '')) || '').replace(/^::ffff:/, '') || '-';
-          log.info(`handfx page: served /shockfx build=${BUILD} clientIp=${ip}`);
+          log.info(`handfx build: poll /api/handfx/build build=${BUILD} clientIp=${ip}`);
           return send(res, 200, { build: BUILD });
         },
       },
