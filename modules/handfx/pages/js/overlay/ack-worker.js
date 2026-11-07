@@ -14,9 +14,17 @@ let intervalMs = 500;
 let timeoutMs = 4000;
 let inflight = false;
 
+const stats = { attempts: 0, ok: 0, abort: 0, type: 0, other: 0, skipped: 0, lastStatus: 0, lastMs: 0 };
+
 function tick() {
-  if (!payload || inflight) return;
+  // `skipped` is the case the tick counter alone cannot see: no payload, so no ack is attempted.
+  if (!payload || inflight) {
+    stats.skipped += 1;
+    return;
+  }
   inflight = true;
+  stats.attempts += 1;
+  const started = Date.now();
   const ctrl = new AbortController();
   const timerId = setTimeout(() => ctrl.abort(), timeoutMs);
   fetch('/api/handfx/ack', {
@@ -27,15 +35,23 @@ function tick() {
   })
     .then((res) => {
       clearTimeout(timerId);
+      stats.lastStatus = res.status;
+      stats.lastMs = Date.now() - started;
       if (res.ok) {
+        stats.ok += 1;
         lastOkAt = Date.now();
         ticksSinceOk = 0;
         postMessage({ type: 'ack-ok', at: Date.now() });
       } else postMessage({ type: 'ack-fail', status: res.status });
     })
-    .catch(() => {
+    .catch((err) => {
       clearTimeout(timerId);
-      postMessage({ type: 'ack-fail', error: 'fetch' });
+      stats.lastMs = Date.now() - started;
+      const name = (err && err.name) || 'Error';
+      if (name === 'AbortError') stats.abort += 1;
+      else if (name === 'TypeError') stats.type += 1;
+      else stats.other += 1;
+      postMessage({ type: 'ack-fail', error: name });
     })
     .finally(() => {
       inflight = false;
@@ -88,6 +104,18 @@ setInterval(() => {
         gapMs,
         sinceOk: ticksSinceOk,
         lastOkAt,
+        // The worker's side of the ack. Without this the server sees only its own arrivals and
+        // cannot tell an ack that never left from one that left and was not credited.
+        ack: {
+          ...stats,
+          clientId: (() => {
+            try {
+              return String(JSON.parse(payload).clientId || '');
+            } catch {
+              return '';
+            }
+          })(),
+        },
       }),
       keepalive: true,
     }).catch(() => {});

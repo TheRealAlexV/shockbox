@@ -139,6 +139,17 @@ let workerTickSinceOk = 0;
 /** Which thread last acked, and when: page main thread or ack worker. */
 let ackVia = null;
 let ackViaAt = 0;
+/**
+ * Both sides of the ack, counted where they happen. `ackRequests` is incremented before any
+ * handler logic so it counts arrivals, not successes; `touchClientCalls` counts what the handler
+ * actually ran; `ackNewClient` counts acks whose clientId had no row yet, which is the identity
+ * mismatch that would answer "2xx returned, lastAckAt frozen".
+ */
+let ackRequests = 0;
+let touchClientCalls = 0;
+let ackNewClient = 0;
+/** The worker's own report of its ack attempts, carried on the tick it posts every 500 ms. */
+let workerAckStats = null;
 /** One log line when an established client goes quiet for this long — never one per poll. */
 const CLIENT_SILENT_MS = 30_000;
 // No server-held connection may outlive CAMERA_MAX_MS, so a document that vanished without closing
@@ -603,6 +614,8 @@ function build(ctx) {
   /** One /ack from one page. Registered on the first ack; the first-ack line is once per id. */
   function touchClient(id, bodyIn, roleIn = null) {
     const now = Date.now();
+    touchClientCalls += 1;
+    if (!clientsById.has(id)) ackNewClient += 1;
     let c = clientsById.get(id);
     if (!c) {
       const source = ['camera', 'synthetic', 'none'].includes(bodyIn.anchors) ? bodyIn.anchors : 'none';
@@ -988,7 +1001,14 @@ function build(ctx) {
       workerTickAt,
       workerTickGapMs,
       workerTickSinceOk,
-      ackVia,
+      ackRequests,
+      touchClientCalls,
+      ackNewClient,
+      workerAckStats,
+      // A current fact, not a memory: a worker ack that stopped arriving must not keep asserting
+      // that acks are arriving while pageAckAgeMs says they are not. Null once the stamp is older
+      // than the freshness window that the rest of the truth table already uses.
+      ackVia: ackViaAt && Date.now() - ackViaAt <= PAGE_FRESH_MS ? ackVia : null,
       ackViaAt,
       // The per-role verdict: one entry per document role present, and the headline role's row
       // (`/shockfx`). The top-level `pageState`/`clientBuild` follow this row; the other roles are
@@ -1330,6 +1350,7 @@ function build(ctx) {
             if (body.pageOpen) body.lastPoseAt = Date.now();
             return send(res, 200, { ok: true });
           }
+          ackRequests += 1;
           // Provenance: an ack with no main-thread involvement is the proof the worker is live and
           // posting. Logged only when it changes, so the ledger does not become a 2/s feed.
           const ackViaNow = req.headers['x-handfx-via'] === 'worker' ? 'worker' : 'page';
@@ -1442,6 +1463,7 @@ function build(ctx) {
               workerTickAt = Date.now();
               workerTickGapMs = Number(body.gapMs) || 0;
               workerTickSinceOk = Number(body.sinceOk) || 0;
+              if (body.ack && typeof body.ack === 'object') workerAckStats = body.ack;
               return send(res, 200, { ok: true });
             }
             const list = Array.isArray(body.events) ? body.events : [body];
