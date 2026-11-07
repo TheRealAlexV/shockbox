@@ -31,7 +31,11 @@ function sizeOf(file) {
   }
 }
 
-export function createLog({ dir, file: filePath = null, console: toConsole = true, maxBytes = MAX_BYTES, keep = KEEP } = {}) {
+// `console: true` prints to stdout/stderr unconditionally, `false` never does, and `null` (the
+// default) prints only to a stream a human is looking at — a TTY. A pipe or a redirect means
+// something else is already copying that stream into this same dated file (the TUI supervisor's
+// _pump_output does exactly that), and printing here as well writes every line to the file twice.
+export function createLog({ dir, file: filePath = null, console: toConsole = null, maxBytes = MAX_BYTES, keep = KEEP } = {}) {
   const ring = [];
   let file = null;
   let size = 0;
@@ -95,14 +99,20 @@ export function createLog({ dir, file: filePath = null, console: toConsole = tru
     const text = `${at} ${level.padEnd(5)} [${scope}] ${msg}`;
     ring.push({ at, scope, level, msg });
     if (ring.length > RING_MAX) ring.shift();
-    if (toConsole) {
-      // stdout can be a closed pipe (the launcher went away). Swallow it: an uncaught EPIPE here
-      // is what used to recurse through the uncaughtException handler into this same function.
-      try {
-        const stream = level === 'error' || level === 'warn' ? process.stderr : process.stdout;
-        stream.write(text + '\n');
-      } catch {
-        /* no console */
+    if (toConsole !== false) {
+      const stream = level === 'error' || level === 'warn' ? process.stderr : process.stdout;
+      // Same reasoning as the `console` default: `null` means auto, so a stream that is not a TTY
+      // is skipped. `true` still forces the copy for a caller that wants it regardless. With no
+      // file sink at all (the log directory was unwritable) the console copy is the only one
+      // there is — whatever reads the pipe is then the last record of this line.
+      if (toConsole === true || stream.isTTY || !file) {
+        // stdout can be a closed pipe (the launcher went away). Swallow it: an uncaught EPIPE here
+        // is what used to recurse through the uncaughtException handler into this same function.
+        try {
+          stream.write(text + '\n');
+        } catch {
+          /* no console */
+        }
       }
     }
     writeFile(text);

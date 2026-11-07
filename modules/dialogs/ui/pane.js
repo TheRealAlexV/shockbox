@@ -448,13 +448,17 @@ export async function render(container, ctx) {
       if (frame.reset) pull();
       return;
     }
-    const stamp = `${frame.channel}|${frame.event ?? frame.cmd ?? ''}|${frame.data?.rev ?? ''}|${frame.data?.t ?? ''}`;
+    // A state push arrives two ways: a `publish()`ed command frame keeps its payload in `args`
+    // ({seq, channel, cmd:'snapshot', args, view}), an `emit()`ed event frame carries `data`.
+    // Resolve both before reading or stamping — a snapshot read only from `data` is silently
+    // dropped and the list then waits for the 5 s poll (the wall pane resolves it the same way).
+    const d = (frame.cmd === 'snapshot' ? frame.args : frame.data) || {};
+    const stamp = `${frame.channel}|${frame.event ?? frame.cmd ?? ''}|${d.rev ?? ''}|${d.t ?? ''}`;
     if (stamp === lastStamp) return;
     lastStamp = stamp;
     streamAt = Date.now();
     paintStream();
     if (frame.channel !== 'dialogs') return;
-    const d = frame.data || {};
     if (frame.event === 'sound') {
       streamOut.dataset.sound = String(Date.now());
       return;

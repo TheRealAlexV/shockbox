@@ -467,6 +467,27 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
     }
   });
 
+  // Socket deadlines. These are the listener's guards on a half-open *request*; the caps in
+  // core/events.mjs and handfx's /camera/stream bound a long-lived *response*. Set together so the
+  // numbers are visible in one place, and logged at listen time.
+  //   requestTimeout  — deadline for receiving one request (headers + body). It does not touch a
+  //                     response already streaming: verified on this Node (24.x) with the cap at
+  //                     800 ms, an endless response kept writing for 2.5 s. 300 s is Node's default
+  //                     and is far beyond the largest body we accept (BODY_LIMIT = 2 MB of JSON).
+  //   headersTimeout  — headers only, 20 s: CEF sends them in the request's first packet, so this is
+  //                     huge headroom while a scanner or a half-open socket is dropped quickly.
+  //   keepAliveTimeout— an idle kept-alive socket is answered with `Connection: close` and released
+  //                     after 5 s. This reclaims a socket a vanished document left *idle*, but never
+  //                     one mid-stream: the peer goes on accepting MJPEG frames, so it is never idle.
+  //                     That case is exactly what the max-age caps exist for.
+  //   timeout         — 0 (disabled) on purpose: an inactivity reaper would read a silent camera or a
+  //                     quiet bus as death and kill a healthy stream. Lifetime is bounded by the caps,
+  //                     which do not depend on traffic.
+  server.requestTimeout = 300_000;
+  server.headersTimeout = 20_000;
+  server.keepAliveTimeout = 5_000;
+  server.timeout = 0;
+
   server.on('clientError', (err, socket) => {
     try {
       socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
@@ -482,6 +503,10 @@ export function createServer({ port, host, stateDir, publicDir, registry, events
         server.once('error', reject);
         server.listen(pn, h, () => {
           server.removeListener('error', reject);
+          log.info(
+            `http: timeouts request=${server.requestTimeout}ms headers=${server.headersTimeout}ms ` +
+              `keepAlive=${server.keepAliveTimeout}ms socket=${server.timeout}ms`,
+          );
           resolve(server.address());
         });
       });

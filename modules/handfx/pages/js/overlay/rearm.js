@@ -17,11 +17,12 @@ export function cameraWanted(settings) {
 
 /**
  * Re-arm after the server returns: drop the stream that can never deliver again, stop the tracker,
- * drop a camera claim no frame backs, then let `autoCamera` run the camera path it already owns
- * (relay first, device second, synthetic last) with its bounded retry — 2 attempts, 5 s apart.
+ * drop a camera claim no frame backs, then let `autoCamera` open the relay it already owns. The
+ * caller has cleared the retry backoff first, so this attempt is immediate; if it fails, the page's
+ * own bounded retry (2 s doubling to 30 s) keeps going without anyone touching the OBS source.
  *
- * `live` is a camera that is starting frames right now, which is worth re-arming even when the
- * relay setting is off (a device session the operator started).
+ * `live` is a session that is starting frames right now, which is worth re-arming even when the
+ * relay setting is off (a session the operator started).
  */
 export async function rearmCamera({ state, relay, tracker, autoCamera, userStopped, visible }) {
   if (userStopped || !visible) return false;

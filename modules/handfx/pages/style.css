@@ -73,6 +73,24 @@ body[data-underlay='off'] #cam {
   color: #ff5d6a;
 }
 
+/* The page's own diagnostic readout. Deliberately not chrome: no box, low contrast, small, and out
+   of the badge's corner so it cannot disturb the layout. It stays in permanently — a frozen clock
+   or a latched gate must be legible in a screenshot of the source itself. */
+#diag {
+  position: fixed;
+  right: 10px;
+  bottom: 10px;
+  z-index: 3;
+  font: 10px/1.3 ui-monospace, monospace;
+  color: rgba(255, 255, 255, 0.34);
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.8);
+  pointer-events: none;
+  white-space: pre;
+}
+body[data-clean='true'] #diag {
+  display: none;
+}
+
 #banner {
   position: fixed;
   left: 10px;

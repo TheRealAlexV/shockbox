@@ -111,6 +111,13 @@
       "help": "The size ffmpeg scales to before encoding MJPEG. Smaller is cheaper to decode in the page.",
       "group": "general"
     },
+    "cameraRelayKeepWarm": {
+      "type": "boolean",
+      "default": false,
+      "label": "Keep the camera warm with no page connected",
+      "help": "On: ffmpeg holds the capture device whether or not a page is connected, so the camera stays warm and the first frame arrives without a warm-up. The device is then permanently held — another program cannot open it, and the virtual camera keeps publishing. Off: ffmpeg starts on the first page that connects and stops five seconds after the last one leaves.",
+      "group": "general"
+    },
     "ffmpegPath": {
       "type": "string",
       "default": "ffmpeg",

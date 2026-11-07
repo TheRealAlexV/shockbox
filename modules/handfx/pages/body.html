@@ -56,6 +56,27 @@
       body[data-clean='true'] #mask {
         display: none;
       }
+      /* Embed mode (?embed=1): this page inside the pane. It has no camera of its own, so the mask
+         the OBS body source publishes is the whole picture. Start and Stop live in the pane. */
+      body[data-embed='true'] #cam,
+      body[data-embed='true'] #controls {
+        display: none;
+      }
+      body[data-embed='true'] #mask {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        opacity: 0.85;
+        background: #05070a;
+      }
+      body[data-embed='true'] #status {
+        left: 4px;
+        right: 4px;
+        bottom: 4px;
+        padding: 3px 5px;
+        font-size: 10px;
+      }
       #controls {
         position: fixed;
         top: 6px;

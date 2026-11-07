@@ -8,9 +8,52 @@ const RING_MAX = 400;
 const HEARTBEAT_MS = 15_000;
 const CLIENT_BLOCK_MAX_MS = 20_000;
 const CLIENT_BUFFER_MAX = 4 * 1024 * 1024;
+// No server-held connection may outlive SSE_MAX_MS, so a document that vanished without closing
+// anything loses its bus slot on a timer rather than never. CEF keeps a navigated-away document's
+// sockets in its per-origin pool (6 slots) with the response still ESTABLISHED; our heartbeat keeps
+// writing into them, so the peer always accepts bytes and no inactivity timeout can ever notice.
+// 5 min = 20 heartbeats: a healthy page reconnects three times an hour (hello + ring replay, cheap)
+// and a leaked slot is back in the pool long before the operator gives up on the pane.
+// SHOCKBOX_STREAM_MAX_MS is the test hook that shortens it (and handfx's camera cap) for a test.
+const SSE_MAX_MS = Number(process.env.SHOCKBOX_STREAM_MAX_MS) || 300_000;
 // Identifies this process. Sent in every `hello` so a reconnecting page can tell
 // "the server restarted" from "I missed frames".
 const BOOT = `${Date.now().toString(36)}-${process.pid}`;
+
+/**
+ * Which document a request belongs to, as far as the supersede rule below cares: one path, one
+ * holder. A page declares it with `?role=` (the page path it was loaded at); `/shockfx/overlay`
+ * is therefore the same identity before and after a reload, which is what lets the successor end
+ * the predecessor's leaked stream. Bounded and charset-restricted because it is only ever echoed
+ * into a log line.
+ */
+export function validRole(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9._/-]{1,64}$/.test(value) ? value : null;
+}
+
+/** The identity a request declares on its own URL (`?role=`), or null. */
+export function roleOf(req) {
+  try {
+    return validRole(new URL(req.url, 'http://localhost').searchParams.get('role'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The identity a request *inherits* from the document that made it: the referring URL's path.
+ * A document cached from before `?role=` existed still names its own path here, so a successor
+ * can supersede it on the first deploy after this rule ships — not just from the second.
+ */
+export function refPath(req) {
+  const ref = req.headers?.referer;
+  if (!ref) return null;
+  try {
+    return validRole(new URL(ref).pathname);
+  } catch {
+    return null;
+  }
+}
 
 export function createEvents({ log }) {
   const clients = new Map();
@@ -80,13 +123,15 @@ export function createEvents({ log }) {
   function drop(c, why) {
     if (c.dead) return;
     c.dead = true;
+    if (c.ageTimer) clearTimeout(c.ageTimer);
     clients.delete(c.id);
     try {
       c.res.end();
     } catch {
       /* ignore */
     }
-    log.info(`sse client #${c.id} ${[...c.channels]} dropped (${why}), ${clients.size} left`);
+    const age = Math.round((Date.now() - c.born) / 1000);
+    log.info(`sse client #${c.id} ${[...c.channels]} dropped (${why}) after ${age} s, ${clients.size} left`);
   }
 
   /** Publish a command frame to one channel. view scopes delivery (wall has landscape|portrait). */
@@ -230,10 +275,34 @@ export function createEvents({ log }) {
       res,
       channels: new Set(channels),
       view,
+      role: roleOf(req),
+      ref: refPath(req),
       remote: client || req.socket?.remoteAddress || '?',
+      born: Date.now(),
+      ageTimer: null,
       dead: false,
     };
     clients.set(c.id, c);
+    // Supersede: one document holds one bus. A predecessor whose stream was never closed keeps an
+    // ESTABLISHED socket in CEF's six-per-origin pool, and the successor's own two responses then
+    // starve its acks (measured: `ack request: signal timed out` with the socket count at 6). Ending
+    // the older response here is what keeps a reload from wedging the page.
+    //
+    // Only the *same* identity is touched, and the response that just attached is never a candidate
+    // (it is `c`), so a different page — or the live page itself — never loses its feed. A client
+    // that declared no role is matched only by the path its document came from (`ref`), which is how
+    // a document cached from before `?role=` existed is superseded on the first deploy that ships
+    // this rule. A client with neither a role nor a referer is never a candidate at all.
+    if (c.role) {
+      for (const old of [...clients.values()]) {
+        if (old !== c && (old.role === c.role || (!old.role && old.ref === c.role))) drop(old, 'superseded');
+      }
+    }
+    // The cap: at max age the response is ended cleanly (drop calls end(), never an error status),
+    // so the slot the page's vanished predecessor kept goes back to the pool. EventSource reconnects
+    // by itself on a clean close (`retry: 1500` above), which is why ending is safe here.
+    c.ageTimer = setTimeout(() => drop(c, 'max age'), SSE_MAX_MS);
+    if (c.ageTimer.unref) c.ageTimer.unref();
     // `boot` is the process-start token: a client from an earlier process cannot use its
     // `since` against a fresh ring (seq restarts at 1), so it is told to resync instead of
     // silently replaying nothing and believing it is current.
@@ -284,10 +353,8 @@ export function createEvents({ log }) {
   if (heartbeat.unref) heartbeat.unref();
 
   const sweeper = setInterval(() => {
-    const now = Date.now();
     for (const c of [...clients.values()]) {
       if (c.res.writableLength > CLIENT_BUFFER_MAX) drop(c, 'backpressure');
-      else if (c.born === undefined) c.born = now;
     }
   }, 5000);
   if (sweeper.unref) sweeper.unref();

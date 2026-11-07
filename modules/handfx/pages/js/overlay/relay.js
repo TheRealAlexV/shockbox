@@ -116,6 +116,10 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
   let dropped = 0;
   let firstWaiter = null;
   let stallTimer = null;
+  let retryTimer = null; // a pending re-open (see `wantReopen`)
+  let retryDelay = 0; // 0 = the next re-open is immediate
+  const RETRY_BASE = 500;
+  const RETRY_MAX = 15000;
 
   function emit(state) {
     try {
@@ -147,6 +151,46 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     }
   }
 
+  function cancelReopen() {
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+
+  /**
+   * The page's own way back to the stream. The server ends every camera stream at its max age
+   * (`CAMERA_MAX_MS`), so a healthy page sees a clean EOF every two minutes *by design*; an OBS
+   * browser source must not depend on an event (visibilitychange, pageshow) arriving to ask again,
+   * because none does while it is on screen. This is the re-open path, and it is bounded: 0.5 s
+   * doubling to 15 s while `wanted`, never a tight loop, cancelled by `stop()`.
+   *
+   * Without it the max-age close was the end of the feed: the clean-EOF branch got exactly one
+   * `acquire()`, and one failed re-fetch (producer restarting, a 503, a reset) left `error` set
+   * with nothing left to try — 0 clients, `demand` still true, and the page drawing synthetic
+   * hands for the rest of the session.
+   */
+  function wantReopen(immediate = false) {
+    if (!wanted || ctrl || retryTimer) return;
+    let delay = 0;
+    if (!immediate) {
+      retryDelay = Math.min(retryDelay ? retryDelay * 2 : RETRY_BASE, RETRY_MAX);
+      delay = retryDelay;
+    }
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (!wanted || ctrl) return;
+      void start().then((ok) => {
+        if (ok) {
+          retryDelay = 0;
+          return;
+        }
+        // A failed attempt must not be the last word either: `start()` resolved false because
+        // nothing decoded, and the next try backs off.
+        wantReopen();
+      });
+    }, delay);
+    if (retryTimer.unref) retryTimer.unref();
+  }
+
   /**
    * The stream is gone — a clean EOF or a read error, they are the same event to this page. Drop
    * the connection, the held frame and the claim that anything is live, so the page stops drawing
@@ -172,7 +216,11 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
 
   function stop({ forget = true } = {}) {
     if (forget) wanted = false;
+    // A pending re-open belongs to the intent being stopped: a page that forgot the stream must not
+    // be reopened by a timer it no longer owns.
+    cancelReopen();
     close();
+    starting = null; // a start after a stop opens a fresh connection, not the aborted one
     latest = null;
     if (current) {
       current.close();
@@ -215,6 +263,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
         if (!live) {
           live = true;
           error = null;
+          // A frame arrived: the next drop (including the server's max-age close) reopens at once.
+          retryDelay = 0;
+          cancelReopen();
           emit('live');
           if (firstWaiter) {
             const w = firstWaiter;
@@ -243,17 +294,30 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
         if (!decoding) void drain();
       }
     }
-    // A clean EOF is the camera going away too: without this the page kept the last frame and
-    // went on reporting itself live forever.
-    if (!ac.signal.aborted && ctrl) fail('relay: stream ended');
+    // A clean end is the server's CAMERA_MAX_MS cap expiring, not a dead camera: reconnect.
+    if (!ac.signal.aborted && ctrl === ac) {
+      close();
+      // Say the stream ended. Without this the page kept `live` true across the gap, so its own
+      // state and /status claimed a relay feed while nothing was arriving, and the page was never
+      // told the feed came back (`cameraLive()` re-arms the backoff on every `live`). A page-side
+      // 'idle' is not an error: recovery is the re-open below, not a guess by the page.
+      if (live) {
+        live = false;
+        emit('idle');
+      }
+      // The server ends every stream at its max age, so this is the healthy path back, not the end:
+      // reopen at once (the socket is free and the server is up) with the retry loop behind it.
+      if (wanted) wantReopen(true);
+    }
   }
 
-  async function start() {
-    wanted = true;
-    // No visibility gate: an OBS browser source reports `hidden` whenever it is not in the
-    // program, and that is exactly the page that must still open the relay — nothing here needs a
-    // click, and the server stops ffmpeg by itself when the last client leaves.
-    if (ctrl) return live;
+  /**
+   * One acquisition, and every caller shares it. A retry that lands while the previous `fetch` is
+   * still opening used to see `ctrl` set and `live` false, report the stream dead, and start a
+   * second connection on top of the first — which is how a retry loop ends up fighting itself.
+   * `ac` is kept local so a stale acquisition cannot abort the controller of a newer one.
+   */
+  async function acquire() {
     const ac = new AbortController();
     ctrl = ac;
     error = null;
@@ -287,12 +351,42 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       if (!got) throw new Error(`no frame within ${Math.round(timeout / 1000)} s`);
       return true;
     } catch (err) {
-      close();
+      // A stop or a re-arm aborted this fetch: that is the page's intent, not a camera failure, so
+      // it must not report an error the retry loop would then explain with "relay: aborted".
+      if (ac.signal.aborted) {
+        if (ctrl === ac) close();
+        return false;
+      }
+      if (ctrl === ac) close();
       live = false;
-      error = ac.signal.aborted && !err.message ? 'relay: aborted' : `relay: ${err && err.message ? err.message : err}`;
+      error = `relay: ${err && err.message ? err.message : err}`;
       emit('error');
       return false;
     }
+  }
+
+  let starting = null;
+
+  function start() {
+    wanted = true;
+    // No visibility gate: an OBS browser source reports `hidden` whenever it is not in the
+    // program, and that is exactly the page that must still open the relay — nothing here needs a
+    // click, and the server stops ffmpeg by itself when the last client leaves.
+    if (ctrl && live) return Promise.resolve(true);
+    // A leftover controller whose stream never came up. Answering `false` here forever reconnected
+    // nothing and failed nothing, so the page read "relay: no frames" until it was reloaded: tear
+    // the dead stream down and acquire again.
+    if (ctrl) {
+      if (starting) return starting; // an acquisition is already opening: share it, never stack one
+      console.log('handfx relay: stream open without a frame — re-acquiring');
+      fail('relay: stream never produced a frame');
+    }
+    if (!starting) {
+      starting = acquire().finally(() => {
+        starting = null;
+      });
+    }
+    return starting;
   }
 
   // A hidden document keeps its stream: an OBS browser source is hidden while its scene is not in

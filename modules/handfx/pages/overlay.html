@@ -3,6 +3,122 @@
   <head>
     <base href="/shockfx/" />
     <meta charset="utf-8" />
+    <!-- Error capture, installed before anything else can fail. A classic inline script runs during
+         parse, ahead of the deferred module below and before the stylesheet is fetched, so a 404'd
+         ES module, a missing model file or a throw on the first line of boot is reported to the
+         server instead of vanishing into OBS. Fire-and-forget: one coalesced POST per 500 ms,
+         AbortSignal.timeout(3000), never awaited by the boot path. -->
+    <script>
+      (function () {
+        var diag = {
+          clientId: (function () {
+            try {
+              if (self.crypto && typeof self.crypto.randomUUID === 'function') return self.crypto.randomUUID();
+            } catch (e) {}
+            var out = '';
+            for (var i = 0; i < 16; i += 1) out += Math.floor(Math.random() * 256).toString(16).padStart(2, '0');
+            return out;
+          })(),
+          build: '',
+          ring: [],
+          phases: [],
+          report: report,
+          phase: phase,
+          setBuild: function (b) { diag.build = b ? String(b).slice(0, 64) : ''; },
+          setClient: function (id) { if (id) diag.clientId = String(id).slice(0, 64); },
+          phaseList: function () { return diag.phases.slice(); },
+        };
+        var queue = [];
+        var seen = Object.create(null);
+        var timer = 0;
+        var posting = false;
+        var lastPostAt = 0;
+
+        function currentPhase() { return diag.phases.length ? diag.phases[diag.phases.length - 1] : ''; }
+        function stackOf(err) {
+          var s = err && err.stack ? String(err.stack) : '';
+          return s.split('\n').slice(0, 3).join('\n');
+        }
+        function ringAdd(ev) {
+          diag.ring.push(ev);
+          if (diag.ring.length > 20) diag.ring.shift();
+        }
+        // One event: {kind, message, stack (3 frames), src, phase, build, t}. `count` taller than 1
+        // says how many identical reports the coalescer folded into this one.
+        function report(kind, message, extra) {
+          extra = extra || {};
+          var ev = {
+            kind: String(kind || 'note').slice(0, 40),
+            message: message == null ? '' : String(message).slice(0, 500),
+            stack: extra.stack == null ? '' : String(extra.stack).slice(0, 1000),
+            src: extra.src == null ? '' : String(extra.src).slice(0, 500),
+            phase: extra.phase || currentPhase(),
+            build: diag.build,
+            t: Date.now(),
+            count: 1,
+          };
+          ringAdd(ev);
+          var sig = ev.kind + '|' + ev.phase + '|' + ev.message;
+          if (seen[sig]) { seen[sig].count += 1; schedule(); return; }
+          seen[sig] = ev;
+          queue.push(ev);
+          schedule();
+        }
+        // A breadcrumb, emitted once: it POSTs like any event, so a page that dies before its first
+        // ack still says how far it got. The same list rides the ack payload as `phases`.
+        function phase(name) {
+          if (!name || diag.phases.indexOf(name) !== -1) return;
+          diag.phases.push(name);
+          report('phase', name, { phase: name });
+        }
+        function schedule() {
+          if (timer) return;
+          var wait = 500 - (Date.now() - lastPostAt);
+          timer = setTimeout(flush, wait > 0 ? wait : 0);
+        }
+        function flush() {
+          timer = 0;
+          // One report socket at a time: the whole point is never to spend the page's six.
+          if (posting || !queue.length) { if (queue.length) schedule(); return; }
+          if (Date.now() - lastPostAt < 500) { schedule(); return; }
+          var events = queue.splice(0, 20);
+          for (var i = 0; i < events.length; i += 1) delete seen[events[i].kind + '|' + events[i].phase + '|' + events[i].message];
+          posting = true;
+          lastPostAt = Date.now();
+          var done = function () { posting = false; if (queue.length) schedule(); };
+          try {
+            fetch('/api/handfx/page-event', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ clientId: diag.clientId, build: diag.build, events: events }),
+              signal: AbortSignal.timeout(3000),
+              keepalive: true,
+            }).then(done, done);
+          } catch (e) { done(); }
+        }
+
+        // Capture phase on window sees both uncaught errors and resource-load failures; the latter
+        // arrive with an element as `target` and no `message`, so the URL is read off the element.
+        window.addEventListener('error', function (ev) {
+          var t = ev && ev.target;
+          if (t && t !== window && (t.src || t.href)) {
+            report('resource', 'failed to load ' + (t.tagName || 'resource') + ' ' + (t.src || t.href), {
+              src: t.src || t.href,
+            });
+            return;
+          }
+          report('error', (ev && ev.message) || 'error', {
+            src: ev && ev.filename ? ev.filename + ':' + ev.lineno + ':' + ev.colno : '',
+            stack: stackOf(ev && ev.error),
+          });
+        }, true);
+        window.addEventListener('unhandledrejection', function (ev) {
+          var r = ev && ev.reason;
+          report('rejection', (r && r.message) || String(r || 'unhandled rejection'), { stack: stackOf(r) });
+        });
+        self.__handfxDiag = diag;
+      })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ShockBox · ShockFX</title>
     <link rel="stylesheet" href="style.css" />
@@ -21,6 +137,9 @@
       <canvas id="fx"></canvas>
     </div>
     <div id="badge" hidden></div>
+    <!-- The page's own clock, in the composited output. A diagnostic readout, not UI: one source
+         screenshot says whether the page is drawing but mute, or its ack gate is latched. -->
+    <div id="diag"></div>
     <div id="banner" hidden></div>
     <div id="controls">
       <button type="button" data-act="start" data-state="off">Start camera</button>
@@ -32,9 +151,22 @@
       // reload asks for a fresh build and the entry module URL changes with it; a document OBS
       // keeps alive keeps its old `?v=` and reports that old build on /ack, which is how a stale
       // source is caught instead of looking healthy.
-      const res = await fetch('/api/handfx/build', { cache: 'no-store' }).catch(() => null);
+      const res = await fetch('/api/handfx/build', {
+        cache: 'no-store',
+        // A server that accepts the connection and never answers must not hold the page before its
+        // module is even imported: the bootstrap is the first thing a silent page cannot report.
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => null);
       const build = res && res.ok ? String((await res.json()).build || '') : '';
-      await import(`./js/overlay/main.js${build ? `?v=${encodeURIComponent(build)}` : ''}`);
+      // Tag the capture with the build before the module is fetched, so an error thrown while
+      // loading or evaluating main.js is reported against the build that caused it.
+      if (self.__handfxDiag && self.__handfxDiag.setBuild) self.__handfxDiag.setBuild(build);
+      // With no build (the fetch timed out or failed) never import the bare URL: an unversioned
+      // module URL can be satisfied from a cache entry left by an older deploy, which is exactly
+      // the stale document this page exists to catch. A per-load nonce cannot collide with any
+      // earlier document's key, so a timed-out bootstrap still cannot pin a page to old bytes.
+      const key = build || `no-build-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      await import(`./js/overlay/main.js?v=${encodeURIComponent(key)}`);
     </script>
   </body>
 </html>

@@ -25,6 +25,12 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createPublisher } from './publish-pipe.mjs';
 import { BOUNDARY, createCameraRelay } from './camera-relay.mjs';
+// The document identity a request declares (`?role=`) or inherits (its `Referer` path), shared with
+// the SSE hub so both long-lived responses are superseded by the same rule.
+import { roleOf, refPath, validRole } from '../../core/events.mjs';
+// Enumeration launches the virtual-camera client DLLs, so it is only ever reached from the two
+// explicit /cameras routes — never from `status()`, which the pane polls at 1 Hz.
+import { list as listCameras, rescan as rescanCameras, configuredSource } from './camera-list.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -73,6 +79,47 @@ const PAGE_STALE_MS = 5000;
  * reporting while Chrome gives its document no frames to draw.
  */
 const LOOP_STALE_MS = 2000;
+
+/**
+ * A page ack older than this is not the page's current answer for the feed truth table
+ * (`pageTruth`). Ten seconds is roughly ten heartbeat periods: long enough that a GC pause or a
+ * single dropped request is not a fault, short enough that a dead document is caught while the
+ * operator is still looking at the wrong picture.
+ */
+const PAGE_FRESH_MS = 10_000;
+/**
+ * A beat older than this is not from a live page. The beat is an `<img>` GET on a 1 s timer — no
+ * fetch, no body, no socket held — so five missed beats is a page that is gone, not a slow one.
+ * This is what makes `pageTruth` able to say *mute* (beats fresh, acks stale) rather than guessing
+ * between "busy" and "dead".
+ */
+const PAGE_BEAT_STALE_MS = 5000;
+/**
+ * The document that decides the headline verdict. The OBS browser source is served at `/shockfx`,
+ * and a page's role is its `location.pathname`, so this is the page the operator watches. Other
+ * roles are reported beside it and can never answer in its place.
+ */
+const HEADLINE_ROLE = '/shockfx';
+/**
+ * A client that has neither acked nor beaten for this long is not a candidate for its role's
+ * verdict, however recent a single ack looked. The page acks every 500 ms (`ACK_MS` in
+ * pages/js/overlay/main.js) and beats every 1000 ms (`BEAT_MS`), so this is twenty missed acks and
+ * ten missed beats — the same line `PAGE_FRESH_MS` already draws for "is this page current". The
+ * entry stays in `clientList` until `CLIENTS_TTL_MS`; it just stops answering for its role.
+ */
+const CLIENT_CANDIDATE_MS = PAGE_FRESH_MS;
+/** A per-client ack entry is forgotten after this much silence: a closed tab is not a client. */
+const CLIENTS_TTL_MS = 10 * 60 * 1000;
+/** One log line when an established client goes quiet for this long — never one per poll. */
+const CLIENT_SILENT_MS = 30_000;
+// No server-held connection may outlive CAMERA_MAX_MS, so a document that vanished without closing
+// anything loses its pool slot on a timer rather than never. CEF holds the old socket ESTABLISHED
+// and keeps accepting frames, so no inactivity timeout can tell it from a live viewer. 2 min is
+// ~3600 frames at 30 fps: the page already reconnects for its own reasons (pagehide, a 3 s stall),
+// so one extra clean close every two minutes is not new behaviour, and a leaked slot is returned to
+// the 6-connection pool while the operator still cares. SHOCKBOX_STREAM_MAX_MS is the test hook,
+// shared with the SSE cap in core/events.mjs.
+const CAMERA_MAX_MS = Number(process.env.SHOCKBOX_STREAM_MAX_MS) || 120_000;
 
 /**
  * Every command the bus accepts. `reload` and the effect cursor are handled by the page;
@@ -267,6 +314,47 @@ function build(ctx) {
     draws: 0, anchors: 'none', lastDrawAt: 0, lastAckAt: 0, build: '',
     loopTicks: 0, lastLoopAt: 0, hidden: null, visibility: '',
   };
+  // The page's own error reports (POST /page-event), newest first. Overlay-only and additive: the
+  // page buffers its own ring too, but a page that dies cannot be asked, so the server keeps the
+  // last 50 it heard. Each entry carries the reporting clientId and build.
+  const pageEvents = [];
+  /**
+   * Block testimony from the overlay's watchdog *worker* (GET /page-blame), one entry per client.
+   *
+   * This is the only report that can arrive while the page's main thread is blocked, because the
+   * worker owns a thread and a `fetch` of its own. It is deliberately *not* a liveness signal: a
+   * blame never stamps `lastAckAt` or `beatAt`, so a blocked page still reads as stale, and a page
+   * that keeps being blamed cannot look fresh. Bounded at 32 clients and rewritten in place, so a
+   * permanently blocked page increments `count` instead of growing the ring.
+   */
+  const pageBlames = new Map();
+  const PAGE_BLAME_CLIENTS = 32;
+  /**
+   * Record one blame. Returns the entry so the caller can log the first one for a client: the log
+   * line answers "when did this page go mute" without polling /status.
+   */
+  function recordPageBlame(clientId, q, now) {
+    let entry = pageBlames.get(clientId);
+    const first = !entry;
+    if (!entry) {
+      if (pageBlames.size >= PAGE_BLAME_CLIENTS) pageBlames.delete(pageBlames.keys().next().value);
+      entry = { clientId, firstAt: now, lastAt: now, count: 0, why: '', gap: 0, last: '' };
+      pageBlames.set(clientId, entry);
+    }
+    entry.lastAt = now;
+    entry.count += 1;
+    const why = typeof q.get('why') === 'string' ? q.get('why') : '';
+    if (why) entry.why = why.slice(0, 60);
+    const gap = Number(q.get('gap'));
+    if (Number.isFinite(gap)) entry.gap = Math.max(0, Math.round(gap));
+    const last = q.get('last');
+    if (typeof last === 'string') entry.last = last.slice(0, 900);
+    return { entry, first };
+  }
+  /** The public shape: newest blame first, so /status leads with the page that just went mute. */
+  function pageBlameList() {
+    return [...pageBlames.values()].sort((a, b) => b.lastAt - a.lastAt);
+  }
   // Why the overlay's camera did not open (the page's own diagnostic object), the label of the
   // device it did open, which pipe is carrying frames (relay | device | synthetic | none) and why
   // the relay is not it. Reported on /ack, read back on /status; never a frame.
@@ -291,11 +379,440 @@ function build(ctx) {
       size: settings.get('cameraRelaySize'),
       ffmpegPath: settings.get('ffmpegPath'),
       capture: settings.get('cameraRelayCapture'),
+      // ffmpeg holds the device with no page connected when this is on (relay's own key name).
+      cameraRelayKeepWarm: settings.get('cameraRelayKeepWarm') === true,
     }),
   });
   const unsubRelay = settings.subscribe((changed) => {
     if (changed.some((k) => k.startsWith('cameraRelay') || k === 'ffmpegPath')) relay.sync();
   });
+
+  /**
+   * Per-client ack identity: `clientId → { … }`. The page mints a uuid on load and sends it on
+   * /ack; it is optional, because a document cached from before this existed never sends one.
+   *
+   * Why the map exists: "the newest ack, from any client" let a live document keep a dead one
+   * looking healthy — several pages share one OBS window, and a hidden or throttled document can
+   * still heartbeat on a timer. One entry per id means liveness is asked of a *particular* page.
+   */
+  const clientsById = new Map();
+  /**
+   * Which clientId is currently holding the relay open by asking for frames, or null. Reported on
+   * /status so "nobody asked for frames" is a visible fact instead of an `idle` feed with no error.
+   */
+  let feedArmedBy = null;
+  /**
+   * The release deadline. One unref'd timeout, reset by each asking ack: when the last asking page
+   * stops acking (a closed tab, an OBS reload) the relay is released without a poll loop.
+   */
+  let demandTimer = null;
+
+  /**
+   * The single truth table for the feed. `effectiveSource`, `stale`, `state` and `reason` are all
+   * computed here and nowhere else, so one payload cannot contradict itself:
+   *
+   *   feed not live                → effectiveSource 'stale', stale, state = the feed's own state
+   *   feed live, acks stale, beats fresh → 'page-mute': alive and drawing, not reporting
+   *   feed live, fresh ack camera  → effectiveSource 'camera', not stale
+   *   feed live, fresh ack other   → effectiveSource = that source, not stale
+   */
+  function pageTruth(feed, page, now) {
+    const live = feed.state === 'live';
+    const pageAckAgeMs = page && page.lastAckAt ? Math.max(0, now - page.lastAckAt) : Infinity;
+    const pageBeatAgeMs = page && page.beatAt ? Math.max(0, now - page.beatAt) : Infinity;
+    const pageFresh = pageAckAgeMs <= PAGE_FRESH_MS;
+    const beatFresh = pageBeatAgeMs <= PAGE_BEAT_STALE_MS;
+    // The three page states, named. Acks are the page *talking*; beats are the page *running*, and
+    // they travel different paths on purpose, so the pair says which of the two failed.
+    const pageState = pageFresh ? 'live' : beatFresh ? 'page-mute' : 'page-dead';
+    const loopStale = clientLoopStale(page, now);
+    const aged = (ms) => (Number.isFinite(ms) ? `${Math.round(ms / 1000)} s` : 'never');
+    if (!live) {
+      return {
+        live,
+        pageFresh,
+        pageState,
+        pageAckAgeMs,
+        pageBeatAgeMs,
+        beatFresh,
+        loopStale,
+        stale: true,
+        effectiveSource: 'stale',
+        state: feed.state,
+        reason: `feed ${feed.state}${feed.reason || feed.error ? `: ${feed.reason || feed.error}` : ''}`,
+      };
+    }
+    if (!pageFresh) {
+      return {
+        live,
+        pageFresh,
+        pageState,
+        pageAckAgeMs,
+        pageBeatAgeMs,
+        beatFresh,
+        loopStale,
+        stale: true,
+        effectiveSource: 'stale',
+        // Not 'live': the pipe is running, but the page is not reporting what it draws. The two
+        // stale cases are finally distinguishable — a mute page is still beating.
+        state: pageState,
+        reason: page
+          ? beatFresh
+            ? `page mute: ${page.lastAckAt ? `no ack for ${aged(pageAckAgeMs)}` : 'no ack ever'} but beating ${aged(pageBeatAgeMs)} ago (ticks ${page.beatTicks || 0}, draws ${page.beatDraws || 0}) — alive and drawing, not reporting`
+            : `page dead: no ack for ${aged(pageAckAgeMs)} and no beat for ${aged(pageBeatAgeMs)} — the page is gone`
+          : 'page dead: no page has ever acked or beaten',
+      };
+    }
+    const source = ['camera', 'synthetic', 'none'].includes(page.source) ? page.source : 'none';
+    return {
+      live,
+      pageFresh,
+      pageState,
+      pageAckAgeMs,
+      pageBeatAgeMs,
+      beatFresh,
+      loopStale,
+      stale: false,
+      effectiveSource: source,
+      state: 'live',
+      reason: loopStale
+        ? `feed live, page live: ack ${aged(pageAckAgeMs)} ago, but its loop has not advanced for ${aged(now - (page.loopAdvAt || now))} — reporting, not drawing`
+        : `feed live, page live: ack ${aged(pageAckAgeMs)} ago, reporting ${source}`,
+    };
+  }
+
+  /** Is this client still reporting at all? An ack or a beat inside the candidate window. */
+  function clientAlive(c, now) {
+    const seen = Math.max(c.lastAckAt || 0, c.beatAt || 0);
+    return seen > 0 && now - seen <= CLIENT_CANDIDATE_MS;
+  }
+
+  /**
+   * How good one client is as its role's answer. Ranked first on whether it is drawing *now* — a
+   * document that survived has an advancing paint clock, one that died mid-boot does not — and only
+   * then on ack recency. Recency alone is what let a transient boot row outrank the live document.
+   */
+  function candidateRank(c, now) {
+    const ackFresh = c.lastAckAt > 0 && now - c.lastAckAt <= PAGE_FRESH_MS;
+    const drawing = ackFresh && c.loopTicks > 0 && !clientLoopStale(c, now);
+    return [drawing ? 2 : ackFresh ? 1 : 0, c.lastAckAt || 0];
+  }
+
+  /** The best live client matching `match`, or null. */
+  function bestClient(now, match) {
+    let best = null;
+    let bestRank = null;
+    for (const c of clientsById.values()) {
+      if (!match(c) || !clientAlive(c, now)) continue;
+      const r = candidateRank(c, now);
+      if (!best || r[0] > bestRank[0] || (r[0] === bestRank[0] && r[1] > bestRank[1])) {
+        best = c;
+        bestRank = r;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * The client that answers for one role: live, and the best of its live documents. A null-role row
+   * (a document cached from before `?role=` existed) matches no role at all, so it can never be
+   * handed back here however recent its `lastAckAt` is.
+   */
+  function rolePage(role, now) {
+    return role ? bestClient(now, (c) => (c.role || null) === role) : null;
+  }
+
+  /**
+   * The page the headline verdict is built from. It is the `/shockfx` document and no other. When
+   * no `/shockfx` document is reporting, another role's live document is still the page talking
+   * (its path changed), so it answers. Only a tree with no role-bearing client at all — a page
+   * cached before `?role=` existed — falls back to the old any-client behaviour.
+   */
+  function freshestPage(now) {
+    const headline = rolePage(HEADLINE_ROLE, now);
+    if (headline) return headline;
+    const other = bestClient(now, (c) => Boolean(c.role));
+    if (other) return other;
+    if ([...clientsById.values()].some((c) => c.role)) return null; // roles exist, none reporting
+    const legacy = bestClient(now, () => true);
+    if (legacy) return legacy;
+    // A document cached before `clientId` existed still acks, and calling it dead because it has no
+    // id would be a worse lie than trusting the one stamp it does send.
+    if (draw.lastAckAt > 0) return { id: null, lastAckAt: draw.lastAckAt, beatAt: 0, source: draw.anchors };
+    return null;
+  }
+
+  /**
+   * Forget entries silent for 10 minutes, and log the first 30 s of silence once per client.
+   * It rides the status read (the pane's 1 Hz poll) instead of a timer, so an idle module logs
+   * nothing, and `silentLogged` is what keeps the line off every subsequent poll.
+   */
+  function sweepClients(now) {
+    for (const [id, c] of clientsById) {
+      // A beat is proof of life too: a mute page (acks broken, beats arriving) must not be swept
+      // out from under the truth table just because its ack path is the thing that failed.
+      const silentFor = now - Math.max(c.lastAckAt || 0, c.beatAt || 0);
+      if (silentFor > CLIENTS_TTL_MS) {
+        clientsById.delete(id);
+        continue;
+      }
+      if (!c.silentLogged && silentFor > CLIENT_SILENT_MS) {
+        c.silentLogged = true;
+        log.info(`handfx page: silent clientId=${id} for ${Math.round(silentFor / 1000)}s`);
+      }
+    }
+  }
+
+  /** One /ack from one page. Registered on the first ack; the first-ack line is once per id. */
+  function touchClient(id, bodyIn, roleIn = null) {
+    const now = Date.now();
+    let c = clientsById.get(id);
+    if (!c) {
+      const source = ['camera', 'synthetic', 'none'].includes(bodyIn.anchors) ? bodyIn.anchors : 'none';
+      c = { id, role: roleIn, firstAckAt: now, lastAckAt: now, lastDrawAt: 0, loopTicks: 0, hidden: null, build: null, source, drawCount: 0, phases: [], silentLogged: false, wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0, beatPhase: '', loopAdvAt: now };
+      clientsById.set(id, c);
+      log.info(`handfx page: first ack clientId=${id} role=${roleIn || '-'} build=${typeof bodyIn.build === 'string' ? bodyIn.build : ''} source=${source}`);
+    }
+    // The document's identity, not its ephemeral clientId: a reload makes a new clientId but keeps
+    // the same role, which is what /status groups on.
+    if (roleIn) c.role = roleIn;
+    c.lastAckAt = now;
+    c.silentLogged = false;
+    if (Number.isFinite(bodyIn.draws)) c.drawCount = Math.max(c.drawCount, Math.max(0, bodyIn.draws | 0));
+    if (Number.isFinite(bodyIn.lastDrawAt) && bodyIn.lastDrawAt > c.lastDrawAt) c.lastDrawAt = Math.min(now, bodyIn.lastDrawAt);
+    if (Number.isFinite(bodyIn.loopTicks)) {
+      const ticks = Math.max(0, bodyIn.loopTicks | 0);
+      // The loop-advance clock: when this page's paint counter last moved. A page that acks forever
+      // with a frozen `loopTicks` is alive and not drawing, and only this stamp can say so for a
+      // *particular* client — a second page acking cannot mask it.
+      if (ticks > c.loopTicks) c.loopAdvAt = now;
+      c.loopTicks = Math.max(c.loopTicks, ticks);
+    }
+    if (typeof bodyIn.hidden === 'boolean') c.hidden = bodyIn.hidden;
+    if (typeof bodyIn.build === 'string' && bodyIn.build) c.build = bodyIn.build.slice(0, 64);
+    // The page's build self-heal, reported on its own beat. `reloads` is monotonic per server
+    // build, `staleSince` is the first mismatch this document saw (0 while it matches). Clamped,
+    // so /status cannot carry a page's stray numbers, and never latched downward: a reloaded
+    // document re-reports the budget it restored from sessionStorage.
+    if (Number.isFinite(bodyIn.reloads)) c.reloads = Math.max(0, bodyIn.reloads | 0);
+    if (Number.isFinite(bodyIn.lastReloadAt)) c.lastReloadAt = Math.min(now, Math.max(0, bodyIn.lastReloadAt));
+    if (Number.isFinite(bodyIn.staleSince)) c.staleSince = bodyIn.staleSince > 0 ? Math.min(now, bodyIn.staleSince) : 0;
+    // Which boot breadcrumbs this page reached (module-start … first-draw). Overwritten whole, so
+    // the list always reads as the page's current progress and never accumulates.
+    if (Array.isArray(bodyIn.phases)) {
+      c.phases = bodyIn.phases.filter((p) => typeof p === 'string').map((p) => p.slice(0, 40)).slice(0, 24);
+    }
+    if (['camera', 'synthetic', 'none'].includes(bodyIn.anchors)) c.source = bodyIn.anchors;
+    // Does this page need camera frames? Overwritten on every ack, never latched: the ack that
+    // stops saying it (or stops arriving) is the release.
+    c.wantsFeed = bodyIn.wantsFeed === true;
+  }
+
+  /**
+   * One beat from one page: a GET with no body, on a 1 s timer that shares nothing with `ack()` —
+   * no fetch, no JSON, no socket held. It registers the client if no ack has arrived yet (a page
+   * whose ack path is broken still proves it is running), and stamps the counters the node
+   * otherwise only learns from an ack, so `clientList` stops lying when acks go mute.
+   */
+  function touchBeat(id, q, now) {
+    let c = clientsById.get(id);
+    if (!c) {
+      c = { id, firstAckAt: 0, lastAckAt: 0, lastDrawAt: 0, loopTicks: 0, hidden: null, build: null, source: 'none', drawCount: 0, phases: [], silentLogged: false, wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0, beatPhase: '', loopAdvAt: now };
+      clientsById.set(id, c);
+      log.info(`handfx page: first beat clientId=${id} (no ack yet)`);
+    }
+    c.beatAt = now;
+    const ticks = Number(q.get('t'));
+    if (Number.isFinite(ticks)) {
+      const t = Math.max(0, Math.floor(ticks));
+      if (t > c.beatTicks) c.beatTicks = t;
+      if (t > c.loopTicks) {
+        c.loopTicks = t;
+        c.loopAdvAt = now;
+      }
+    }
+    const draws = Number(q.get('d'));
+    if (Number.isFinite(draws)) c.beatDraws = Math.max(c.beatDraws || 0, Math.max(0, Math.floor(draws)));
+    const phase = q.get('p');
+    if (typeof phase === 'string') c.beatPhase = phase.slice(0, 40);
+    const build = q.get('b');
+    if (typeof build === 'string' && build && !c.build) c.build = build.slice(0, 64);
+  }
+
+  /**
+   * Is this client's paint clock frozen *while it is still acking*? Read-only reporting: a page
+   * that acks forever and never advances `loopTicks` is alive and not drawing, and this is asked
+   * of one client so a second page cannot answer for it.
+   */
+  function clientLoopStale(c, now) {
+    if (!c) return false;
+    if (now - c.lastAckAt > PAGE_FRESH_MS) return false; // stale acks are mute/dead, not a loop fault
+    return now - (c.loopAdvAt || c.firstAckAt || now) > LOOP_STALE_MS;
+  }
+
+  /**
+   * Arm or release the camera relay from the pages' own heartbeats. Any fresh client whose ack says
+   * `wantsFeed` holds the producer; when none does, it is released. The heartbeat is the only
+   * subscription involved, so a page that reconnects after a node restart re-arms the camera with
+   * its next ack — no reload, no operator action, and nothing to lose on a reconnect.
+   */
+  function applyFeedDemand() {
+    const now = Date.now();
+    let holder = null;
+    for (const c of clientsById.values()) {
+      if (c.wantsFeed !== true) continue;
+      if (now - c.lastAckAt > PAGE_FRESH_MS) continue;
+      if (!holder || c.lastAckAt > holder.lastAckAt) holder = c;
+    }
+    feedArmedBy = holder ? holder.id : null;
+    relay.setDemand(Boolean(holder));
+    if (demandTimer) {
+      clearTimeout(demandTimer);
+      demandTimer = null;
+    }
+    if (holder) {
+      // One more freshness window, then re-ask: a page that went away releases the camera by
+      // itself, and a page that is still there keeps it armed with each ack in between.
+      demandTimer = setTimeout(applyFeedDemand, PAGE_FRESH_MS + 1000);
+      demandTimer.unref?.();
+    }
+  }
+
+  /**
+   * One client's answer, in the same vocabulary as `pageTruth`: `live` (acking), `page-mute`
+   * (beating, not acking), `page-dead` (neither, but still inside the candidate window) and `stale`
+   * (past it — listed, never counted). `drawing` is null when the page is not acking, because
+   * nothing is known about a loop that is not reporting. `candidate` is what a role's verdict may
+   * pick: a real role, still reporting.
+   */
+  function clientVerdict(c, now) {
+    const ackAgeMs = c.lastAckAt ? Math.max(0, now - c.lastAckAt) : null;
+    const beatAgeMs = c.beatAt ? Math.max(0, now - c.beatAt) : null;
+    const ackFresh = ackAgeMs != null && ackAgeMs <= PAGE_FRESH_MS;
+    const beatFresh = beatAgeMs != null && beatAgeMs <= PAGE_BEAT_STALE_MS;
+    const alive = clientAlive(c, now);
+    // Read-only: this client is acking but its paint counter has stopped advancing. Asked of one
+    // client so a second page's ticking cannot answer for it.
+    const loopStale = clientLoopStale(c, now);
+    return {
+      state: ackFresh ? 'live' : beatFresh ? 'page-mute' : alive ? 'page-dead' : 'stale',
+      live: ackFresh,
+      ackAgeMs,
+      beatAgeMs,
+      candidate: Boolean(c.role) && alive,
+      // A page acking forever with a frozen loop is alive and not drawing; a page drawing has an
+      // advancing `loopTicks` and no stale loop.
+      drawing: ackFresh ? c.loopTicks > 0 && !loopStale : null,
+      loopStale,
+    };
+  }
+
+  /**
+   * The per-role view. One entry per role present, carrying the authoritative row (`rolePage`) and
+   * the answers /status publishes: live, build, ack age, beat age, drawing. Rows that no longer
+   * report are still counted in `documents` but never become a role's answer. The `null` group is
+   * documents from before `?role=` existed: reported, never authoritative for any role.
+   */
+  function rolesView(now) {
+    const groups = new Map();
+    for (const c of clientsById.values()) {
+      const key = c.role || null;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
+    }
+    const roles = [];
+    for (const [role, list] of groups) {
+      const best = role ? rolePage(role, now) : bestClient(now, (c) => !c.role);
+      const verdict = best ? clientVerdict(best, now) : null;
+      roles.push({
+        role,
+        state: verdict ? verdict.state : 'absent',
+        live: verdict ? verdict.live : false,
+        build: best ? best.build || null : null,
+        ackAgeMs: verdict ? verdict.ackAgeMs : null,
+        beatAgeMs: verdict ? verdict.beatAgeMs : null,
+        drawing: verdict ? verdict.drawing : false,
+        loopStale: verdict ? verdict.loopStale : false,
+        clientId: best ? best.id : null,
+        documents: list.length,
+      });
+    }
+    return {
+      headlineRole: HEADLINE_ROLE,
+      headline: roles.find((r) => r.role === HEADLINE_ROLE) || null,
+      roles,
+    };
+  }
+
+  /** The public shape: the barest facts, no internal bookkeeping (`silentLogged` stays here). */
+  function clientList() {
+    const now = Date.now();
+    return [...clientsById.values()].map((c) => ({
+      id: c.id,
+      // Which document this is, independent of the ephemeral clientId: two entries with the same
+      // role are one page's predecessor and successor, and /status can say so.
+      role: c.role || null,
+      ...clientVerdict(c, now),
+      firstAckAt: c.firstAckAt,
+      lastAckAt: c.lastAckAt,
+      lastDrawAt: c.lastDrawAt,
+      loopTicks: c.loopTicks,
+      hidden: c.hidden,
+      build: c.build,
+      // The build self-heal: how many self-reloads this page spent on the build it reports, when
+      // the last one happened, and when it first saw a mismatch (0 while it matches).
+      reloads: c.reloads || 0,
+      lastReloadAt: c.lastReloadAt || 0,
+      staleSince: c.staleSince || 0,
+      source: c.source,
+      drawCount: c.drawCount,
+      wantsFeed: c.wantsFeed === true,
+      phases: c.phases || [],
+      // The beat: the last `<img>` GET this page sent, and the counters it carried. Read beside
+      // `lastAckAt`, it separates a mute page (beat fresh, ack stale) from a dead one (both stale).
+      beatAt: c.beatAt || 0,
+      beatTicks: c.beatTicks || 0,
+      beatDraws: c.beatDraws || 0,
+      beatPhase: c.beatPhase || '',
+      // Block testimony from this client's own worker, or null. Beside `lastAckAt` it separates a
+      // blocked page (blame fresh, ack stale) from a gone one (both stale).
+      pageBlame: pageBlames.get(c.id) || null,
+    }));
+  }
+
+  /**
+   * The camera inventory envelope for /cameras and /cameras/rescan. `list()` is the only enumerator
+   * and it is called from a route, never from `status()`: enumerating starts other processes' DLLs.
+   * A failed enumeration is a 200 with `ok: false`, so the pane can say *why* nothing is listed
+   * instead of showing a broken request.
+   */
+  async function camerasPayload(force) {
+    const started = Date.now();
+    let out;
+    try {
+      out = force ? await rescanCameras() : await listCameras();
+    } catch (err) {
+      out = { ok: false, error: err && err.message ? err.message : String(err) };
+    }
+    const ms = Date.now() - started;
+    const devices = Array.isArray(out.devices) ? out.devices : [];
+    const nonVideo = Array.isArray(out.nonVideo) ? out.nonVideo : [];
+    if (out.ok === true) log.info(`handfx cameras: enumerate ok=${devices.length} cached=${out.cached === true} ms=${ms}`);
+    else log.warn(`handfx cameras: enumerate failed "${out.error || 'unknown'}"`);
+    // The relay's own view, not a second enumeration: is something actually capturing right now?
+    const feed = relay.status();
+    return {
+      ok: out.ok === true,
+      cached: out.cached === true,
+      ageMs: Number.isFinite(out.ageMs) ? out.ageMs : 0,
+      devices,
+      nonVideo,
+      error: out.error || null,
+      configured: configuredSource(),
+      live: feed.state === 'live' ? { source: feed.source, mode: feed.capture ? feed.capture.mode : null } : null,
+    };
+  }
+
 
   function publish(cmd, args) {
     // The replay stamp lives on its own key: `args.id` belongs to the caller (it is the effect id
@@ -312,19 +829,30 @@ function build(ctx) {
     // read this document, so the setting takes effect at the first read, and `off` costs a compare.
     pipe.setMode(settings.get('publish'));
     // Same reasoning for the relay: off costs a compare, on applies any changed device/size, and
-    // a client still connected is restarted onto the new settings.
+    // a client still connected is restarted onto the new settings. The demand is re-derived first,
+    // so a page that acked while this document was being built is armed by the first read.
+    applyFeedDemand();
     relay.sync();
     const s = settings.all();
     const model = findModel();
-    // Freshness: an ack (or draw stamp) older than 5 s is not this page's current answer. The
-    // overlay's beat is its own timer (`main.js` heartbeat), so `stale` now means the page itself
-    // stopped reporting — a gone page — and not a document Chrome declined to paint. That case is
-    // `renderLoop: 'stopped'` below. `none` stays `none` (no page ever reported — e.g. only the
-    // preview iframe is open), never `stale`.
+    // Freshness is one table now (`pageTruth`), not a set of separate age checks: the payload used
+    // to be able to say `stale: true` next to `effectiveSource: "camera"`, and `stale: false` was
+    // unreachable while the feed was merely healthy. The table reads the relay's own state and the
+    // *freshest* page ack, so a live document cannot keep a dead one looking healthy.
     const now = Date.now();
-    const beat = Math.max(draw.lastAckAt, draw.lastDrawAt);
-    const stale = beat > 0 && now - beat > PAGE_STALE_MS;
-    const staleForMs = stale ? now - beat : 0;
+    sweepClients(now);
+    const feed = relay.status();
+    const page = freshestPage(now);
+    const truth = pageTruth(feed, page, now);
+    const stale = truth.stale;
+    // The build the authoritative page reports, which is the headline role's row whenever it has
+    // one: `draw.build` is the overlay's own last ack and cannot see a second document take over.
+    const pageBuild = (page && page.build) || draw.build;
+    // A page running a bundle this server no longer serves is its own fault, not the feed's: the
+    // picture can look healthy while none of the deployed code is running. Named here so /status
+    // reads as `page on stale build …` instead of `feed idle`.
+    const buildStale = Boolean(pageBuild && pageBuild !== BUILD);
+    const staleForMs = stale ? Math.round(truth.pageAckAgeMs) : 0;
     // The paint clock, read as its own state. `ackFresh` is the difference that matters: an acking
     // page whose loop is silent is alive and not painting (an occluded OBS source — Chrome sends a
     // document it does not composite no `requestAnimationFrame` at all), which is a real fault on
@@ -345,16 +873,45 @@ function build(ctx) {
       // `cameraError`/`relayError`/`cameraSource` for why — and is not the same thing as the
       // operator asking for synthetic.
       trackingSource: ['camera', 'synthetic'].includes(settings.get('trackingSource')) ? settings.get('trackingSource') : 'auto',
-      // The page's last-acked source, and whether it is still current. `stale` is not a source:
-      // it says the page has stopped reporting, so `effectiveSource` cannot be trusted either.
-      effectiveSource: stale ? 'stale' : draw.anchors, // camera | synthetic | none | stale
+      // Answered by `pageTruth` only: `stale` is not a source, it says the feed or the page is not
+      // current, so `effectiveSource` degrades to `stale` with a `reason` in the same breath.
+      effectiveSource: truth.effectiveSource, // camera | synthetic | none | stale
       lastAckedSource: draw.anchors,
+      // Where the freshest page says its boot got to (module-start … first-draw). Empty until a
+      // page acks; the list is the answer to "it acked once and stopped": last crumb reached.
+      phases: page && Array.isArray(page.phases) ? page.phases : [],
       stale,
       staleForMs,
+      /** Why `effectiveSource` reads what it reads — feed state, page ack age, or a stale bundle. */
+      reason: buildStale ? `page on stale build ${pageBuild} (server ${BUILD}); ${truth.reason}` : truth.reason,
+      /**
+       * The clientId whose heartbeat is holding the relay open, or null. Beside `reason`: a null
+       * here with `state: "idle"` is "no page asked for frames", which is a fact, not silence.
+       */
+      feedArmedBy,
+      /** True when the freshest known page acked inside `PAGE_FRESH_MS`. */
+      pageFresh: truth.pageFresh,
+      // The page's state, named: `live` (acks fresh), `page-mute` (acks stale, beats fresh: alive
+      // and drawing, not reporting) or `page-dead` (both stale). Passed through from the feed's own
+      // state when the feed is not live. `truth.reason` says the same thing in words.
+      pageState: truth.pageState,
+      beatFresh: truth.beatFresh === true,
+      beatAgeMs: Number.isFinite(truth.pageBeatAgeMs) ? Math.round(truth.pageBeatAgeMs) : null,
+      // The beat itself: when the freshest page last proved it is running, and the counters it
+      // carried. These are populated even when acks are mute, which is the point.
+      beatAt: (page && page.beatAt) || 0,
+      beatTicks: (page && Number.isFinite(page.beatTicks) && page.beatTicks) || 0,
+      beatDraws: (page && Number.isFinite(page.beatDraws) && page.beatDraws) || 0,
+      beatPhase: (page && page.beatPhase) || '',
+      // Read-only: the freshest page is acking but its loop counter has stopped advancing.
+      loopStale: truth.loopStale === true,
       // What the page is running vs what this server serves. `null` before the first ack.
       build: BUILD,
-      clientBuild: draw.build || null,
-      buildMatches: draw.build ? draw.build === BUILD : null,
+      clientBuild: pageBuild || null,
+      buildMatches: pageBuild ? pageBuild === BUILD : null,
+      // The bundle fault on its own: `buildMatches: false` used to be one boolean beside a `stale`
+      // that still said the feed was fine. This is the field a reader can key on.
+      buildStale,
       // Whether the overlay is drawing at all, and on what: `none` means the page is open but no
       // loop has rendered (or no page is open), which is the state that looks like a dead source.
       draws: draw.draws,
@@ -371,14 +928,33 @@ function build(ctx) {
       hidden: draw.hidden,
       visibility: draw.visibility || null,
       // The overlay's camera answer: why it did not open (object or null) and what it did open.
+      // A feed that is not live carries neither: a stale document must not hand the pane a
+      // live-looking device name, or an ffmpeg error from an hour ago that reads as today's.
       cameraError: camera.error,
       cameraLabel: camera.label,
-      cameraSource: camera.source,
+      cameraSource: truth.live ? camera.source : null,
+      // The page's own reason the relay is not the source, reported even when the feed is live: a
+      // live feed with no client is exactly the case that hid this string before.
       relayError: camera.relayError,
       // The virtual camera's truth: off | waiting (no consumer, or connected and silent) | live
       // (a consumer is reading frames), plus the counters and the geometry both sides agreed on.
       publish: { ...pipe.status(), timing: publishTiming.at ? publishTiming : null },
-      cameraFeed: relay.status(),
+      // `state` is the table's, not the relay's alone, so it can no longer read `live` beside
+      // `stale: true`. The rest of the relay's report is carried through untouched, and `clients`
+      // stays the number of stream readers it has always been; `clientCount`/`clientList` are the
+      // acking pages, which is a different population.
+      cameraFeed: { ...feed, state: truth.state, live: truth.live, reason: truth.reason, clientCount: clientsById.size, clientList: clientList() },
+      // The per-role verdict: one entry per document role present, and the headline role's row
+      // (`/shockfx`). The top-level `pageState`/`clientBuild` follow this row; the other roles are
+      // reported beside it. A second document of a role can no longer mask the real one, and a
+      // null-role row from before `?role=` existed answers for nothing.
+      pageRoles: rolesView(now),
+      // The page's own error reports, newest first, capped at 50. Empty until a page reports.
+      pageEvents: pageEvents.slice(),
+      // Block testimony from the watchdog worker, newest first. A page whose main thread is blocked
+      // still reports here while it cannot ack or beat, which is the whole point: an entry with a
+      // fresh `lastAt` beside a stale `lastAckAt` is a blocked page, not a gone one.
+      pageBlame: pageBlameList(),
       runtime: {
         vendored: fs.existsSync(path.join(VENDOR, 'vision', 'vision_bundle.mjs')),
         simdWasm: fs.existsSync(path.join(VENDOR, 'vision', 'simd-wasm', 'vision_wasm_internal.wasm')),
@@ -406,7 +982,121 @@ function build(ctx) {
       // The build the page must load with (`?v=`) and report on /ack. Kept out of /status on
       // purpose: a page that read its build from /status would always match the server, even when
       // the document itself is a day old — the value has to come from the URL the page loaded.
-      { path: '/build', method: 'GET', handler: (req, res) => send(res, 200, { build: BUILD }) },
+      // The overlay document's own bootstrap: `pages/overlay.html` fetches this once per document
+      // load, so it is the one page-load fact a module route can see (core serves the HTML itself).
+      // This is the line that would have named the stale document before it sat there for 16 hours.
+      {
+        path: '/build',
+        method: 'GET',
+        handler: (req, res) => {
+          const ip = String((req.socket && (req.socket.remoteAddress || '')) || '').replace(/^::ffff:/, '') || '-';
+          log.info(`handfx page: served /shockfx build=${BUILD} clientIp=${ip}`);
+          return send(res, 200, { build: BUILD });
+        },
+      },
+      {
+        path: '/beat',
+        method: 'GET',
+        handler: (req, res, url) => {
+          const q = url && url.searchParams ? url.searchParams : new URLSearchParams();
+          const id = String(q.get('c') || '').slice(0, 64);
+          if (id) touchBeat(id, q, Date.now());
+          // 204 and no body: the page sends this with `new Image()`, and nothing is waiting to read
+          // it. No-store so a proxy can never replay a beat and make a dead page look alive.
+          res.writeHead(204, { 'cache-control': 'no-store' });
+          res.end();
+        },
+      },
+      // Block testimony from the page's watchdog worker: the only instrument that survives a
+      // blocked main thread, because it runs its own thread and its own `fetch`.
+      //
+      // A GET with query params (never a body) so it works from inside a worker with no request
+      // plumbing, and 204 no-store like /beat: nothing reads the answer, and a proxy must never
+      // replay a blame. It records nothing in the liveness path — no `lastAckAt`, no `beatAt` — so
+      // a blamed page still reads stale, and blaming cannot manufacture freshness.
+      {
+        path: '/page-blame',
+        method: 'GET',
+        handler: (req, res, url) => {
+          const q = url && url.searchParams ? url.searchParams : new URLSearchParams();
+          const id = String(q.get('c') || '').slice(0, 64);
+          if (id) {
+            const { entry, first } = recordPageBlame(id, q, Date.now());
+            if (first) {
+              log.warn(
+                `handfx page-blame: client=${id} why=${entry.why || '-'} gap=${entry.gap}ms ` +
+                  `last=${entry.last ? entry.last.slice(0, 120) : '-'}`,
+              );
+            }
+          }
+          res.writeHead(204, { 'cache-control': 'no-store' });
+          res.end();
+        },
+      },
+      // A deploy's push, instead of waiting for the page's own 25 s poll: the bus message the page
+      // already handles (`applyBusCommand` → `reload`). No page state is touched here, and the
+      // route is honest about how many pages were listening.
+      {
+        path: '/page/reload',
+        method: 'POST',
+        handler: (req, res) => {
+          const rec = publish('reload', {});
+          log.info(`handfx page: reload pushed seq=${rec?.seq ?? '-'} clients=${clientsById.size}`);
+          return send(res, 200, { ok: true, seq: rec?.seq ?? null, clients: clientsById.size });
+        },
+      },
+      // What ffmpeg can open. An explicit ask, never a poll: enumeration launches the virtual-camera
+      // client DLLs in other processes. A failed enumeration is still a 200 with `ok: false`, so the
+      // pane renders the reason instead of a broken request.
+      {
+        path: '/cameras',
+        method: 'GET',
+        handler: async (req, res) => send(res, 200, await camerasPayload(false)),
+      },
+      {
+        path: '/cameras/rescan',
+        method: 'POST',
+        handler: async (req, res) => send(res, 200, await camerasPayload(true)),
+      },
+      // Restart the feed in place, for a wedged ffmpeg or a source the operator just changed.
+      // `dispose()` is the relay's stop half: it ends the attached streams, tears the pipe socket
+      // down, kills the producer and zeroes the attempt budget (`failed` becomes `idle`). `sync()`
+      // is the start half: it re-reads the settings, so a pending `cameraRelaySource` applies, and
+      // starts again only when someone is reading or keep-warm is on. Both are synchronous, and
+      // `start()` returns while a producer exists, so two presses in a row cannot spawn two
+      // producers. The page's stream ends by design; it reconnects on its own.
+      {
+        path: '/cameras/restart',
+        method: 'POST',
+        handler: (req, res) => {
+          const before = relay.status();
+          if (!relay.enabled()) {
+            log.warn(`handfx cameras: restart refused — relay off (state=${before.state})`);
+            return send(res, 200, { ok: false, restarted: false, error: 'camera relay is off' });
+          }
+          try {
+            relay.dispose();
+            relay.sync();
+            const after = relay.status();
+            log.info(
+              `handfx cameras: restart from=${before.state} to=${after.state} source="${after.source || ''}" attempt=${after.attempt} clients=${before.clients}`,
+            );
+            return send(res, 200, {
+              ok: true,
+              restarted: true,
+              state: after.state,
+              source: after.source,
+              attempt: after.attempt,
+              clients: after.clients,
+              error: null,
+            });
+          } catch (err) {
+            const message = err && err.message ? err.message : String(err);
+            log.warn(`handfx cameras: restart failed "${message}" state=${before.state}`);
+            return send(res, 200, { ok: false, restarted: false, error: message });
+          }
+        },
+      },
       // The bare list a client may expect from the page's own registry — `Object.keys(EFFECTS)`,
       // strings in renderer order. `/status` carries the same ids with their titles and gestures;
       // this one exists so "the effects" is never a shape a client has to unpack to get right.
@@ -424,11 +1114,37 @@ function build(ctx) {
         handler: (req, res) => {
           relay.sync();
           if (!relay.enabled()) return send(res, 503, { ok: false, error: 'camera relay is off' });
+          // Which document this stream belongs to. The relay ends any older stream of the same
+          // identity before taking this one (see `addClient`), so a reloaded page cannot leave its
+          // predecessor holding a socket out of the browser's six-per-origin budget.
+          const role = roleOf(req);
           res.writeHead(200, {
             'content-type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`,
             'cache-control': 'no-store',
           });
-          relay.addClient(res);
+          relay.addClient(res, role, refPath(req));
+          // A clean end at CAMERA_MAX_MS: no error status, so the page's next `fetch` simply opens
+          // a new stream. `relay.addClient` already drops its client on `close`.
+          const born = Date.now();
+          const remote = req.socket?.remoteAddress || '?';
+          let why = 'client closed';
+          const age = setTimeout(() => {
+            why = 'max age';
+            try {
+              res.end();
+            } catch {
+              /* already gone */
+            }
+          }, CAMERA_MAX_MS);
+          if (age.unref) age.unref();
+          res.on('close', () => {
+            clearTimeout(age);
+            // `superseded` is set by the relay when a newer stream of the same identity arrived:
+            // this response was ended on purpose, not by the page leaving.
+            log.info(
+              `handfx camera stream client=${remote} role=${role || '-'} closed (${res.superseded ? 'superseded' : why}) after ${Math.round((Date.now() - born) / 1000)} s`,
+            );
+          });
           return new Promise((resolve) => res.on('close', resolve));
         },
       },
@@ -565,6 +1281,19 @@ function build(ctx) {
             if (body.pageOpen) body.lastPoseAt = Date.now();
             return send(res, 200, { ok: true });
           }
+          // Per-page identity, optional by design: a document cached before `clientId` existed still
+          // acks, and those acks keep counting through `draw` (see `freshestPage`).
+          if (typeof bodyIn.clientId === 'string' && bodyIn.clientId && bodyIn.clientId.length <= 64) {
+            // Which document this ack belongs to, recorded so /status can show one entry per role
+            // rather than one per ephemeral clientId (which changes on every reload). Declared in
+            // the body; a page from before this existed is classified from its own User-Agent
+            // through `roleOf` (its URL carries no role). Read-only bookkeeping: superseding is
+            // done where a long-lived response attaches, never here — an ack cannot tell a
+            // successor's own pre-ack stream from its predecessor's, and guessing would drop the
+            // live page's feed.
+            touchClient(bodyIn.clientId, bodyIn, validRole(bodyIn.role) || roleOf(req));
+            applyFeedDemand();
+          }
           if (Number.isFinite(bodyIn.maskAt) && bodyIn.maskAt > body.lastMaskAt) body.lastMaskAt = Math.min(Date.now(), bodyIn.maskAt);
           // The page's draw truth: monotonic counter, the anchor source, the last draw stamp.
           if (Number.isFinite(bodyIn.draws)) draw.draws = Math.max(draw.draws, Math.max(0, bodyIn.draws | 0));
@@ -637,6 +1366,43 @@ function build(ctx) {
             at: Date.now(),
           });
           send(res, 200, { ok: true, ratio: effectiveRatio() });
+        },
+      },
+
+      // The page's own diagnostics: an error, a rejection, a failed resource load, or a boot
+      // breadcrumb. Additive to /ack and deliberately dumb — it must never become the failure it
+      // reports. Accepts one event or a coalesced batch (`{clientId, build, events:[…]}`), keeps the
+      // last 50 in memory and answers `{ok:true}` in every case, including a malformed body.
+      {
+        path: '/page-event',
+        method: 'POST',
+        handler: (req, res, url, bodyIn) => {
+          try {
+            const body = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
+            const list = Array.isArray(body.events) ? body.events : [body];
+            for (const raw of list) {
+              if (!raw || typeof raw !== 'object') continue;
+              const ev = {
+                kind: typeof raw.kind === 'string' && raw.kind ? raw.kind.slice(0, 40) : 'note',
+                phase: typeof raw.phase === 'string' ? raw.phase.slice(0, 40) : '',
+                message: typeof raw.message === 'string' ? raw.message.slice(0, 500) : String(raw.message == null ? '' : raw.message).slice(0, 500),
+                stack: typeof raw.stack === 'string' ? raw.stack.slice(0, 1000) : '',
+                src: typeof raw.src === 'string' ? raw.src.slice(0, 500) : '',
+                count: Number.isFinite(raw.count) ? Math.max(1, raw.count | 0) : 1,
+                clientId: typeof (body.clientId || raw.clientId) === 'string' ? String(body.clientId || raw.clientId).slice(0, 64) : '',
+                build: typeof (body.build || raw.build) === 'string' ? String(body.build || raw.build).slice(0, 64) : '',
+                t: Number.isFinite(raw.t) ? raw.t : Date.now(),
+                at: Date.now(),
+              };
+              pageEvents.unshift(ev);
+              if (pageEvents.length > 50) pageEvents.length = 50;
+              log.info(`handfx page: ${ev.kind} ${ev.phase} ${ev.message}`.slice(0, 400));
+            }
+          } catch (err) {
+            // Swallow: a diagnostic channel that can fail is worse than none. The 200 below is the
+            // contract — the page must never retry or care.
+          }
+          return send(res, 200, { ok: true });
         },
       },
 

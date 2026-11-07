@@ -43,7 +43,10 @@ export async function render(container, ctx) {
   body.append(previewSlot, sideSlot);
   const effectsHost = el('div');
   const footerHost = el('div');
-  root.append(headerHost, bannerHost, body, effectsHost, footerHost);
+  // The body view gets its own slot, outside the column that render() rebuilds: an iframe
+  // detached from the document reloads, and this one must not.
+  const bodySlot = el('div', { class: 'hfx-body-slot' });
+  root.append(headerHost, bannerHost, body, bodySlot, effectsHost, footerHost);
 
   const s = {
     status: null, // /api/handfx/status
@@ -52,7 +55,19 @@ export async function render(container, ctx) {
     live: new Map(), // effect id -> {startedAt, hands, gesture} (from the overlay's reports)
     underlay: true, // the camera feed under the effects; off leaves the dark backdrop
     log: [],
+    // Camera card. The device list is read once and only re-enumerated on a button press: listing
+    // DirectShow launches the virtual-camera clients, so it is never polled.
+    cameras: null, // last /api/handfx/cameras payload
+    camerasReadAt: 0, // when that payload was produced (ageMs already subtracted)
+    camerasBusy: false, // a rescan is in flight
+    camerasErr: null,
+    cameraPending: null, // {from,to}: written to settings, not yet in the feed
+    cameraRestartErr: null,
   };
+
+  // The pane asks OBS's body source to start or stop on the control channel. It never publishes a
+  // mask and never opens the body camera: pages/js/body/main.js owns 'handfx.body' publishing.
+  const bodyCtl = 'BroadcastChannel' in window ? new BroadcastChannel('handfx.body.ctl') : null;
 
   /* -------------------------------------------------------------- data */
 
@@ -163,9 +178,9 @@ export async function render(container, ctx) {
     const b = (s.status && s.status.body) || {};
     const last = Number(b.lastMaskAt) || 0;
     const age = last ? Date.now() - last : Infinity;
-    if (!last) return { tone: 'idle', text: 'no body mask yet — open the body page and start it' };
+    if (!last) return { tone: 'idle', text: 'no body mask yet. Start the body source below.' };
     if (age < BODY_FRESH_MS) return { tone: 'ok', text: `mask arriving (${Math.round(age / 100) / 10}s ago)` };
-    return { tone: 'warn', text: `mask stopped ${Math.round(age / 1000)}s ago — body effects are off` };
+    return { tone: 'warn', text: `mask stopped ${Math.round(age / 1000)}s ago, body effects are off` };
   }
 
   function effectEnabled(id) {
@@ -250,6 +265,9 @@ export async function render(container, ctx) {
       previewSlot.append(previewHost);
     }
     sideSlot.replaceChildren(sideColumn(reg, enabled));
+    // Built once, then only its text changes: the body iframe inside must never be recreated.
+    if (!bodyCardEl) bodySlot.append((bodyCardEl = bodyCard()));
+    updateBodyCard();
     effectsHost.replaceChildren(effectsCard(reg));
     footerHost.replaceChildren(footer(reg));
     renderLog();
@@ -290,6 +308,12 @@ export async function render(container, ctx) {
      by a bus event or a status poll. */
   const previewHost = el('div', { class: 'hfx-preview-host' });
   let pv = null;
+  // The body view's own host, created once so a status poll never reloads the iframe.
+  const bodyHost = el('div', { class: 'hfx-body-embed-host' });
+  let bodyPv = null;
+  let bodyCardEl = null;
+  let bodyPillEl = null;
+  let bodyBeatEl = null;
 
   function previewCard() {
     if (!pv) {
@@ -312,7 +336,8 @@ export async function render(container, ctx) {
 
   function sideColumn(reg, enabled) {
     const col = el('div', { class: 'hfx-side' });
-    col.append(trackingCard(), bodyCard(), lookCard());
+    // Camera first: it is the one control an operator reaches for when the picture is missing.
+    col.append(cameraCard(), trackingCard(), lookCard());
     return col;
   }
 
@@ -359,6 +384,228 @@ export async function render(container, ctx) {
     };
   }
 
+  /* -------------------------------------------------------------- camera card */
+
+  // The camera dropdown lives here, in the pane, on the main page. Nothing opens a second window,
+  // and the separate device window is gone: the select is the whole device list.
+  const PAGE_ACK_FRESH_MS = 5000;
+
+  /** The relay's own facts, plus the device the operator selected in settings. */
+  function cameraFacts() {
+    const f = (s.status && s.status.cameraFeed) || {};
+    const selected = String(s.settings.cameraRelaySource || '');
+    const clients = Array.isArray(f.clientList) ? f.clientList : [];
+    const now = Date.now();
+    const drawing = clients.find(
+      (c) => c && c.source === 'camera' && !c.hidden && Number(c.lastAckAt) > 0 && now - Number(c.lastAckAt) <= PAGE_ACK_FRESH_MS,
+    );
+    return { f, selected, clients, drawing, state: String(f.state || 'unknown') };
+  }
+
+  /**
+   * The camera's state, computed from /status only. A select that wrote the setting is
+   * `selected, not active` until the relay reports the new source running, so the pane never
+   * claims a switch that has not happened. `idle` is never spelled as a missing camera: that
+   * conflation is what made a 16 hour outage look like unplugged hardware.
+   */
+  function cameraPill() {
+    const { f, selected, state, drawing } = cameraFacts();
+    if (s.cameraPending) {
+      const to = s.cameraPending.to ? `“${s.cameraPending.to}”` : 'the first camera';
+      return { tone: 'warn', text: `selected ${to}, not active. The feed still reads the old device until you press Restart camera.` };
+    }
+    if (state === 'off') return { tone: 'idle', text: 'relay off. The cameraRelay setting is off, so nothing reads a camera.' };
+    if (state === 'failed' || f.error) return { tone: 'bad', text: `relay failed: ${String(f.error || f.reason || 'ffmpeg stopped').slice(0, 140)}` };
+    if (state === 'stalled') return { tone: 'bad', text: 'feed stalled. ffmpeg is still running but no frame arrived in the last 2 s.' };
+    if (state === 'starting' || state === 'restarting') {
+      return { tone: 'warn', text: `starting. ffmpeg is opening ${selected || 'the camera'}.` };
+    }
+    if (state === 'idle' && Number(f.clients || 0) === 0) {
+      // Honest idle. Never "no camera": the device exists, nothing has asked the relay for it.
+      return { tone: 'idle', text: 'relay idle, no page connected. Nothing has asked the relay for a picture.' };
+    }
+    if (state === 'live' && drawing) {
+      return { tone: 'ok', text: `live. The page is drawing the feed${Number(f.fps) > 0 ? ` at ${Math.round(Number(f.fps))} fps` : ''}.` };
+    }
+    if (state === 'live') {
+      return {
+        tone: 'warn',
+        text:
+          Number(f.clients || 0) === 0
+            ? 'feed ready, no page connected. The relay stops five seconds after the last page leaves.'
+            : 'feed running, but no page is drawing the camera yet.',
+      };
+    }
+    return { tone: 'idle', text: `relay state: ${state}. ${f.reason ? String(f.reason).slice(0, 140) : 'No reason reported.'}` };
+  }
+
+  /** One line of relay arithmetic, in the operator's words. */
+  function cameraDiagnostic() {
+    const { f, clients, selected } = cameraFacts();
+    const bits = [`relay ${f.state || 'unknown'}`];
+    bits.push(selected ? `source “${selected}”` : 'source not set');
+    if (Number.isFinite(Number(f.frames))) bits.push(`${Number(f.frames)} frames`);
+    if (Number(f.dropped) > 0) bits.push(`${Number(f.dropped)} dropped`);
+    const pages = Number(f.clientCount ?? f.clients ?? 0);
+    bits.push(`${pages} page${pages === 1 ? '' : 's'}`);
+    // The relay's client records and its page count can disagree; that gap is worth seeing.
+    if (clients.length && clients.length !== pages) bits.push(`${clients.length} client records`);
+    const quiet = clients.filter((c) => c && c.hidden);
+    if (quiet.length) bits.push(`${quiet.length} hidden`);
+    return bits.join(' · ');
+  }
+
+  /** How old the device list is. The cache is 30 s, so this says when, not whether. */
+  function cameraListLine() {
+    if (s.camerasBusy) return 'scanning. DirectShow enumeration takes 2 to 8 s and switches the virtual cameras on.';
+    if (s.camerasErr && !s.cameras) return `camera list unavailable: ${s.camerasErr}`;
+    if (!s.cameras) return 'camera list not read yet.';
+    const age = Math.max(0, Math.round((Date.now() - (s.camerasReadAt || Date.now())) / 1000));
+    const when = age < 2 ? 'as of just now' : `as of ${age} s ago`;
+    const n = Array.isArray(s.cameras.devices) ? s.cameras.devices.length : 0;
+    return `${n} camera${n === 1 ? '' : 's'} ffmpeg can open, ${when}${s.cameras.cached ? ', from the 30 s cache' : ''}.`;
+  }
+
+  async function loadCameras(rescan = false) {
+    s.camerasBusy = true;
+    s.camerasErr = null;
+    render();
+    try {
+      const out = rescan ? await api.post('/api/handfx/cameras/rescan', {}) : await api.get('/api/handfx/cameras');
+      s.camerasReadAt = Date.now() - Math.max(0, Number((out && out.ageMs) || 0));
+      if (out && out.ok === false) {
+        s.camerasErr = String(out.error || 'the server could not list devices');
+      } else {
+        s.cameras = out || null;
+      }
+      if (out && out.error && !s.camerasErr) s.camerasErr = String(out.error);
+    } catch (err) {
+      s.camerasErr = err.message;
+    } finally {
+      s.camerasBusy = false;
+      render();
+    }
+  }
+
+  /** The dropdown. Virtual cameras are marked in the option text and by a badge beside the select. */
+  function cameraSelect(selected) {
+    const wrap = el('div', { class: 'hfx-cam-pick' });
+    const sel = el('select', { class: 'hfx-select', id: 'cam-source', 'aria-label': 'camera device' });
+    const c = s.cameras;
+    const devices = c && Array.isArray(c.devices) ? c.devices.slice() : [];
+    const known = devices.some((d) => d.name === selected);
+
+    if (!devices.length) {
+      sel.append(el('option', { value: selected || '', text: c ? 'no camera ffmpeg can open' : 'device list not read yet' }));
+    } else if (selected && !known) {
+      sel.append(el('option', { value: selected, text: `${selected} (set here, not in this list)` }));
+    } else if (!selected) {
+      // An empty setting means "whatever ffmpeg opens first"; say that instead of silently
+      // displaying the first device as if the operator had chosen it.
+      sel.append(el('option', { value: '', text: '(first camera ffmpeg opens)' }));
+    }
+    for (const d of devices) {
+      sel.append(el('option', { value: d.name, text: d.virtual ? `${d.name} · virtual` : d.name }));
+    }
+    sel.value = selected || (devices[0] ? devices[0].name : '');
+    sel.disabled = s.camerasBusy;
+    sel.addEventListener('change', async () => {
+      const to = sel.value;
+      const active = (s.cameras && s.cameras.live) || cameraFacts().f.source || '';
+      sel.disabled = true;
+      try {
+        await patch('cameraRelaySource', to);
+        s.cameraPending = to && to !== active ? { from: active, to } : null;
+        push(
+          s.cameraPending
+            ? `camera set to “${to}”. The feed still reads the old device until you press Restart camera.`
+            : `camera set to “${to}”. It is already the device the feed reads.`,
+          'warn',
+        );
+      } catch (err) {
+        push(`camera setting refused: ${err.message}`, 'bad');
+      }
+      render();
+    });
+    wrap.append(sel);
+
+    const dev = devices.find((d) => d.name === selected);
+    if (dev && dev.virtual) wrap.append(el('span', { class: 'hfx-badge', text: 'virtual' }));
+    return wrap;
+  }
+
+  function cameraActions() {
+    const box = el('div', { class: 'hfx-row hfx-actions' });
+
+    const restart = el('button', {
+      type: 'button',
+      class: 'btn btn-sm hfx-cam-restart',
+      text: 'Restart camera',
+      title: 'Stops ffmpeg and starts it again on the selected device. The feed drops for a second or two.',
+    });
+    restart.disabled = s.camerasBusy;
+    restart.addEventListener('click', async () => {
+      restart.disabled = true;
+      restart.textContent = 'restarting…';
+      s.cameraRestartErr = null;
+      try {
+        await api.post('/api/handfx/cameras/restart', {});
+        s.cameraPending = null;
+        push('camera restart sent. The feed drops for a second or two, then comes back on the selected device.', 'warn');
+        await refresh();
+      } catch (err) {
+        s.cameraRestartErr = `${err.message}. Nothing was restarted.`;
+      }
+      render();
+    });
+
+    const scan = el('button', {
+      type: 'button',
+      class: 'btn btn-quiet btn-sm',
+      text: s.camerasBusy ? 'scanning…' : 'Refresh list',
+      title: 'Asks ffmpeg to list DirectShow devices again. Takes 2 to 8 s and switches the virtual cameras on.',
+    });
+    scan.disabled = s.camerasBusy;
+    scan.addEventListener('click', () => loadCameras(true));
+
+    box.append(restart, scan);
+    return box;
+  }
+
+  /** Devices ffmpeg cannot open as video: listed, never selectable. */
+  function cameraOtherDevices() {
+    const list = s.cameras && Array.isArray(s.cameras.nonVideo) ? s.cameras.nonVideo : [];
+    if (!list.length) return null;
+    return el(
+      'details',
+      { class: 'hfx-cam-other' },
+      el('summary', { text: `${list.length} device${list.length === 1 ? '' : 's'} ffmpeg cannot open as video` }),
+      el('ul', {}, list.map((d) => el('li', { text: `${d.name}${d.kind && d.kind !== 'none' ? ` (${d.kind})` : ''}` }))),
+    );
+  }
+
+  function cameraCard() {
+    const { f, selected } = cameraFacts();
+    const pill = cameraPill();
+    const card = el('section', { class: 'panel hfx-cam' });
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Camera' })));
+
+    const bodyEl = el('div', { class: 'panel-body hfx-fields' });
+    bodyEl.append(cameraSelect(selected));
+    bodyEl.append(el('div', { class: 'hfx-cam-state' }, el('span', { class: 'hfx-pill', 'data-tone': pill.tone, text: pill.text })));
+    bodyEl.append(cameraActions());
+    bodyEl.append(el('div', { class: 'hfx-note hfx-cam-diag', text: cameraDiagnostic() }));
+    if (f.reason) bodyEl.append(el('div', { class: 'hfx-note', text: `Relay says: ${String(f.reason).slice(0, 200)}` }));
+    if (f.error) bodyEl.append(el('pre', { class: 'hfx-stderr', text: String(f.error).slice(-600) }));
+    if (s.cameraRestartErr) bodyEl.append(el('div', { class: 'hfx-note bad', text: `restart: ${s.cameraRestartErr}` }));
+    bodyEl.append(el('div', { class: 'hfx-note hfx-cam-list', text: cameraListLine() }));
+    if (s.camerasErr && s.cameras) bodyEl.append(el('div', { class: 'hfx-note', text: `this read failed: ${s.camerasErr}` }));
+    const other = cameraOtherDevices();
+    if (other) bodyEl.append(other);
+    card.append(bodyEl);
+    return card;
+  }
+
   function trackingCard() {
     const card = el('section', { class: 'panel' });
     const src = effectiveSource();
@@ -394,30 +641,82 @@ export async function render(container, ctx) {
     return card;
   }
 
-  /** Body tracking: a read-only report of the body page's mask, plus its page link and buttons. */
+  /** Start and Stop for the body source: a command on the control channel, never a camera open. */
+  function bodyAction(cmd, label, variant) {
+    return el('button', {
+      type: 'button',
+      class: variant,
+      text: label,
+      title:
+        cmd === 'start'
+          ? 'asks the OBS body source to open its camera and start publishing the mask'
+          : 'asks the OBS body source to stop and close its camera',
+      onclick: () => {
+        if (!bodyCtl) {
+          push('this browser has no BroadcastChannel, so the pane cannot reach the body source', 'bad');
+          return;
+        }
+        bodyCtl.postMessage({ cmd, at: Date.now() });
+        push(`body ${cmd} sent to the OBS body source`, 'ok');
+      },
+    });
+  }
+
+  /**
+   * The body view, embedded in the pane. `?embed=1` makes the page a viewer: OBS keeps the camera,
+   * the mask publishing and the /ack beat (see pages/js/body/main.js), and this card only watches
+   * the mask arrive. Built once and then updated in place: a detached iframe reloads, and a
+   * reload here would restart the viewer on every status poll.
+   */
   function bodyCard() {
-    const card = el('section', { class: 'panel' });
-    const b = bodySummary();
-    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Body tracking' }),
-      el('span', { class: 'hfx-pill', 'data-tone': b.tone, text: b.text })));
+    const card = el('section', { class: 'panel hfx-body-card' });
+    bodyPillEl = el('span', { class: 'hfx-pill', 'data-tone': 'idle', text: 'reading status' });
+    card.append(el('div', { class: 'panel-head' }, el('span', { class: 'panel-title', text: 'Body camera' }), bodyPillEl));
+
     const body = el('div', { class: 'panel-body hfx-fields' });
-    const page = s.status && s.status.body;
+    bodyPv = mountPreview(bodyHost, {
+      title: 'Body view',
+      hint: 'live mask from the OBS body source; this view never opens a camera',
+      src: '/shockfx/body?embed=1',
+      interactive: false,
+    });
+    bodyBeatEl = el('div', { class: 'hfx-note', text: '' });
     body.append(
-      el('p', { class: 'hfx-help', text: `The body page runs PoseLandmarker + ImageSegmenter in its own small Browser Source and posts one mask at ~15 Hz over BroadcastChannel('handfx.body'). Only timestamps come back here — a frame never crosses the wire. Body effects stop 1 s after the mask does.` }),
-      el('div', { class: 'hfx-row hfx-actions' },
-        actionButton({ label: 'projectile.fire', title: 'throw the projectile from the current hand anchor', variant: 'btn btn-sm', run: () => bus('projectile.fire', { skin: shootSkin() }), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
+      el('div', { class: 'hfx-body-embed' }, bodyHost),
+      el(
+        'div',
+        { class: 'hfx-row hfx-actions' },
+        bodyAction('start', 'Start body source', 'btn btn-sm'),
+        bodyAction('stop', 'Stop body source', 'btn btn-quiet btn-sm'),
+        actionButton({ label: 'projectile.fire', title: 'throw the projectile from the current hand anchor', variant: 'btn btn-quiet btn-sm', run: () => bus('projectile.fire', { skin: shootSkin() }), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
         actionButton({ label: 'edit.clear', title: 'wipe the hand-edit canvas', variant: 'btn btn-quiet btn-sm', run: () => bus('edit.clear'), onDone: () => render(), onError: (e) => push(e.message, 'bad') }),
       ),
-      (s.status && s.status.bodyPage)
-        ? el('a', { class: 'gen-link hfx-open', href: s.status.bodyPage, target: '_blank', rel: 'noopener' },
-            el('span', { class: 'gen-link-title', text: 'Open the body tracking page' }), el('span', { class: 'gen-link-go', text: 'open ↗', 'aria-hidden': 'true' }))
-        : null,
+      el('p', { class: 'hfx-help', text: 'The body browser source in OBS owns the camera and publishes the mask. Start and Stop ask it to open or close that camera. This pane never opens the camera itself, so the two cannot fight over the device.' }),
+      bodyBeatEl,
     );
-    if (page && page.lastPoseAt) {
-      body.append(el('div', { class: 'hfx-note', text: `body page beat ${Math.round((Date.now() - page.lastPoseAt) / 1000)}s ago` }));
+    if (s.status && s.status.bodyPage) {
+      body.append(
+        el('a', { class: 'gen-link hfx-open', href: s.status.bodyPage, target: '_blank', rel: 'noopener' },
+          el('span', { class: 'gen-link-title', text: 'Open the body tracking page on its own' }),
+          el('span', { class: 'gen-link-go', text: 'open ↗', 'aria-hidden': 'true' })),
+      );
     }
     card.append(body);
     return card;
+  }
+
+  /** The body card's text, updated in place so its iframe is never rebuilt. */
+  function updateBodyCard() {
+    if (!bodyPillEl) return;
+    const b = bodySummary();
+    bodyPillEl.dataset.tone = b.tone;
+    bodyPillEl.textContent = b.text;
+    const page = (s.status && s.status.body) || {};
+    if (bodyBeatEl) {
+      bodyBeatEl.textContent = page.lastPoseAt
+        ? `body source beat ${Math.round((Date.now() - page.lastPoseAt) / 1000)} s ago`
+        : 'no beat from the OBS body source yet. Start it above, or check that its browser source is open in OBS.';
+    }
   }
 
   function lookCard() {
@@ -613,6 +912,10 @@ export async function render(container, ctx) {
     return () => unsub();
   }
   render();
+
+  // The device list, read once. It is cached for 30 s and enumeration is a real side effect (it
+  // launches the virtual-camera clients), so this never joins the status poll.
+  loadCameras().catch(() => {});
 
   // The body-tracking row is about the last few seconds (mask freshness), not the last command:
   // re-read the status on a slow beat so it ages honestly on an idle pane.

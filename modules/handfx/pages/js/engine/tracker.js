@@ -31,6 +31,13 @@ const MODEL_CACHE = 'handfx:models-v1';
 const MODEL_KEY_LOCAL = '/handfx/model/hand_landmarker.task?from=local';
 const MODEL_KEY_CDN = '/handfx/model/hand_landmarker.task?from=cdn';
 
+/** How long a detect may stay unanswered before the detector thread is presumed dead. */
+export const DETECT_TIMEOUT = 3000;
+/** The same patience for a rebuilt worker's handshake: a wasm compile is slower than a frame. */
+export const INIT_TIMEOUT = 10000;
+/** Consecutive deadlines, with no ready+result between them, before tracking is called failed. */
+export const HANG_LIMIT = 3;
+
 /** The wasm fileset the SDK is handed. Directory names match the module's vendor aliases. */
 export function wasmFileset(base = '/api/handfx/vendor') {
   return {
@@ -87,9 +94,12 @@ function clamp(n, lo, hi) {
 }
 
 export class Tracker {
-  constructor({ onFrame, onState } = {}) {
+  constructor({ onFrame, onState, worker, clock, task } = {}) {
     this.onFrame = onFrame || (() => {});
     this.onState = onState || (() => {});
+    // The worker's graph. The overlay drives hands; a page that needs another graph starts its own
+    // worker with that task rather than changing this one's shape.
+    this.task = task || 'hand';
     this.state = 'idle'; // idle | starting | running | error
     this.error = null;
     this.model = 'idle'; // idle | loading | ready | failed
@@ -118,6 +128,29 @@ export class Tracker {
     // Where the model bytes came from (`local` = the module's own file, `cdn` = the model URL).
     this.modelSource = null;
     this._t0 = 0;
+
+    // Detection runs in a classic worker (overlay/hand-worker.js), not on this thread: the wasm
+    // graph's final fence waits forever on a lost GPU context, and nothing on the main thread can
+    // pre-empt it. The page keeps one frame in flight and one queued — newest wins.
+    this._worker = null;
+    this._workerReady = false;
+    this._bootWait = null; // {resolve, reject} for the init handshake in progress
+    this._pending = null; // {bitmap, at, width, height} — single slot, newest wins
+    this._inflight = null; // the frame the worker is chewing on
+    this._busy = false;
+    this._sentAt = 0;
+    this._hangTimer = 0;
+    this._hangCount = 0; // consecutive deadlines with no ready+result in between
+    this._seq = 0;
+    this._modelBuffer = null; // the fetched bytes, kept so a rebuilt worker need not refetch
+    this._options = null; // createFromOptions options, replayed on every rebuild
+    this._fileset = null;
+
+    // Test seams: a fake worker and a fake clock let the hang policy be proven without a browser.
+    this._newWorker = worker || (() => new Worker(new URL('../overlay/hand-worker.js', import.meta.url)));
+    this._now = (clock && clock.now) || (() => performance.now());
+    this._setTimer = clock && clock.setTimeout ? (fn, ms) => clock.setTimeout(fn, ms) : (fn, ms) => setTimeout(fn, ms);
+    this._clearTimer = clock && clock.clearTimeout ? (id) => clock.clearTimeout(id) : (id) => clearTimeout(id);
   }
 
   snapshot() {
@@ -248,7 +281,6 @@ export class Tracker {
     if (this.landmarker) return;
     this._setState({ model: 'loading' });
     try {
-      const mod = await import('/api/handfx/vendor/vision/vision_bundle.mjs');
       let model;
       try {
         model = await fetchModel({ local: opts.modelLocal, url: opts.modelUrl, signal: AbortSignal.timeout(45000) });
@@ -257,35 +289,18 @@ export class Tracker {
         throw new MediaError('model', `Hand model unavailable: ${err.message}`);
       }
       const conf = confidenceFor(opts.sensitivity);
-      let landmarker;
-      try {
-        landmarker = await mod.HandLandmarker.createFromOptions(wasmFileset(), {
-          baseOptions: { modelAssetBuffer: new Uint8Array(model.buffer), delegate: 'GPU' },
-          numHands: 2,
-          runningMode: 'VIDEO',
-          minHandDetectionConfidence: conf.minDetection,
-          minHandPresenceConfidence: conf.minDetection,
-          minTrackingConfidence: conf.minTracking,
-        });
-        this._setState({ runtime: 'nosimd' });
-      } catch (err) {
-        // GPU delegate on a machine without WebGL2: retry on the CPU before calling it failed.
-        try {
-          landmarker = await mod.HandLandmarker.createFromOptions(wasmFileset(), {
-            baseOptions: { modelAssetBuffer: new Uint8Array(model.buffer), delegate: 'CPU' },
-            numHands: 2,
-            runningMode: 'VIDEO',
-            minHandDetectionConfidence: conf.minDetection,
-            minHandPresenceConfidence: conf.minDetection,
-            minTrackingConfidence: conf.minTracking,
-          });
-          this._setState({ runtime: 'nosimd-cpu' });
-        } catch (err2) {
-          this._setState({ model: 'failed' });
-          throw new MediaError('model', `Hand model failed to load (${model.cached ? 'cached' : 'downloaded'} ${Math.round(model.buffer.byteLength / 1e6)} MB): ${err2.message}`);
-        }
-      }
-      this.landmarker = landmarker;
+      // The bytes stay here: a worker that hangs is terminated and rebuilt, and downloading the
+      // model again to recover from a frozen GPU context would turn a hiccup into an outage.
+      this._modelBuffer = model.buffer;
+      this._fileset = wasmFileset();
+      this._options = {
+        numHands: 2,
+        runningMode: 'VIDEO',
+        minHandDetectionConfidence: conf.minDetection,
+        minHandPresenceConfidence: conf.minDetection,
+        minTrackingConfidence: conf.minTracking,
+      };
+      await this._initDetector();
       // Which copy was used is not visible from the picture: a CDN download and the module's own
       // file both end here as "ready". Keep it so the pane and the browser gate can ask.
       this.modelSource = { from: model.from, source: model.source, cached: model.cached, bytes: model.buffer.byteLength };
@@ -294,6 +309,19 @@ export class Tracker {
       if (!(err instanceof MediaError)) this._setState({ model: 'failed' });
       throw err;
     }
+  }
+
+  /**
+   * Start the detector worker and wait for its handshake. Split out of `_loadModel` because a
+   * rebuild after a hang already has the bytes and the options and must not refetch.
+   */
+  async _initDetector() {
+    if (!this._modelBuffer) throw new MediaError('model', 'Hand model unavailable: no bytes to hand the detector');
+    const runtime = await this._bootWorker();
+    // The handle the rest of the class gates on (`pushFrame`, `startRelay`, `dispose`): truthy once
+    // a detector exists; its `close()` shuts the worker down.
+    this.landmarker = { worker: true, close: () => this._stopWorker() };
+    this._setState({ runtime });
   }
 
   /**
@@ -343,26 +371,205 @@ export class Tracker {
     }
     const g = c.getContext('2d');
     if (!g) return false;
+    // The underlay paints this canvas (main.js), so the drawn copy keeps happening here even
+    // though detection now reads the bitmap on the other thread.
     g.drawImage(bitmap, 0, 0, width, height);
-    try {
-      this._detect(c, width, height, at);
-    } catch (err) {
-      // A throw from the SDK is a real failure, not "no hands": say so once.
-      this._setState({ state: 'error', error: `tracking threw: ${err.message}` });
-      return false;
-    }
+    return this._submit(bitmap, at, width, height);
+  }
+
+  /**
+   * Hand one frame to the detector thread. One in flight, one queued, newest wins: a detector that
+   * runs slower than the camera must not build a backlog of stale poses.
+   */
+  _submit(bitmap, at, width, height) {
+    if (!this._worker && !this._startWorker()) return false;
+    // A queued frame nobody has sent yet is ours to release; the one in flight was transferred.
+    if (this._pending && typeof this._pending.bitmap.close === 'function') this._pending.bitmap.close();
+    this._pending = { bitmap, at, width, height };
+    this._flush();
     return true;
   }
 
-  /** The one detect call: the camera loop and the relay both come through here. */
-  _detect(source, width, height, at) {
-    const res = this.landmarker.detectForVideo(source, at);
-    const hands = res && res.landmarks ? res.landmarks.map((lm, i) => ({
-      landmarks: lm,
-      handedness: res.handedness && res.handedness[i] ? res.handedness[i][0].categoryName : null,
-    })) : [];
+  _flush() {
+    if (!this._worker || !this._workerReady || this._busy || !this._pending) return;
+    const frame = this._pending;
+    this._pending = null;
+    this._busy = true;
+    this._inflight = frame;
+    this._seq += 1;
+    this._arm(DETECT_TIMEOUT);
+    try {
+      // Transferred, not copied: a 720p bitmap is megabytes and this runs 30 times a second. The
+      // page's other holder is relay.js, whose `close()` on a detached bitmap is a no-op.
+      this._worker.postMessage(
+        { type: 'detect', bitmap: frame.bitmap, at: frame.at, seq: this._seq, size: { width: frame.width, height: frame.height } },
+        [frame.bitmap],
+      );
+    } catch {
+      // Already detached (a consumer closed it): drop this frame rather than wedge the sender.
+      this._clearTimer(this._hangTimer);
+      this._hangTimer = 0;
+      this._busy = false;
+      this._inflight = null;
+      if (typeof frame.bitmap.close === 'function') frame.bitmap.close();
+      this._flush();
+    }
+  }
+
+  _arm(ms) {
+    this._clearTimer(this._hangTimer);
+    this._sentAt = this._now();
+    this._hangTimer = this._setTimer(() => this._onHang(), ms);
+  }
+
+  /**
+   * A deadline with no answer: the detector thread is gone, or its GPU fence is never coming back.
+   * Nothing on the page can pre-empt that call, so the only cure is terminate() and a fresh thread.
+   */
+  _onHang() {
+    this._hangTimer = 0;
+    this._hangCount += 1;
+    const dead = this._inflight;
+    this._inflight = null;
+    this._busy = false;
+    this._stopWorker();
+
+    if (this._hangCount >= HANG_LIMIT) {
+      if (this._pending) {
+        if (typeof this._pending.bitmap.close === 'function') this._pending.bitmap.close();
+        this._pending = null;
+      }
+      this._setState({ state: 'error', error: 'tracking stalled: detector stopped responding' });
+      return;
+    }
+
+    this._startWorker();
+    // A rebuild that never becomes ready has to reach the limit too, or the page keeps a dead
+    // thread and never says so. Only armed when the handshake has not already come back.
+    if (!this._workerReady) this._arm(INIT_TIMEOUT);
+    // The pose it was showing is a guess now: say "no hands" once so effects drop instead of
+    // freezing a stale hand in place.
+    if (this._hangCount === 1) {
+      this.onFrame({
+        hands: [],
+        width: (dead && dead.width) || 0,
+        height: (dead && dead.height) || 0,
+        source: 'camera',
+        at: this._now(),
+      });
+    }
+    this._flush();
+  }
+
+  _startWorker() {
+    this._workerReady = false;
+    let worker;
+    try {
+      worker = this._newWorker();
+    } catch (err) {
+      const wait = this._bootWait;
+      this._bootWait = null;
+      if (wait) wait.reject(err);
+      return null;
+    }
+    worker.onmessage = (ev) => this._onMessage(ev);
+    worker.onerror = (ev) => this._onWorkerError(ev);
+    this._worker = worker;
+    worker.postMessage({
+      type: 'init',
+      task: this.task,
+      fileset: this._fileset,
+      options: this._options,
+      // A copy: the page keeps the original for the next rebuild.
+      modelBuffer: this._modelBuffer ? this._modelBuffer.slice(0) : null,
+    });
+    return worker;
+  }
+
+  _bootWorker() {
+    const ready = new Promise((resolve, reject) => {
+      this._bootWait = { resolve, reject };
+    });
+    this._startWorker();
+    return ready;
+  }
+
+  _stopWorker() {
+    this._workerReady = false;
+    if (!this._worker) return;
+    try {
+      this._worker.postMessage({ type: 'close' });
+    } catch {
+      /* the thread is already gone */
+    }
+    try {
+      this._worker.terminate();
+    } catch {
+      /* same */
+    }
+    this._worker = null;
+  }
+
+  _onMessage(ev) {
+    const msg = (ev && ev.data) || {};
+
+    if (msg.type === 'ready') {
+      this._workerReady = true;
+      const wait = this._bootWait;
+      this._bootWait = null;
+      if (wait) wait.resolve(msg.runtime || null);
+      this._flush();
+      return;
+    }
+
+    if (msg.type === 'error') {
+      const wait = this._bootWait;
+      this._bootWait = null;
+      if (wait) {
+        wait.reject(new MediaError('model', `Hand model failed to load: ${msg.error}`));
+        return;
+      }
+      this._stopWorker();
+      this._setState({ state: 'error', error: `tracking threw: ${msg.error}` });
+      return;
+    }
+
+    if (msg.type !== 'result') return;
+    // A result from a worker that was terminated or a session that stopped: nobody wants it.
+    if (msg.seq !== this._seq) return;
+    // After the third deadline the page has said tracking failed: a frame that lands now would
+    // revive exactly the claim it just dropped.
+    if (this.state !== 'running') return;
+    this._clearTimer(this._hangTimer);
+    this._hangTimer = 0;
+    this._busy = false;
+    // Reset only here, never on `ready` alone: a worker that handshakes and then hangs forever must
+    // reach the limit instead of terminate-looping behind a page that still claims to track.
+    this._hangCount = 0;
+    const frame = this._inflight;
+    this._inflight = null;
     countFrame(this);
-    this.onFrame({ hands, width, height, source: 'camera', at });
+    this.onFrame({
+      hands: msg.hands || [],
+      width: (frame && frame.width) || 0,
+      height: (frame && frame.height) || 0,
+      source: 'camera',
+      at: msg.at != null ? msg.at : frame ? frame.at : this._now(),
+    });
+    this._flush();
+  }
+
+  _onWorkerError(ev) {
+    // An uncaught throw in the worker. During the handshake it is a load failure; after it, the
+    // detector is gone and the page must stop claiming a camera it cannot read.
+    const wait = this._bootWait;
+    this._bootWait = null;
+    const error = new MediaError('model', `detector worker failed: ${(ev && ev.message) || 'worker error'}`);
+    if (wait) {
+      wait.reject(error);
+      return;
+    }
+    this._setState({ state: 'error', error: error.message });
   }
 
   _loop() {
@@ -371,12 +578,19 @@ export class Tracker {
       const v = this.video;
       if (v.readyState >= 2 && v.videoWidth && v.currentTime !== this.lastVideoTime) {
         this.lastVideoTime = v.currentTime;
-        try {
-          this._detect(v, v.videoWidth, v.videoHeight, performance.now());
-        } catch (err) {
-          // A throw from the SDK is a real failure, not "no hands": say so once.
-          this._setState({ state: 'error', error: `tracking threw: ${err.message}` });
-          return;
+        // The worker takes a bitmap, not a <video>: decode off the loop so a slow read never holds
+        // the rAF tick. A frame still in flight means its successor is newer anyway.
+        if (!this._busy && !this._pending) {
+          const at = this._now();
+          const width = v.videoWidth;
+          const height = v.videoHeight;
+          createImageBitmap(v)
+            .then((bmp) => {
+              if (!this._submit(bmp, at, width, height)) bmp.close();
+            })
+            .catch(() => {
+              /* a frame that will not decode is a dropped frame, not an error */
+            });
         }
       }
       this.raf = requestAnimationFrame(tick);
@@ -389,6 +603,18 @@ export class Tracker {
     cancelAnimationFrame(this.raf);
     this.raf = 0;
     this.feed = null;
+    // Whatever the detector was chewing on belongs to the session that just ended: bump the
+    // sequence so a late result is dropped instead of reviving a claim the page has given up, and
+    // release the frame that never got sent. The worker itself stays up: the next start reuses it.
+    this._clearTimer(this._hangTimer);
+    this._hangTimer = 0;
+    this._busy = false;
+    this._inflight = null;
+    this._seq += 1;
+    if (this._pending) {
+      if (typeof this._pending.bitmap.close === 'function') this._pending.bitmap.close();
+      this._pending = null;
+    }
     if (this.stream) {
       for (const t of this.stream.getTracks()) t.stop();
       this.stream = null;

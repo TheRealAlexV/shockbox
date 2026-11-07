@@ -28,12 +28,17 @@
 // `status().state` is the whole vocabulary, and each value says what it means:
 //   off      the config says `cameraRelay: off`; nothing will ever spawn
 //   idle     enabled, but no page is reading — there is nothing for the relay to do
-//   starting ffmpeg is running and no complete frame has arrived yet
+//   starting ffmpeg is running (or the pipe is still connecting) and no frame has arrived yet;
+//            the per-attempt deadline below covers connect + config + first frame
 //   live     a complete frame arrived within the last 2 s
-//   error    ffmpeg opened but produced no frame in 8 s, frames stopped for 2 s with clients
-//            attached, or ffmpeg exited. `error` carries its stderr tail.
+//   stalled  the attempt died: no frame for 2 s, no first frame in 8 s, the pipe never
+//            connected/configured, or ffmpeg exited. `error` carries its stderr tail. `stall()`
+//            tears the attempt down completely, so the next `start()` is never blocked by it.
+//   restarting a retry is scheduled; the watchdog stays armed, so nothing is parked
+//   failed   the attempt budget is spent (`auto` alternated too many times); nothing spawns until
+//            a client arrives or the config changes. Never silent: `error` and `capture` stay set.
 // A stalled producer keeps its last frame (`/camera/latest.jpg` still answers) and the status marks
-// it `stale`; it is never reported `live`.
+// it `stale`; it is never reported `live`. Every transition writes one `handfx camera:` line.
 
 import { spawn as spawnProcess } from 'node:child_process';
 import fs from 'node:fs';
@@ -93,6 +98,15 @@ const WS_MAX_PAYLOAD = 64 * 1024 * 1024;
  * broken publisher, not a slow one. 3 s is generous for a named-pipe connect on the same machine.
  */
 const PIPE_CONFIG_MS = 3000;
+/**
+ * One attempt must reach a live frame inside this window: connect + config + first frame. The 2 s
+ * stall covers a producer that opened and went quiet and the config timer covers a publisher that
+ * never configured, but a connect that never completes had no supervisor at all. This deadline is
+ * that supervisor, so an attempt cannot park without a line in the log.
+ */
+const ATTEMPT_MS = START_GRACE_MS + PIPE_CONFIG_MS;
+/** `auto` alternates pipe/dshow on failure; past this many switches the attempt budget is spent. */
+const MAX_AUTO_SWITCHES = 4;
 
 /** Coerce whatever the settings layer reports into the shape this file runs on. */
 export function normalizeConfig(raw) {
@@ -107,6 +121,9 @@ export function normalizeConfig(raw) {
     size: SIZES.includes(c.size) ? c.size : '960x540',
     ffmpegPath: String(c.ffmpegPath || 'ffmpeg'),
     capture: ['auto', 'pipe', 'dshow'].includes(c.capture) ? c.capture : 'auto',
+    // Keep the producer warm with no page attached. Read defensively: the settings file may not
+    // know this key yet, and an absent key must mean "off" (today's behaviour).
+    keepWarm: c.cameraRelayKeepWarm === true,
   };
 }
 
@@ -334,6 +351,15 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   let restartTimer = null;
   let stopTimer = null;
   let watchdogTimer = null;
+  /** The per-attempt deadline: connect + config + first frame must all finish before it fires. */
+  let attemptTimer = null;
+  /** Starts since the producer was last live; the `attempt=` in every start line. */
+  let attempts = 0;
+  let attemptStartedAt = 0;
+  /** Which path `auto` tries next; null means "not decided: pipe first". */
+  let autoNext = null;
+  /** pipe<->dshow switches in this outage, bounded so `auto` cannot loop forever. */
+  let autoSwitches = 0;
   /** Which capture path is running right now, or null when nothing is. */
   let mode = null;
   let pipeSocket = null;
@@ -346,7 +372,30 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   let fallback = null;
   const pipeInput = { frames: 0, dropped: 0, width: 0, height: 0, fpsNum: 0, fpsDen: 0, lastAt: 0 };
   const clients = new Set();
+  /**
+   * Stream connections opened since this process started, and when the last one came or went.
+   * `clients` is instantaneous, so without these "attached then dropped" and "never attached" read
+   * the same on /status — which is exactly the case a page that cannot reach the stream lands in.
+   */
+  let streamOpens = 0;
+  let lastClientAt = 0;
+  /**
+   * A live page asking for frames. A demand is a consumer for every gate below, so the producer
+   * arms and holds with no stream reader attached — which is what lets a page that reconnects after
+   * a node restart recover the camera with its own heartbeat instead of a subscription that a
+   * reconnect or a restart silently loses. `keepWarm` stays the operator's pin and is untouched.
+   */
+  let demand = false;
   const counters = { frames: 0, dropped: 0, lastFrameAt: 0, error: null };
+
+  /**
+   * Every transition speaks through here. The 2026-11-06 starve was invisible because the only
+   * speaker was the 2 s watchdog and the dshow path had no line at all; a relay that stops
+   * delivering must never do so silently.
+   */
+  function say(line) {
+    if (log && typeof log.info === 'function') log.info(`handfx camera: ${line}`);
+  }
 
   const clearRestart = () => {
     if (restartTimer) clearTimeout(restartTimer);
@@ -405,31 +454,65 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     return currentArgv.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(' ');
   }
 
+  /** Clear the per-attempt deadline. Idempotent, and safe to call from any transition. */
+  function clearAttempt() {
+    if (attemptTimer) clearTimeout(attemptTimer);
+    attemptTimer = null;
+  }
+
+  /** Arm the deadline covering connect + config + first frame. Cleared the moment the relay is live. */
+  function armAttempt() {
+    clearAttempt();
+    attemptStartedAt = Date.now();
+    attemptTimer = setTimeout(() => {
+      attemptTimer = null;
+      if (state === 'live' || state === 'off' || state === 'failed') return;
+      stall(`no live frame within ${Math.round(ATTEMPT_MS / 1000)} s of start`);
+    }, ATTEMPT_MS);
+    attemptTimer.unref?.();
+  }
+
   /**
-   * ffmpeg is running but has delivered no frame in 2 s. That is a dead camera, not a slow one:
-   * report the state with the producer's own words, keep the last frame for /camera/latest.jpg
-   * (status marks it `stale`), and restart the producer under the normal backoff.
+   * An attempt died. Report it with the producer's own words, keep the last frame for
+   * /camera/latest.jpg (status marks it `stale`), tear the attempt down completely — pipe socket
+   * included, so the next `start()` is never blocked — and hand the decision to `afterFailure()`.
    */
-  function stall() {
+  function stall(why = null) {
+    if (state === 'off' || state === 'failed') return;
     const window = stderrWindow();
-    const waited = Math.max(1, Math.round(silenceFor() / 1000));
-    const what = counters.lastFrameAt
-      ? `no frame for ${waited} s`
-      : `ffmpeg opened but produced no frame in ${waited} s`;
+    const silentFor = child ? silenceFor() : Date.now() - attemptStartedAt;
+    const waited = Math.max(1, Math.round(silentFor / 1000));
+    const what =
+      why ||
+      (counters.lastFrameAt
+        ? `no frame for ${waited} s`
+        : `ffmpeg opened but produced no frame in ${waited} s`);
+    const failedMode = mode || (cfg.capture === 'auto' ? 'pipe' : cfg.capture);
     const proc = child;
     child = null; // the exit handler must ignore the process we are about to kill
     parser = null;
+    clearAttempt();
+    teardownPipe();
+    mode = null;
+    spawnedAt = 0;
+    state = 'stalled';
+    say(`stalled mode=${failedMode} no frame for ${waited}s argv="${argvLine()}" stderr="${window}"`);
     setError(`${what}; argv: ${argvLine()}${window ? `; stderr: ${window}` : ''}`);
-    scheduleRestart();
     if (proc) killProcess(proc);
+    afterFailure(failedMode, what);
   }
 
+  /**
+   * The supervisor. It is deliberately not conditional on `child`: an attempt can hold a socket
+   * (and a deadline) without a producer, and parking the watchdog there is exactly how the relay
+   * went silent. `starting` is supervised by the attempt deadline, not by this 500 ms tick.
+   */
   function checkSilent() {
-    if (!child) {
+    if (state === 'off' || state === 'idle' || state === 'failed') {
       stopWatchdog();
       return;
     }
-    if (silenceFor() > stallLimit()) stall();
+    if (child && silenceFor() > stallLimit()) stall();
   }
 
   function startWatchdog() {
@@ -443,16 +526,27 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     watchdogTimer = null;
   }
 
+  /**
+   * The error funnel: one place that records why and warns. It no longer owns `state` — the
+   * transition that failed names it, so one failure is one state, not two competing ones.
+   */
   function setError(message) {
     counters.error = String(message || 'camera relay failed').slice(0, MAX_ERROR);
-    state = 'error';
     if (log && typeof log.warn === 'function') log.warn(`handfx camera: ${counters.error}`);
   }
 
-  function scheduleRestart() {
-    if (restartTimer || !cfg.enabled || clients.size === 0) return;
+  /** Retry the given path under the normal backoff. Always logs the transition. */
+  function scheduleRestart(nextMode) {
+    if (restartTimer || !cfg.enabled) return;
+    if (!clients.size && !demand && !cfg.keepWarm) {
+      state = 'idle';
+      stopWatchdog();
+      return;
+    }
     const delay = Math.min(1000 * 2 ** attempt, MAX_BACKOFF);
     attempt += 1;
+    state = 'restarting';
+    say(`restarting mode=${nextMode || cfg.capture} in ${delay}ms attempt=${attempts + 1}`);
     restartTimer = setTimeout(() => {
       restartTimer = null;
       start();
@@ -460,38 +554,84 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     restartTimer.unref?.();
   }
 
-  function fail(message) {
-    latest = null;
-    parser = null;
-    teardownPipe();
-    setError(message);
-    scheduleRestart();
+  /**
+   * How an attempt failure is retried. `auto` alternates pipe and dshow, records why the pipe was
+   * abandoned (`capture.fallback`) and gives up after MAX_AUTO_SWITCHES so it cannot loop forever;
+   * a forced path retries itself. Reaching dshow from a *starve* is the fix for `auto` never
+   * having fallen back: a starve is the one failure no socket event ever reports.
+   */
+  function afterFailure(failedMode, what) {
+    if (!cfg.enabled) {
+      state = 'off';
+      return;
+    }
+    if (!clients.size && !demand && !cfg.keepWarm) {
+      state = 'idle';
+      stopWatchdog();
+      return;
+    }
+    if (cfg.capture !== 'auto') {
+      scheduleRestart(failedMode);
+      return;
+    }
+    if (autoSwitches >= MAX_AUTO_SWITCHES) {
+      failTerminal(
+        failedMode,
+        `auto: ${autoSwitches} path switches without a frame (last: ${what})`,
+      );
+      return;
+    }
+    const next = failedMode === 'dshow' ? 'pipe' : 'dshow';
+    autoSwitches += 1;
+    autoNext = next;
+    if (next === 'dshow') {
+      fallback = /^pipe /.test(what) ? what : `pipe ${pipeName}: ${what}`;
+      say(`fallback pipe->dshow "${cfg.source}" reason="${what}"`);
+      state = 'restarting';
+      // A dead path must not delay the working one: the first switch is immediate.
+      start();
+      return;
+    }
+    scheduleRestart(next);
   }
 
-  /**
-   * The pipe is unusable for this attempt. Say so with the pipe name and the reason, then either
-   * fall back to dshow (`auto`, recorded in `capture.fallback`) or report and retry the pipe under
-   * the normal backoff (`pipe`).
-   */
-  function pipeFailed(reason) {
-    const message = `pipe ${pipeName}: ${reason}`;
-    const wasAuto = cfg.capture === 'auto';
+  /** Attempt budget spent: stop retrying, but stay observable. A new client resets the budget. */
+  function failTerminal(failedMode, reason) {
+    clearRestart();
+    clearAttempt();
+    stopWatchdog();
     teardownPipe();
     const proc = child;
     child = null;
     parser = null;
-    spawnedAt = 0;
-    counters.lastFrameAt = 0;
-    if (proc) killProcess(proc);
     mode = null;
-    if (wasAuto && clients.size) {
-      fallback = message;
-      latest = null;
-      setError(`${message}; auto: falling back to dshow "${cfg.source}"`);
-      startDshow();
-      return;
-    }
-    fail(message);
+    spawnedAt = 0;
+    state = 'failed';
+    say(`failed mode=${failedMode || cfg.capture} "${reason}"`);
+    setError(reason);
+    if (proc) killProcess(proc);
+  }
+
+  function fail(message) {
+    const failedMode = mode || (cfg.capture === 'auto' ? 'pipe' : cfg.capture);
+    latest = null;
+    parser = null;
+    clearAttempt();
+    teardownPipe();
+    mode = null;
+    spawnedAt = 0;
+    state = 'stalled';
+    setError(message);
+    afterFailure(failedMode, message);
+  }
+
+  /**
+   * The pipe is unusable for this attempt. That is the same transition as a starve, so it takes the
+   * same road: report it with the pipe name, tear the attempt down, then let `afterFailure()` pick
+   * dshow (`auto`, recorded in `capture.fallback`) or the same path under backoff.
+   */
+  function pipeFailed(reason) {
+    stall(`pipe ${pipeName}: ${reason}`);
   }
 
   /** Spawn one producer and wire its pipes. `mode` decides whether stdin is fed by the pipe reader. */
@@ -553,12 +693,38 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       return;
     }
     mode = 'dshow';
+    state = 'starting';
+    say(`start mode=dshow source="${cfg.source}" attempt=${attempts}`);
     spawnChild(bin, ffmpegArgs(cfg));
   }
 
+  /**
+   * The one entry point for "a producer should be running". Every early return here is a decision,
+   * and the two legitimate ones (disabled, nobody reading) are silent by design; a stale pipe
+   * socket is *not* legitimate, so it is discarded and the attempt proceeds instead of bailing.
+   */
   function start() {
-    if (child || pipeSocket || !cfg.enabled || clients.size === 0) return;
+    if (!cfg.enabled) {
+      if (state !== 'off') state = 'off';
+      return;
+    }
+    if (!clients.size && !demand && !cfg.keepWarm) {
+      // Enabled but nobody is reading and keep-warm is off: there is nothing to do.
+      if (child || pipeSocket) stopChild();
+      else state = 'idle';
+      return;
+    }
+    if (child) return; // a producer is already running
+    if (pipeSocket) {
+      // A socket without a producer is the corpse of an attempt whose child went away (the 06:03
+      // wedge: stall() used to leave exactly this). Discard it and go, never return silently.
+      say('stale pipe connection without a producer; discarding');
+      teardownPipe();
+    }
     clearRestart();
+    clearStop();
+    attempts += 1;
+    armAttempt();
     const bin = resolveBinary(cfg.ffmpegPath);
     if (!bin) {
       // Name what was asked for, so a wrong path is unmistakably a binary problem and never a
@@ -567,11 +733,9 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       fail(`ffmpeg not found: "${cfg.ffmpegPath}" (looked on ${where})`);
       return;
     }
-    if (cfg.capture === 'dshow') {
-      startDshow(bin);
-      return;
-    }
-    startPipe(bin);
+    const nextMode = cfg.capture === 'auto' ? autoNext || 'pipe' : cfg.capture;
+    if (nextMode === 'dshow') startDshow(bin);
+    else startPipe(bin);
   }
 
   /** Connect to the publisher and wait for its config; ffmpeg cannot start without the geometry. */
@@ -579,6 +743,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     mode = 'pipe';
     teardownPipe();
     state = 'starting';
+    say(`start mode=pipe source="${pipeName}" attempt=${attempts}`);
     const sock = net.connect({ path: pipeName });
     pipeSocket = sock;
     const stream = createPipeParser({
@@ -720,14 +885,17 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
 
   function removeClient(client) {
     if (!clients.delete(client)) return;
-    if (!clients.size) scheduleStop();
+    lastClientAt = Date.now();
+    // Keep-warm means the camera does not depend on a page being connected; a page's demand does
+    // the same for as long as its heartbeat keeps asking.
+    if (!clients.size && !demand && !cfg.keepWarm) scheduleStop();
   }
 
   function scheduleStop() {
     clearStop();
     stopTimer = setTimeout(() => {
       stopTimer = null;
-      if (!clients.size) stopChild();
+      if (!clients.size && !demand) stopChild();
     }, STOP_AFTER_MS);
     stopTimer.unref?.();
   }
@@ -744,7 +912,15 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   }
 
   function stopChild() {
+    const wasActive =
+      Boolean(child || pipeSocket || restartTimer || attemptTimer) ||
+      state === 'live' ||
+      state === 'starting' ||
+      state === 'stalled' ||
+      state === 'restarting' ||
+      state === 'failed';
     clearRestart();
+    clearAttempt();
     stopWatchdog();
     teardownPipe();
     mode = null;
@@ -754,9 +930,16 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     latest = null;
     spawnedAt = 0;
     counters.lastFrameAt = 0;
+    // The error belongs to the run that just ended. A stopped relay must never report it: the pane
+    // presses Restart precisely to stop reading the old failure, and a dead producer has no frame
+    // coming to clear it (`onFrame` is the only other place that does).
+    counters.error = null;
     attempt = 0;
+    attempts = 0;
+    autoSwitches = 0;
     // `idle` is enabled-but-nobody-reading; `off` is the config forbidding the relay entirely.
     state = cfg.enabled ? 'idle' : 'off';
+    if (wasActive) say('stopped');
     if (!proc) return;
     killProcess(proc);
   }
@@ -785,9 +968,19 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     counters.frames += 1;
     counters.lastFrameAt = Date.now();
     if (state !== 'live') {
+      // One line that tells "delivering 30 fps" from "delivering nothing" without a watchdog.
+      const geom =
+        mode === 'pipe' && pipeInput.width
+          ? `${pipeInput.width}x${pipeInput.height}@${pipeInput.fpsNum}/${pipeInput.fpsDen}`
+          : `${cfg.size}@${cfg.fps}`;
+      say(`live mode=${mode || cfg.capture} ${geom} after ${Date.now() - attemptStartedAt}ms`);
       state = 'live';
       counters.error = null;
       attempt = 0;
+      attempts = 0;
+      // Remember the path that works; `auto` retries it first after a stop.
+      if (cfg.capture === 'auto' && mode) autoNext = mode;
+      clearAttempt();
     }
     for (const client of clients) {
       // A producer that outruns a consumer loses the older frame; that is the drop counter.
@@ -797,24 +990,6 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     }
   }
 
-  function start() {
-    if (child || pipeSocket || !cfg.enabled || clients.size === 0) return;
-    clearRestart();
-    const bin = resolveBinary(cfg.ffmpegPath);
-    if (!bin) {
-      // Name what was asked for, so a wrong path is unmistakably a binary problem and never a
-      // broken camera: the relay's error is the only thing the operator has to go on.
-      const where = process.platform === 'win32' ? 'PATH and the usual Windows install folders' : 'PATH';
-      fail(`ffmpeg not found: "${cfg.ffmpegPath}" (looked on ${where})`);
-      return;
-    }
-    if (cfg.capture === 'dshow') {
-      startDshow(bin);
-      return;
-    }
-    startPipe(bin);
-  }
-
   function sync() {
     const next = normalizeConfig(read());
     const changed =
@@ -822,7 +997,8 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       next.fps !== cfg.fps ||
       next.size !== cfg.size ||
       next.ffmpegPath !== cfg.ffmpegPath ||
-      next.capture !== cfg.capture;
+      next.capture !== cfg.capture ||
+      next.keepWarm !== cfg.keepWarm;
     cfg = next;
     if (!cfg.enabled) {
       if (state !== 'off' || child || restartTimer || stopTimer || clients.size) {
@@ -835,10 +1011,22 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       return;
     }
     if (state === 'off') state = 'idle';
-    if (changed && (child || restartTimer)) {
+    if (changed) {
+      // A settings change is a fresh attempt budget: the operator changed something on purpose.
+      autoSwitches = 0;
+      autoNext = null;
+      attempt = 0;
+      if (state === 'failed') state = 'idle';
+    }
+    if (changed && (child || restartTimer || state === 'failed' || !clients.size)) {
       clearRestart();
       stopChild();
-      if (clients.size) start();
+      if (clients.size || demand || cfg.keepWarm) start();
+    }
+    // Keep-warm boot: with no page ever connected there is no addClient to kick the relay, so
+    // sync() (the settings poll) is the only thing that can start it.
+    if (cfg.keepWarm && !child && !pipeSocket && !restartTimer && !attemptTimer && state !== 'failed') {
+      start();
     }
   }
 
@@ -855,17 +1043,67 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     },
 
     /**
+     * A page's heartbeat: "this document needs frames". Arms the producer with no stream reader
+     * attached and releases it when the last asking page stops saying so. Idempotent, because it is
+     * called on every ack; the release path is the same stop the last reader triggers, so a page
+     * that dies stops the camera without anyone touching the pane.
+     */
+    setDemand(on) {
+      const next = Boolean(on) && cfg.enabled;
+      if (next === demand) return;
+      demand = next;
+      say(`demand ${next ? 'arm' : 'release'} clients=${clients.size} keepWarm=${cfg.keepWarm}`);
+      if (next) {
+        clearStop();
+        start();
+      } else if (!clients.size && !cfg.keepWarm) {
+        scheduleStop();
+      }
+    },
+
+    /**
      * Take over `res` and stream parts to it until it closes. The caller has already written the
      * 200/multipart headers; returns the client record for tests.
+     *
+     * `role` is the identity of the document that asked for the stream, `ref` the path it came
+     * from (see core/events.mjs `roleOf`/`refPath`). One document holds one stream: a predecessor
+     * whose stream was never closed keeps an ESTABLISHED socket in CEF's six-per-origin pool, and
+     * the successor's own two responses then starve its acks. Ending the older stream here is what
+     * keeps a reload from wedging the page. Only the same identity is touched — a different page's
+     * stream is never ended — and the response that just attached is not in the set yet.
      */
-    addClient(res) {
-      const client = { res, busy: false, pending: null };
+    addClient(res, role = null, ref = null) {
+      if (role) {
+        for (const old of [...clients]) {
+          if (old.role === role || (!old.role && old.ref === role)) {
+            // Read by the route handler that owns the response, so its one close line names the
+            // reason instead of claiming the client left.
+            old.res.superseded = true;
+            clients.delete(old);
+            try {
+              old.res.end();
+            } catch {
+              /* already gone */
+            }
+          }
+        }
+      }
+      const client = { res, role, ref, busy: false, pending: null };
       const drop = () => removeClient(client);
       res.on('close', drop);
       res.on('error', drop);
       clients.add(client);
+      streamOpens += 1;
+      lastClientAt = Date.now();
       clearStop();
       if (cfg.enabled) {
+        // A new reader is a fresh budget: if the last outage ended in `failed`, retry from here.
+        if (state === 'failed') {
+          state = 'idle';
+          attempt = 0;
+          attempts = 0;
+          autoSwitches = 0;
+        }
         start();
         // The newest frame is sent immediately: a client that just connected should not wait a
         // whole frame interval for its first boundary.
@@ -876,14 +1114,17 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     },
 
     /**
-     * The relay's own truth, read by /api/handfx/status. `state` is `off` (disabled by config),
-     * `idle` (enabled, no reader), `starting`, `live`, or `error`. `live` is never reported for a
-     * frame older than 2 s; `stale` marks a kept frame that is being served by /camera/latest.jpg
-     * past its freshness, and `error` carries ffmpeg's stderr tail when there is one.
+     * The relay's own truth, read by /api/handfx/status. `state` is the machine: `off` (disabled
+     * by config), `idle` (enabled, no reader, keep-warm off), `starting`, `live`, `stalled`
+     * (the attempt died; `error` says why), `restarting`, or `failed` (attempt budget spent).
+     * `live` is never reported for a frame older than 2 s; `stale` marks a kept frame that is
+     * being served by /camera/latest.jpg past its freshness, and `error` carries ffmpeg's tail.
      */
     status() {
       const silent = silenceFor() > stallLimit();
-      const reported = silent ? 'error' : state;
+      // The watchdog uses this exact predicate to stall, so report it in the same moment rather
+      // than claiming `live` for a frame the supervisor is about to declare dead.
+      const reported = silent && state === 'live' ? 'stalled' : state;
       const window = stderrWindow();
       const error =
         silent && !counters.error
@@ -891,15 +1132,29 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
           : counters.error;
       return {
         state: reported,
+        attempt: attempts,
         source: cfg.source,
         fps: cfg.fps,
         size: cfg.size,
+        keepWarm: cfg.keepWarm,
         frames: counters.frames,
         dropped: counters.dropped,
         clients: clients.size,
+        streamOpens,
+        lastClientAt: lastClientAt || null,
         lastFrameAt: counters.lastFrameAt || null,
-        stale: reported === 'error' && Boolean(latest),
+        stale: (reported === 'stalled' || reported === 'failed') && Boolean(latest),
         error,
+        // Whether a page's heartbeat is holding the producer, and — when nothing is running — why
+        // in words: `idle` used to be indistinguishable from "the camera is fine", which is exactly
+        // how a consumer-gated relay read as healthy while it captured nothing.
+        demand,
+        reason:
+          reported === 'idle'
+            ? demand
+              ? 'demand without producer'
+              : 'no consumer'
+            : null,
         // Which capture path is actually running, what the publisher negotiated, and how many
         // frames it fed (or lost). `fallback` is the pipe failure `auto` recorded before it chose
         // dshow; it stays set until a later pipe attempt succeeds.

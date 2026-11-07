@@ -20,8 +20,9 @@
 import { Tracker, syntheticHands } from '../engine/tracker.js';
 import { createPublisher } from './publish.js';
 import { createRelay } from './relay.js';
-import { rearmCamera } from './rearm.js';
+import { cameraWanted, rearmCamera } from './rearm.js';
 import { createWatchdog } from './watchdog.js';
+import { createBuildCheck } from './build-check.js';
 import { classify, Motion, GestureGate } from '../engine/gestures.js';
 import { FxRenderer, EFFECTS, anchorsFrom, fenceRectFor } from '../engine/fx.js';
 
@@ -32,8 +33,43 @@ import { FxRenderer, EFFECTS, anchorsFrom, fenceRectFor } from '../engine/fx.js'
  * It still runs the synthetic rig locally, so the effects are visible.
  */
 const PREVIEW = new URLSearchParams(location.search).get('preview') === '1';
+/**
+ * Which document this is, for the server's supersede rule (core/events.mjs `attach`, and the
+ * camera relay's `addClient`): one path, one holder. A reload boots a *new* document at the same
+ * path, so the server can end the predecessor's two long-lived responses — the bus and the camera
+ * stream — instead of letting them keep two of the browser's six sockets to this origin, which is
+ * what starves the successor's acks (`ack request: signal timed out` with six sockets held).
+ * The path is used rather than a fresh clientId because a clientId is new on every load and could
+ * never match a predecessor. A preview shares the path but opens neither stream.
+ */
+const ROLE = location.pathname;
 /** The bundle this document was loaded from: the `?v=` the page loader put on this module's URL. */
 const BUILD = new URL(import.meta.url).searchParams.get('v') || 'unknown';
+
+/**
+ * The bootstrap diagnostics installed by `overlay.html`'s inline script, which runs before this
+ * module is even fetched. Every call is a no-op if that script was stripped (e.g. a hand-edited
+ * page), so instrumentation can never be the reason the overlay fails.
+ */
+const diag = self.__handfxDiag && typeof self.__handfxDiag.phase === 'function'
+  ? self.__handfxDiag
+  : { phase() {}, report() {}, setBuild() {}, setClient() {}, phaseList() { return []; }, clientId: '' };
+/**
+ * Record a caught error on the page's own event ring — the boot-step/ack-body/boot-throw kinds that
+ * used to be swallowed by an empty `.catch(() => {})`. Never throws: a report that becomes the
+ * failure it reports is worse than no report. `note` names the call site.
+ */
+function diagError(kind, err, note) {
+  try {
+    const message = `${note ? `${note}: ` : ''}${(err && err.message) || String(err)}`;
+    diag.report(kind, message.slice(0, 500), { stack: err && err.stack ? String(err.stack) : '' });
+  } catch {
+    /* diagnostics must never become the failure they report */
+  }
+}
+// First breadcrumb: the module parsed and its imports resolved. If an import had failed, this line
+// would never run and the inline script would have reported the resource instead.
+diag.phase('module-start');
 
 const $ = (id) => document.getElementById(id);
 const stage = $('stage');
@@ -89,12 +125,22 @@ const state = {
   anchors: 'none', // camera | synthetic | none — where the current frame's anchors came from
   draws: 0, // frames the renderer actually drew: the loop's own counter, reported on /ack
   lastDrawAt: 0,
+  // performance.now() of the newest tracker frame. A tracking claim without one is stale: the relay
+  // reports `running/camera` before its first frame arrives.
+  lastFrameAt: 0,
   // The paint clock, reported beside `draws`: a monotonic tick count and its wall-clock stamp.
   // They are what lets /status tell "page alive, loop stopped" from "page gone" — the two used to
   // look identical because the loop also carried the ack.
   loopTicks: 0,
   lastLoopAt: 0,
+  // When the last /ack was *sent* (performance.now): the 2/s throttle reads this, not success.
   lastAck: 0,
+  // When the server last *answered* an /ack (Date.now), and the acks that failed or timed out
+  // since: the ack-failure wedge condition reads these, so a page the server cannot hear still
+  // looks different from a page whose loop has stopped.
+  ackOkAt: 0,
+  ackFails: 0,
+  ackFailAt: 0,
   startedAt: Date.now(),
   bodyAt: 0, // last body-mask message (performance.now)
   bodySeen: false,
@@ -107,20 +153,29 @@ const tracker = new Tracker({ onFrame: onFrame, onState: onTrackerState });
 // cannot open that device itself (WebcamSwitcher holds it), so it reads the MJPEG stream instead
 // and feeds each decoded frame to the tracker's own detect path.
 const relay = createRelay({
+  // `?role=` on the stream too, so a predecessor's leaked stream is ended when this one attaches.
+  url: `/api/handfx/camera/stream?role=${encodeURIComponent(ROLE)}`,
   onFrame: (bitmap) => tracker.pushFrame(bitmap),
   onState: (s) => {
     state.relayError = s.error || null;
     renderState();
+    if (s.state === 'live') {
+      // Frames are flowing: the backoff starts over, so the next drop retries after 2 s.
+      cameraLive();
+      diag.phase('relay-attached');
+      return;
+    }
     if (s.state !== 'error' || state.cameraSource !== 'relay') return;
-    // The relayed camera went away (EOF, a read error, or 3 s without a frame). Hand the view back
-    // the way a device track ending does — tracker to idle, then fallBackToSynthetic — and make the
-    // page's one bounded retry, which the 5 s gap and the attempt cap already limit. No reconnect
-    // loop. `anchors` is cleared here because the render loop only rewrites it when a frame arrives,
-    // so a dead feed would otherwise keep reporting the last camera frame's `camera` forever.
+    // An established stream died (EOF, a read error, or 3 s without a frame). Hand the view back the
+    // way a track ending does — tracker to idle, then fallBackToSynthetic — and re-enter the same
+    // bounded retry the load path uses. The relay serves a fresh `GET /camera/stream` every time, so
+    // a dead feed is a retry, not a dead page. `anchors` is cleared because the render loop only
+    // rewrites it when a frame arrives, so a dead feed would otherwise keep reporting `camera`.
     state.cameraSource = 'none';
+    state.tracking = false; // the track is gone; the fallback below may claim the view again
     tracker.stop();
     state.anchors = 'none';
-    void autoCamera();
+    scheduleCameraRetry(s.error || 'relay: stream ended');
   },
 });
 // The virtual camera's feed: only runs when the server says `publish` is not `off`.
@@ -149,7 +204,7 @@ function setBadge(text, tone = 'idle') {
   badge.hidden = !text;
 }
 
-/** Record why a camera acquisition failed. `stage` is enumerate | getUserMedia | track | timeout. */
+/** Record why a camera acquisition failed. `stage` is getUserMedia | track | timeout | exclusive. */
 function setCameraError(stage, name, message) {
   state.cameraError = {
     at: Date.now(),
@@ -161,10 +216,26 @@ function setCameraError(stage, name, message) {
 
 /* ---------------------------------------------------------------- settings + bus */
 
+/** One /status read at a time, and each is bounded: it is awaited by the boot, the watchdog's
+ *  probe and recovery, so a read that never settles would freeze all three. */
+let statusInFlight = null;
+const STATUS_TIMEOUT_MS = 8000;
+
 async function loadStatus() {
-  const res = await fetch('/api/handfx/status', { cache: 'no-store' });
-  if (!res.ok) throw new Error(`status ${res.status}`);
-  return res.json();
+  if (statusInFlight) return statusInFlight;
+  statusInFlight = (async () => {
+    try {
+      const res = await fetch('/api/handfx/status', {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      return await res.json();
+    } finally {
+      statusInFlight = null;
+    }
+  })();
+  return statusInFlight;
 }
 
 /**
@@ -264,11 +335,11 @@ function syncSyntheticMode() {
 /** The persisted mode changed: drop what the old mode owns and start what the new one asks for. */
 function switchTrackingSource() {
   if (state.tracking) stopTracking({ manual: false, keepView: true });
+  clearCameraRetry();
   autoCam.attempts = 0;
-  autoCam.lastAt = 0;
   if (state.trackingSource !== 'camera') ensureSyntheticAnchors();
   else ack();
-  if (state.trackingSource !== 'synthetic') autoCamera().catch(() => {});
+  if (state.trackingSource !== 'synthetic') autoCamera().catch((err) => diagError('boot-step', err, 'autoCamera (source switch)'));
 }
 
 /* ---------------------------------------------------------------- underlay */
@@ -356,6 +427,8 @@ function applyBusCommand(msg) {
     // The server already wrote the document; re-read it so the picture follows the operator.
     scheduleRefresh();
   } else if (cmd === 'reload') {
+    // A deploy's push (`POST /api/handfx/page/reload`), over the bus this page already holds.
+    camLog('reload: pushed');
     location.reload();
   }
 }
@@ -364,12 +437,14 @@ let refreshTimer = 0;
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
-    loadStatus().then(applySettings).catch(() => {});
+    loadStatus().then(applySettings).catch((err) => diagError('boot-step', err, 'refresh status'));
   }, 120);
 }
 
 function connectBus() {
-  const es = new EventSource('/events');
+  // `?role=` names this document to the server, which ends any older bus of the same role before
+  // serving this one (see ROLE above). No new parameter for OBS to carry: it is this page's own path.
+  const es = new EventSource(`/events?role=${encodeURIComponent(ROLE)}`);
   bus = es;
   let retry = 250;
   es.addEventListener('handfx', (ev) => {
@@ -419,9 +494,9 @@ async function recoverOverlay(status) {
     connectBus();
     applySettings(status && status.settings ? status : await loadStatus());
     // A server restart is the server's failure, not this page's second camera failure: the check
-    // that a machine has no camera at all must run again from zero.
+    // that a machine has no camera at all must run again from zero, and the next attempt is now.
+    clearCameraRetry();
     autoCam.attempts = 0;
-    autoCam.lastAt = 0;
     // Re-arm the camera the settings ask for, not the one that last failed: a dead relay has
     // already set `camAttempted = false` and stopped tracking, so keying this on that state left
     // the page on synthetic hands until someone clicked Start.
@@ -458,12 +533,189 @@ const watchdog = createWatchdog({
   },
 });
 
+/* ---------------------------------------------------------------- wedge watchdog */
+
+/**
+ * A page whose document Chrome has stopped compositing answers nothing and never recovers by
+ * itself — that is the sixteen-hour inert overlay. Timers still run in that state (measured here:
+ * rAF +0 in 3 s while setInterval advanced), so the last thing left is to restart the document.
+ *
+ * The trigger is the *loop* being stalled, not the picture being still: `loop()` stamps
+ * `lastLoopAt` on every rAF tick whether or not a frame moves, so a static scene — a hand held
+ * still, effects off, a frozen prediction — never trips this. A hidden document is a legitimate
+ * pause, not a wedge, and is skipped.
+ */
+const WEDGE_MS = 15000;
+const RELOAD_GAP_MS = 5 * 60 * 1000;
+const RELOAD_KEY = 'handfx.selfReloadAt';
+let reloadedThisPage = false;
+
+/** The last self-reload, from sessionStorage when it is usable, else this page's own memory. */
+function lastSelfReloadAt() {
+  try {
+    return Number(sessionStorage.getItem(RELOAD_KEY)) || 0;
+  } catch {
+    // No storage: the only memory left is this document, so at most one reload per page life.
+    return reloadedThisPage ? Date.now() : 0;
+  }
+}
+
+/** Reload at most once per 5 minutes, so a page that wedges on boot cannot become a reload loop. */
+function selfReload(reason, freeSockets = false) {
+  const now = Date.now();
+  const last = lastSelfReloadAt();
+  if (last && now - last < RELOAD_GAP_MS) return false;
+  reloadedThisPage = true;
+  try {
+    sessionStorage.setItem(RELOAD_KEY, String(now));
+  } catch {
+    /* the in-memory flag above is the fallback */
+  }
+  // One line per detection naming the condition, so a log reader can tell which fault fired.
+  camLog(`wedge: ${reason}`);
+  // A network wedge reloads into a document that would otherwise compete with the dead sockets
+  // for the browser's six-per-origin budget: drop them first.
+  if (freeSockets) releaseSockets();
+  camLog('self-reload');
+  location.reload();
+  return true;
+}
+
+/**
+ * Close the two long-lived sockets — the bus EventSource and the relay's camera stream — so the
+ * document being abandoned is not holding connections the new one needs.
+ */
+function releaseSockets() {
+  try {
+    bus?.close();
+  } catch {
+    /* already closed */
+  }
+  bus = null;
+  try {
+    // A relay built by an older bundle may not expose `stop`: a missing method is not a fault.
+    // `forget: false` is the whole point: this teardown closes the socket, it does not decide the
+    // page has finished with the camera. `stop()`'s default erases the relay's `wanted` flag, and
+    // `wanted` is what every re-open path tests (relay.js `read`'s EOF branch, `visibilitychange`,
+    // `pageshow`) — so forgetting here left the feed dead for the rest of the document's life the
+    // first time an OBS browser source fired `pagehide`. relay.js's own pagehide listener has
+    // always passed `forget: false` for exactly this reason.
+    if (typeof relay?.stop === 'function') relay.stop({ forget: false });
+  } catch {
+    /* already stopped */
+  }
+}
+
+/* ---------------------------------------------------------------- build self-heal */
+
+/**
+ * The bundle this document runs is fixed at boot. A deploy changes `/api/handfx/build`, and
+ * nothing used to tell the running document, so it kept the old bundle until a human pressed
+ * Refresh in OBS — 20 minutes of synthetic frames that every status field called healthy.
+ *
+ * This is the missing loop. A cheap fetch of the build (no new socket; the 6-per-origin budget is
+ * hard), once per BUILD_POLL_MS while the document is visible, and a self-reload on a mismatch.
+ * `createBuildCheck` owns the budget: three reloads per observed server build, persisted across
+ * the reload it causes, then it stops and the page reports `staleSince` instead of spinning.
+ */
+const BUILD_POLL_MS = 25000;
+const buildCheck = createBuildCheck({
+  ownBuild: BUILD,
+  storage: (() => {
+    try {
+      return sessionStorage;
+    } catch {
+      return null;
+    }
+  })(),
+  reload: () => {
+    camLog('build-reload');
+    location.reload();
+  },
+});
+let lastBuildPollAt = 0;
+
+/** Poll gently: the build is only read, so this costs one small GET per 25 s, never a socket. */
+async function pollBuild(now) {
+  if (now - lastBuildPollAt < BUILD_POLL_MS) return;
+  lastBuildPollAt = now;
+  const res = await fetch('/api/handfx/build', { cache: 'no-store', signal: AbortSignal.timeout(3000) }).catch(() => null);
+  if (!res || !res.ok) return; // a build we could not read is not a mismatch
+  const body = await res.json().catch(() => null);
+  const verdict = buildCheck.observe(body && body.build);
+  if (verdict === 'stop') {
+    const s = buildCheck.state();
+    setBanner(`stale bundle ${BUILD} — server serves ${s.observed}; reload this browser source`, 'bad');
+  }
+}
+
+/** Acks attempted, none answered, for this long: the page is alive and its network is not. */
+const ACK_WEDGE_MS = 12000;
+/** A timeout is a failure, not a success: an ack can never outlive its own beat. */
+const ACK_TIMEOUT_MS = 4000;
+/** A closed gate with no failed request to explain it is a fault after two timeouts. */
+const ACK_GATE_MS = ACK_TIMEOUT_MS * 2;
+
+/**
+ * The gate must never be the reason the page is silent. `ackInFlight` has no owner and no clock: a
+ * request that is never retired, or a body build that threw before `fetch` existed, would hold it
+ * forever and every later tick would return at the gate without a word. This is the belt to
+ * `ack()`'s braces — after two timeouts with no failed request behind the wait, the latch is
+ * reported and released, so the class cannot recur as silence.
+ */
+function checkAckGate(now) {
+  if (!ackInFlight || !ackLatchedAt) return false;
+  // A request that is genuinely failing owns the slot until its own `.finally`; `ackFails` resets
+  // to 0 only on a successful ack, so a latch held with zero failures has no request behind it.
+  if (state.ackFails !== 0) return false;
+  if (now - ackLatchedAt < ACK_GATE_MS) return false;
+  const heldMs = now - ackLatchedAt;
+  ackInFlight = false;
+  ackLatchedAt = 0;
+  diagError('ack-gate-latched', new Error(`ackInFlight held ${Math.round(heldMs / 1000)}s with ackFails=0`), 'ack gate');
+  return true;
+}
+
+function checkWedge(now) {
+  // Hidden is a paused document, not a wedged one: OBS reports a source that is not in the program
+  // as hidden, and reloading it there would fight the source instead of healing it.
+  if (document.visibilityState === 'hidden') return false;
+
+  // Condition 1: the document is not being composited. The loop's own clock stopped.
+  const seenAt = state.lastLoopAt || state.startedAt;
+  if (seenAt && now - seenAt >= WEDGE_MS) {
+    return selfReload(`loop stopped for ${Math.round((now - seenAt) / 1000)}s`);
+  }
+
+  // Condition 2, independent of the loop: it keeps ticking at full rate through a dead network,
+  // so only the acks can see this fault. Acks are still being attempted when a failure landed
+  // within the last two timeouts, and none succeeded for ACK_WEDGE_MS.
+  if (state.ackFails > 0 && !recovering) {
+    const sinceOk = now - (state.ackOkAt || state.startedAt);
+    const stillTrying = now - state.ackFailAt <= ACK_TIMEOUT_MS * 2;
+    if (sinceOk >= ACK_WEDGE_MS && stillTrying) {
+      return selfReload(`acks failing for ${Math.round(sinceOk / 1000)}s`, true);
+    }
+  }
+  return false;
+}
+
 /** The 1 s liveness beat. A hidden source has nothing to recover (its render loop is paused, so
  *  its acks stop too) and a tab coming back fires `visibilitychange`, which re-runs autoCamera. */
 let booted = false;
 setInterval(() => {
-  if (PREVIEW || !booted || document.visibilityState === 'hidden') return;
-  void watchdog.tick();
+  if (PREVIEW) return;
+  if (document.visibilityState === 'hidden') return;
+  // Not gated on `booted`: a boot that hangs on `loadStatus` (a server that is gone, a fetch that
+  // never resolves) would otherwise freeze the page before its own recovery could start.
+  if (booted) void watchdog.tick();
+  // A latch nobody is serving is reported and released before it can look like a dead network.
+  checkAckGate(Date.now());
+  // /ack keeps running on its own timer while the loop is dead, so the connection watchdog would
+  // report a page that is "alive" and doing nothing. This is the check for that state.
+  checkWedge(Date.now());
+  // The build this document runs is fixed at boot; this is the only way a deploy reaches it.
+  if (booted) void pollBuild(Date.now());
 }, 1000);
 
 /* ---------------------------------------------------------------- camera + tracking */
@@ -490,13 +742,27 @@ let camWasLive = false;
 let camAttempted = false;
 
 /**
+ * Does a real camera own the page right now? `state.tracking && !state.synthetic` is the page's
+ * claim; a claim with no frame for CAM_STALL_MS is the frame-less `running/camera` the relay reports
+ * before its first frame, and treating it as live is what latched every self-heal at once.
+ */
+function trackingClaimLive() {
+  return Boolean(
+    state.tracking &&
+      !state.synthetic &&
+      state.lastFrameAt &&
+      performance.now() - state.lastFrameAt <= CAM_STALL_MS,
+  );
+}
+
+/**
  * Hand the page back to the synthetic rig after a camera failed or its track ended, so the overlay
  * keeps animating instead of freezing on the last camera frame. Never on the operator's own Stop.
  */
 function fallBackToSynthetic() {
   if (userStopped) return false;
   if (state.trackingSource === 'camera') return false; // camera only: a blank page beats a fake one
-  if (state.tracking && !state.synthetic) return false; // another camera session owns the view
+  if (trackingClaimLive()) return false; // another camera session owns the view
   const drew = ensureSyntheticAnchors();
   if (drew) {
     setBanner(state.error ? `${state.error} — drawing on synthetic hands` : 'No camera — drawing on synthetic hands', 'warn');
@@ -506,35 +772,109 @@ function fallBackToSynthetic() {
 }
 
 /**
- * The load attempt, and the one retry when the page is shown again. No gesture, no click: a page
- * nobody can click (an OBS browser source) still asks for the camera. `startTracking` tries the
- * server's relay first and enumerates only for the device path, so a machine whose camera belongs
- * to another app is never reported as having none. Two attempts at most, at least 5 s apart, never
- * in a loop.
+ * The camera retry. No gesture, no click: a page nobody can click (an OBS browser source) still
+ * asks for the camera, and keeps asking for as long as the settings want one. The old two-attempt
+ * cap is why a page whose relay, ffmpeg or camera dropped stayed inert until someone refreshed the
+ * OBS source by hand; recovery is now the page's own job.
+ *
+ * Backoff is bounded: 2 s doubling to 30 s, never a tight loop. Every attempt and its outcome is one
+ * console line with the `handfx cam:` prefix, so a page dump says what the camera did and when.
  */
-const AUTO_CAM_ATTEMPTS = 2;
-const AUTO_CAM_GAP = 5000;
-const autoCam = { attempts: 0, lastAt: 0, busy: false };
+const CAM_RETRY_BASE = 2000;
+const CAM_RETRY_MAX = 30000;
+/** A `running` claim older than this with no frame is a dead stream, not a camera that owns the
+ *  page: the relay reports `running/camera` before its first frame, and that claim must not latch
+ *  the retry loop shut. */
+const CAM_STALL_MS = 3000;
+const autoCam = { attempts: 0, nextAt: 0, timer: 0, busy: false };
+
+function camLog(msg) {
+  console.log(`handfx cam: ${msg}`);
+}
+
+function clearCameraRetry() {
+  if (autoCam.timer) clearTimeout(autoCam.timer);
+  autoCam.timer = 0;
+  autoCam.nextAt = 0;
+}
+
+/** A live stream resets the backoff, so the next drop retries after 2 s again. */
+function cameraLive() {
+  clearCameraRetry();
+  autoCam.attempts = 0;
+  camLog('live');
+}
+
+/** The server's relay report from the last `/status` read: stalled → restarting → failed. */
+function relayFeed() {
+  const feed = state.status && state.status.cameraFeed;
+  return feed && typeof feed === 'object' ? feed : null;
+}
+
+/** Why the last attempt failed, in the same words /ack reports. */
+function cameraFailureReason() {
+  // A relay that gave up is a different answer from one that dropped the picture and is retrying;
+  // the page's own `relayError` records only the latter.
+  const feed = relayFeed();
+  if (feed && feed.state === 'failed') return `relay gave up: ${feed.error || 'no reason given'}`;
+  if (state.relayError) return state.relayError;
+  const err = state.cameraError;
+  if (!err) return 'no frames';
+  const detail = err.message || err.name || err.stage;
+  return err.stage ? `${err.stage}: ${detail}` : String(detail);
+}
+
+/**
+ * Arm the next attempt. One timer per page: a second failure replaces the pending retry instead of
+ * stacking another, and an operator Stop (`userStopped`) ends the loop.
+ */
+function scheduleCameraRetry(reason) {
+  if (userStopped) return;
+  const delay = Math.min(CAM_RETRY_BASE * 2 ** Math.max(0, autoCam.attempts - 1), CAM_RETRY_MAX);
+  if (autoCam.timer) clearTimeout(autoCam.timer);
+  autoCam.nextAt = Date.now() + delay;
+  camLog(`retry in ${delay}ms reason="${reason}"`);
+  autoCam.timer = setTimeout(() => {
+    autoCam.timer = 0;
+    void autoCamera();
+  }, delay);
+}
 
 async function autoCamera() {
   if (PREVIEW) return false; // a preview never opens the camera or the relay
   if (state.trackingSource === 'synthetic') return false; // the operator asked for synthetic only
-  if (autoCam.busy || autoCam.attempts >= AUTO_CAM_ATTEMPTS) return false;
+  if (autoCam.busy) return false;
+  // A retry is already armed: a stray caller must not shortcut the backoff.
+  if (autoCam.nextAt && Date.now() < autoCam.nextAt) return false;
   // No visibility gate: an OBS browser source reports `hidden` while it is not in the program, and
   // the relay needs neither a gesture nor permission, so waiting for "visible" is exactly the
   // click-free page that never starts. The server stops ffmpeg on its own when no client reads.
-  if (state.tracking && !state.synthetic) return false; // a camera already owns the page
-  const now = Date.now();
-  if (autoCam.lastAt && now - autoCam.lastAt < AUTO_CAM_GAP) return false;
+  if (state.tracking && !state.synthetic) {
+    if (trackingClaimLive()) return false; // a camera already owns the page
+    // `trackingClaimLive()` is false both for a stale stamp and for no stamp at all, and a claim
+    // that has only just started has none yet. Dropping it there killed a healthy relay mid-start
+    // and restarted it in a loop: no landmark yet is "starting", not "stale".
+    if (!state.lastFrameAt) return false; // starting: no landmark yet, not stale — leave it
+    const stalledFor = Math.round(performance.now() - state.lastFrameAt);
+    camLog(`stalled ${stalledFor}ms without a frame: dropping the tracking claim`);
+    stopTracking({ manual: false });
+  }
   autoCam.attempts += 1;
-  autoCam.lastAt = now;
   autoCam.busy = true;
+  camLog(`attempt ${autoCam.attempts} source="${state.trackingSource}"`);
   try {
     userStopped = false;
-    // Relay first, device second, synthetic last: all of it inside startTracking/openDevice.
+    // Relay only: the device path is unreachable on this rig (see startTracking).
     await startTracking();
-    if (state.tracking && !state.synthetic) return true;
+    if (state.tracking && !state.synthetic) {
+      cameraLive();
+      return true;
+    }
     fallBackToSynthetic();
+    scheduleCameraRetry(cameraFailureReason());
+    return false;
+  } catch (err) {
+    scheduleCameraRetry(`threw: ${(err && err.message) || err}`);
     return false;
   } finally {
     autoCam.busy = false;
@@ -553,6 +893,10 @@ async function startRelay(opts) {
   camAttempted = true; // a relay failure is a camera failure: the synthetic rig gets the view back
   const live = await relay.start();
   if (!live) {
+    // No stream is no claim: a `running/camera` tracker left over from a frame-less start would
+    // otherwise latch every self-heal (ensureSyntheticAnchors, fallBackToSynthetic, autoCamera).
+    tracker.stop();
+    state.tracking = false;
     state.relayError = relay.reason() || 'relay: no frames';
     if (state.cameraSource === 'relay') state.cameraSource = 'none';
     return false;
@@ -571,35 +915,31 @@ async function startRelay(opts) {
 }
 
 /**
- * The device path, unchanged in behaviour: one enumerate so a machine with no video input is
- * reported as such instead of prompting for a device it lacks, then the tracker's getUserMedia.
- * Only reached when the relay is unavailable.
+ * The browser's own camera is not reachable on this rig: WebcamSwitcher opens every physical camera
+ * in WinRT `ExclusiveControl`, so a second process only ever gets NotReadableError. The device path
+ * used to be attempted here as a silent second choice; it is now a report, in plain words, and the
+ * relay carries the frames. Reached only when the settings name a `deviceId` (an explicit choice).
  */
-async function openDevice(opts) {
-  let devices = [];
-  try {
-    devices = (await navigator.mediaDevices?.enumerateDevices?.()) || [];
-  } catch (err) {
-    setCameraError('enumerate', err && err.name, err && err.message);
-  }
-  if (navigator.mediaDevices && !devices.some((d) => d.kind === 'videoinput')) {
-    if (!state.cameraError) {
-      setCameraError('enumerate', 'NoCamera', 'No video input device is present — drawing on synthetic hands.');
-      setBanner('No camera device — drawing on synthetic hands', 'warn');
-    }
-    return null;
-  }
-  camAttempted = true;
-  return tracker.start(opts);
+function reportExclusiveControl() {
+  const message =
+    'The camera is held exclusively by WebcamSwitcher, so this page cannot open it directly. The relay camera is used instead.';
+  state.cameraError = {
+    at: Date.now(),
+    stage: 'exclusive',
+    name: 'ExclusiveControl',
+    message,
+  };
+  camLog(`device mode unavailable reason="ExclusiveControl"`);
+  setBanner(message, 'warn');
+  renderState();
 }
 
 async function startTracking({ fromBus = false, synthetic = false } = {}) {
   if (PREVIEW && !synthetic) return; // a preview never acquires a camera or the relay
   // A running camera owns the view; a running synthetic rig gives way to a real camera (the
   // overlay starts on synthetic when no camera arrives, so the Start button must still work).
-  if (state.tracking && !state.synthetic) return;
-  if (state.tracking) stopTracking({ manual: false, keepView: true });
-  userStopped = false;
+  if (trackingClaimLive()) return;
+  if (state.tracking) stopTracking({ manual: false, keepView: true });  userStopped = false;
   // The persisted mode wins over the button and the bus: `synthetic` never opens a camera, and
   // needs no gesture to do it. `camera` never draws a synthetic frame.
   const wantSynthetic = synthetic || state.trackingSource === 'synthetic';
@@ -626,28 +966,22 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
     tracker.startSynthetic();
     return;
   }
-  // Relay first: on the rig the camera belongs to WebcamSwitcher, so it cannot be opened here.
+  // The relay is the only camera path on this rig: WebcamSwitcher holds every physical camera in
+  // `ExclusiveControl`, so `trackingSource: auto` resolves to the relay alone and a browser
+  // getUserMedia is never tried. An explicit `deviceId` (the operator's own device choice) still
+  // gets an answer, in plain words, and the relay carries the frames anyway.
+  if (s.deviceId) reportExclusiveControl();
   if (await startRelay(opts)) return;
-  const snap = await openDevice(opts);
-  if (!snap) {
-    state.camera = state.cameraError ? 'error' : 'off';
-    renderState();
-    return;
-  }
-  if (snap.state === 'error') {
-    state.camera = snap.error && /denied/i.test(snap.error) ? 'denied' : 'error';
-    state.error = snap.error;
-    state.tracking = false;
-    setBanner(snap.error, 'bad');
-  } else if (snap.state === 'running' && snap.source === 'camera') {
-    // The device this page actually opened, not the one the settings asked for.
-    state.cameraLabel = snap.deviceLabel || null;
-    state.cameraSource = 'device';
-  }
+  // Nothing else to try: the retry loop owns the next attempt.
+  state.camera = state.relayError ? 'error' : 'off';
+  renderState();
 }
 
 function stopTracking({ manual = true, keepView = false } = {}) {
-  if (manual) userStopped = true;
+  if (manual) {
+    userStopped = true;
+    clearCameraRetry(); // the operator stopped it: no timer may start it again
+  }
   camWasLive = false;
   tracker.stop();
   relay.stop();
@@ -675,7 +1009,7 @@ function ensureSyntheticAnchors() {
   // A preview has no camera to show, so it always runs the rig locally; the pane labels it as the
   // preview, never as the OBS source.
   if (state.trackingSource === 'camera' && !PREVIEW) return false; // camera only: never draw a synthetic frame
-  if (state.tracking && !state.synthetic) return false; // a camera session owns the view
+  if (trackingClaimLive()) return false; // a camera session owns the view
   // Ask the tracker, never a remembered flag: a camera attempt (and a Stop) closes the rig's frame
   // loop, and `state.synthetic` stayed true across it — the rig was then never restarted, so no
   // frames arrived, `fx.view` stopped moving and /ack (which rides on those frames) went quiet.
@@ -739,6 +1073,9 @@ function onTrackerState(snap) {
 }
 
 function onFrame(frame) {
+  // A frame is the only proof that a tracking claim is real. The relay reports `running/camera`
+  // before its first frame, so the stall guard in autoCamera reads this stamp.
+  state.lastFrameAt = performance.now();
   // Mirroring happens here, once: the classifier and the effects both work in page space.
   const mirror = state.settings?.mirror !== false;
   const hands = (frame.hands || []).map((h) => ({
@@ -912,20 +1249,73 @@ function tickBody() {
 
 /* ---------------------------------------------------------------- honest state out */
 
+/**
+ * This page load's identity, made once and never reused across loads. The server ignores unknown
+ * fields today; the point is that a status line can say *which* of the four page sessions in an OBS
+ * window is the one still alive, instead of counting acks from a ghost.
+ */
+const CLIENT_ID = (diag.clientId && String(diag.clientId)) || (() => {
+  try {
+    if (self.crypto && typeof self.crypto.randomUUID === 'function') return self.crypto.randomUUID();
+  } catch {
+    /* fall through to hex */
+  }
+  const bytes = new Uint8Array(16);
+  try {
+    self.crypto.getRandomValues(bytes);
+  } catch {
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+})();
+diag.setClient(CLIENT_ID);
+
+/** One /ack in flight at a time. A request that never returns must not own a connection: with no
+ *  guard and no timeout, every ack the browser failed to retire kept its socket, and six of them
+ *  (the per-origin cap) wedged the page: no acks, no status, no SSE reconnect, forever. */
+let ackInFlight = false;
+/** When the gate was closed, so a latch nobody honours cannot outlive its own timeout unwatched. */
+let ackLatchedAt = 0;
+
 function ack(now = performance.now()) {
   // A preview never reports: the server's draw truth belongs to the OBS source, and a preview
   // that acks makes a dead source look healthy (draws/staleness are read back on /status).
   if (PREVIEW) return;
+  // The gate is one request in flight, not a clock: the 500 ms throttle below paces, it never
+  // retires a hung request.
+  if (ackInFlight) return;
   // At most 2/s: this is a status line, not telemetry.
   if (now - state.lastAck < 500) return;
   state.lastAck = now;
-  fetch('/api/handfx/ack', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
+  // The body is built BEFORE the latch is taken, inside a try. The latch used to be set above the
+  // body, with the body's field reads unguarded: one throwing getter meant fetch was never called,
+  // nothing ever cleared the latch, and every later tick returned at the gate — one ack, then
+  // permanent silence. Now a throw frees the beat (the latch was never taken) and reports itself.
+  let payload;
+  try {
+    // The build self-heal's own ledger: how many self-reloads this server build has cost and when
+    // this document first saw the mismatch. On /status it makes the stale page a visible fact.
+    const buildState = buildCheck.state();
+    payload = JSON.stringify({
       // The bundle this document is running. The server compares it with its own and reports
       // `buildMatches` on /status; an old OBS source then shows as a mismatch, not as healthy.
       build: BUILD,
+      // Which page load this is. Additive: the server ignores fields it does not know.
+      clientId: CLIENT_ID,
+      // The document identity, so /status can group the acks of a page's successor and predecessor
+      // under one role instead of one ephemeral clientId each (see ROLE at the top of this file).
+      role: ROLE,
+      // The build self-heal's ledger, read back on /status per client. Additive, clamped there.
+      reloads: buildState.reloads,
+      lastReloadAt: buildState.lastReloadAt,
+      staleSince: buildState.staleSince,
+      // Does this document need frames? This is the relay's arm signal, carried on the beat that
+      // already exists: the server holds the capture while any live page says yes and releases it
+      // when none does, so a node restart is recovered by the next ack instead of by a subscription
+      // a reconnect can lose. False in a preview (a viewer, and it never acks anyway), false when
+      // the settings name no camera (`cameraRelay: "off"` — synthetic is correct there) and false
+      // when the operator asked for synthetic only.
+      wantsFeed: !PREVIEW && cameraWanted(state.settings) && state.trackingSource !== 'synthetic',
       effect: state.effect,
       tracking: state.tracking,
       model: state.model,
@@ -939,6 +1329,9 @@ function ack(now = performance.now()) {
       // not it (string or null). Both are status, not frame data.
       cameraSource: state.cameraSource,
       relayError: state.relayError,
+      // Whether this page believes it holds a stream right now. `clients` on /status is the
+      // server's count; this is the page's side of the same fact, on the same wire.
+      streamAttached: relay.isLive(),
       // The mask's receipt time, so the server's status can say "mask arriving" without a frame
       // ever leaving this page. `body` also lets the pane name the body effects honestly.
       maskAt: state.bodySeen ? state.bodyAt : 0,
@@ -957,21 +1350,72 @@ function ack(now = performance.now()) {
       visibility: document.visibilityState,
       // Where a slow publish frame goes: compose, readback, NV12 conversion, upload. Numbers only.
       publishTiming: publisher.timing(),
-    }),
-  })
-    .then((res) => {
-      // A failed ack is not page state, but a successful one is the liveness proof the watchdog
-      // waits for: no ack for 5 s means this page's own connection is gone.
-      if (res.ok) watchdog.ok();
-      return res.ok ? res.json().catch(() => null) : null;
+      // How far this document got, emitted once each by the boot path: a page that stalls before
+      // its first draw still names the last breadcrumb it reached.
+      phases: diag.phaseList(),
+    });
+  } catch (err) {
+    // No request started, so the latch was never taken: the 500 ms beat survives a bad field read.
+    ackInFlight = false;
+    diagError('ack-body', err, 'ack body');
+    return;
+  }
+  // Only now, with a body in hand, is the gate closed. `.finally` is the only place that frees it.
+  ackInFlight = true;
+  ackLatchedAt = Date.now();
+  try {
+    fetch('/api/handfx/ack', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(ACK_TIMEOUT_MS),
+      body: payload,
     })
-    .then((doc) => {
-      // The server resolves `default` on every read, so a ratio changed in core (or by a scene)
-      // reaches the fence within one beat even though no settings frame was published to the page.
-      const ratio = doc && doc.ratio;
-      if ((ratio === '9:16' || ratio === '16:9') && ratio !== fx.settings.ratio) fx.setSettings({ ratio });
-    })
-    .catch(() => {});
+      .then((res) => {
+        // A failed ack is not page state, but a successful one is the liveness proof the watchdog
+        // waits for: no ack for 5 s means this page's own connection is gone.
+        if (res.ok) {
+          state.ackOkAt = Date.now();
+          state.ackFails = 0;
+          watchdog.ok();
+          // The page reached the server at least once. A stall after this line is a JS fault, not a
+          // boot that never ran; the breadcrumb is the difference.
+          diag.phase('first-ack');
+        } else {
+          ackFailed();
+        }
+        return res.ok ? res.json().catch(() => null) : null;
+      })
+      .then((doc) => {
+        // The server resolves `default` on every read, so a ratio changed in core (or by a scene)
+        // reaches the fence within one beat even though no settings frame was published to the page.
+        const ratio = doc && doc.ratio;
+        if ((ratio === '9:16' || ratio === '16:9') && ratio !== fx.settings.ratio) fx.setSettings({ ratio });
+      })
+      .catch((err) => {
+        // Includes the 4 s AbortError: a request that was never retired is a failure, and the
+        // wedge check reads the count, so it must not be swallowed.
+        ackFailed();
+        diagError('ack-fail', err, 'ack request');
+      })
+      .finally(() => {
+        // Only a settled request frees the slot, so a hung one is replaced on its own timeout.
+        ackInFlight = false;
+        ackLatchedAt = 0;
+      });
+  } catch (err) {
+    // `fetch` itself threw synchronously (a bad URL, a blocked signal): nothing is in flight.
+    ackInFlight = false;
+    ackLatchedAt = 0;
+    ackFailed();
+    diagError('ack-body', err, 'ack fetch');
+  }
+}
+
+/** Count a failed or timed-out /ack. `ackFails` is what tells a wedged *network* from a wedged
+ *  render loop: the loop keeps ticking through both. */
+function ackFailed() {
+  state.ackFails += 1;
+  state.ackFailAt = Date.now();
 }
 
 let statePaint = 0;
@@ -984,7 +1428,14 @@ function renderState(now = performance.now()) {
   else if (state.tracking) bits.push(`tracking${state.cameraSource === 'relay' ? ' · relay' : ''} · ${state.hands} hand${state.hands === 1 ? '' : 's'}`);
   else if (state.camera === 'asking') bits.push('starting camera…');
   else if (state.camera === 'denied') bits.push('camera denied');
-  else if (state.camera === 'error') bits.push('camera error');
+  else if (state.camera === 'error') {
+    // `stalled` / `restarting` is a drop the relay is still retrying; `failed` is it giving up.
+    // `state.camera` alone says only "error", which would read as terminal in both cases.
+    const feed = relayFeed() || {};
+    if (feed.state === 'failed') bits.push(`relay gave up: ${String(feed.error || 'no frames').slice(0, 80)}`);
+    else if (feed.state === 'stalled' || feed.state === 'restarting' || autoCam.timer) bits.push('camera dropped, retrying');
+    else bits.push('camera error');
+  }
   else bits.push('idle');
   const list = effectiveEffects();
   const cur = currentEffect();
@@ -1061,6 +1512,16 @@ function drawDebug(frame, hands, now) {
 /* ---------------------------------------------------------------- frame loop */
 
 let bodyTickAt = 0;
+/** The diagnostic readout's element: written on every loop tick, so it is as live as the paint. */
+const diagEl = document.getElementById('diag');
+function paintDiag() {
+  if (!diagEl) return;
+  const ackAge = state.ackOkAt ? Date.now() - state.ackOkAt : -1;
+  const phases = diag.phaseList();
+  diagEl.textContent =
+    `t=${state.loopTicks} d=${state.draws} ack=${ackAge < 0 ? 'never' : ackAge} ` +
+    `fails=${state.ackFails} gate=${ackInFlight ? 1 : 0} ph=${phases.length ? phases[phases.length - 1] : ''}`;
+}
 function loop(now) {
   // One frame may fail (a GL hiccup, a body bitmap, a broken effect); the loop may not. The frame
   // is what the page has instead of a sign of life, so the next one is always scheduled, and the
@@ -1069,6 +1530,10 @@ function loop(now) {
   // "not ticking" without guessing.
   state.loopTicks += 1;
   state.lastLoopAt = Date.now();
+  if (state.loopTicks === 1) diag.phase('first-frame');
+  // The page's own clock, written where a screenshot can read it: loop ticks, draws, ack age,
+  // failures and whether the ack gate is holding. One frame, one answer to mute-versus-dead.
+  paintDiag();
   try {
     // The body mask expires 1 s after its last message; checked twice a second, not per frame.
     if (now - bodyTickAt > 500) {
@@ -1078,9 +1543,13 @@ function loop(now) {
     // The camera picture under the effects: the same surface the tracker is reading (the relay's
     // frame canvas or the device's video element), so underlay never adds a second decode. Painted
     // even when the effects are off: the underlay is the camera, not an effect.
-    if (state.underlay && state.tracking && !state.synthetic && tracker.state === 'running') {
-      paintUnderlay(tracker.frameSurface());
-    }
+    // `state.synthetic` is a page-side claim, not a fact about this tick: a relay that reported
+    // `running` before a frame arrived leaves it stale, and requiring it here is what kept a live
+    // stream's frames off the screen. The tracker's own frame surface is the fact.
+    const camSurface = state.underlay && state.tracking && tracker.state === 'running'
+      ? tracker.frameSurface()
+      : null;
+    if (camSurface) paintUnderlay(camSurface);
     if (state.settings && state.settings.enabled !== false && state.settings.obsHandFx !== false) {
       // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
       // sees something and the channel is up), each enabled body effect stays alive, so a mask
@@ -1097,6 +1566,7 @@ function loop(now) {
       if (fx.supported) {
         state.draws += 1;
         state.lastDrawAt = Date.now();
+        if (state.draws === 1) diag.phase('first-draw');
       }
     }
     // Publishing is not on this clock. The publisher owns a `setInterval` at the pipe's frame rate
@@ -1129,6 +1599,97 @@ function loop(now) {
  */
 const ACK_MS = 500;
 if (!PREVIEW) setInterval(() => ack(), ACK_MS);
+
+/**
+ * The beat: a liveness report that cannot be starved.
+ *
+ * Deliberately not `fetch`, not JSON, not a websocket — an `<img>` GET. It shares none of `ack()`'s
+ * machinery (no latch, no body build, no response to parse), so it keeps arriving when the ack gate
+ * is stuck, when a field read throws, or when the fetch pool is contended. Reassigning `src` aborts
+ * the previous request, so a hung one can never queue behind itself.
+ *
+ * The counters it carries are what let the node tell a *mute* page (beats fresh, acks stale: alive
+ * and drawing, not talking) from a *dead* one (both stale). No frame, no landmark ever rides it.
+ */
+const BEAT_MS = 1000;
+let beatSeq = 0;
+let beatImg = null;
+/** The last boot phase seen by the beat, so the block witness can name where the page got to. */
+let lastPhase = '';
+function beat() {
+  if (PREVIEW) return;
+  try {
+    const phases = diag.phaseList();
+    const phase = phases.length ? phases[phases.length - 1] : '';
+    lastPhase = phase;
+    const query =
+      `c=${encodeURIComponent(CLIENT_ID)}&t=${state.loopTicks}&d=${state.draws}` +
+      `&p=${encodeURIComponent(phase)}&b=${encodeURIComponent(BUILD)}&n=${(beatSeq += 1)}`;
+    if (!beatImg) beatImg = new Image();
+    beatImg.src = `/api/handfx/beat?${query}`;
+  } catch (err) {
+    diagError('boot-step', err, 'beat');
+  }
+  // The same 1 s timer feeds the off-thread witness, carrying the same counters the beat reports.
+  // It must ride this timer and not its own: the question the worker answers is exactly "did this
+  // timer stop?", so it has to watch this one.
+  if (blockWatch) {
+    try {
+      blockWatch.postMessage({ type: 'tick', t: Date.now(), ticks: state.loopTicks, draws: state.draws, phase: lastPhase });
+    } catch {
+      /* a dead worker is a blind spot, not a page fault */
+    }
+  }
+}
+
+/**
+ * The block witness: the only instrument on this page that runs off its own main thread.
+ *
+ * When the main thread blocks, rAF, `setInterval` and this beat all stop in the same instant, and
+ * the last painted frame stays on screen — a page that cannot say what happened. A worker keeps its
+ * own thread and its own `fetch`, so 5 s of silence is still reportable while the page is mute.
+ *
+ * Nothing here may break the overlay: a missing worker is recorded through diagError and forgotten.
+ */
+let blockWatch = null;
+try {
+  if (!PREVIEW) {
+    const workerUrl = new URL('./watchdog-worker.js', import.meta.url);
+    // Same content identity as the module, so a deploy cannot leave a worker behind.
+    if (BUILD !== 'unknown') workerUrl.search = `?v=${encodeURIComponent(BUILD)}`;
+    blockWatch = new Worker(workerUrl);
+    blockWatch.onerror = (e) => diagError('watchdog-worker', new Error((e && e.message) || 'worker error'), 'block witness');
+    blockWatch.postMessage({ type: 'hello', clientId: CLIENT_ID });
+    // A real teardown is not a block: say goodbye on both paths, since an OBS reload may only fire
+    // one of them. `bye` is idempotent on the worker side.
+    const bye = () => {
+      try {
+        if (blockWatch) blockWatch.postMessage({ type: 'bye' });
+      } catch {
+        /* already gone */
+      }
+    };
+    addEventListener('pagehide', bye);
+    addEventListener('beforeunload', bye);
+    // The cheap half of the socket leak: this document's two long-lived responses are closed as it
+    // goes, so the successor boots with slots to spare. `persisted` means bfcache — the page is
+    // coming back with its sockets intact, so closing them there would break the restored page.
+    // The server's supersede rule is what must hold; this only makes the leak rarer.
+    const release = (ev) => {
+      if (ev && ev.persisted) return;
+      releaseSockets();
+    };
+    addEventListener('pagehide', release);
+    addEventListener('beforeunload', release);
+  }
+} catch (err) {
+  blockWatch = null;
+  diagError('boot-step', err, 'block witness');
+}
+if (!PREVIEW) {
+  beat();
+  setInterval(beat, BEAT_MS);
+}
 
 /* ---------------------------------------------------------------- buttons */
 
@@ -1169,30 +1730,55 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
     const status = await loadStatus();
     applySettings(status);
     heard = true;
+    diag.phase('state-loaded');
     if (!status.runtime || !status.runtime.vendored) setBanner('MediaPipe runtime is not vendored — run the vendor copy step (modules/handfx/vendor/README.md).', 'bad');
   } catch (err) {
     setBanner(`Cannot read /api/handfx/status: ${err.message}`, 'bad');
   }
   // A preview listens to the bus for nothing: every command it could receive would act on the
   // preview (tracking.toggle, reload), and its status must never be mistaken for the source's.
-  if (!PREVIEW) connectBus();
+  // Each of the three synchronous boot steps is guarded on its own: one throwing must not abort
+  // boot before `loop-start`, because a page that cannot render must still be able to say why.
+  if (!PREVIEW) {
+    try {
+      connectBus();
+    } catch (err) {
+      diagError('boot-step', err, 'connectBus');
+    }
+  }
   // The page has just heard from the server: the watchdog starts healthy rather than counting a
   // stale 0 as a failed connection in its first second. A page whose boot could not reach the
   // server is left stale on purpose, so the first tick starts recovering.
-  if (heard) watchdog.ok();
-  renderState();
+  try {
+    if (heard) watchdog.ok();
+  } catch (err) {
+    diagError('boot-step', err, 'watchdog.ok');
+  }
+  try {
+    renderState();
+  } catch (err) {
+    diagError('boot-step', err, 'renderState');
+  }
   // Never a blank page, not even for one frame: unless the mode is camera-only, the synthetic rig
   // draws now and the camera attempt replaces it the moment a real track runs (onTrackerState →
   // running, source camera). In `synthetic` the camera is never asked for at all.
-  ensureSyntheticAnchors();
+  try {
+    ensureSyntheticAnchors();
+  } catch (err) {
+    diagError('boot-step', err, 'ensureSyntheticAnchors');
+  }
+  diag.phase('loop-start');
   requestAnimationFrame(loop);
   // The load attempt, without a gesture: an OBS browser source is never clicked, so a camera only
   // opens here if this page asks for it itself (`auto` and `camera`; `synthetic` skips it).
-  autoCamera().catch(() => {});
+  autoCamera().catch((err) => diagError('boot-step', err, 'autoCamera'));
   document.addEventListener('visibilitychange', () => {
     if (PREVIEW) return; // a preview never acquires, and never "recovers" a source it is not
     if (document.visibilityState === 'visible') {
-      autoCamera().catch(() => {});
+      // Shown again: a fresh backoff, because the camera may have changed hands while hidden.
+      clearCameraRetry();
+      autoCam.attempts = 0;
+      autoCamera().catch((err) => diagError('boot-step', err, 'autoCamera (visible)'));
       void watchdog.tick();
     }
   });
@@ -1223,4 +1809,4 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
     liveIds: () => [...fx.live.keys()],
     ready: Boolean(fx.supported),
   };
-})();
+})().catch((err) => diagError('boot-throw', err, 'boot'));

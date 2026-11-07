@@ -172,6 +172,9 @@ export function createPublisher({ source, fx, settings, log = () => {} }) {
       headers: { 'content-type': 'application/x-nv12' },
       body: nv12,
       cache: 'no-store',
+      // Bounded, or a single hung POST pins `inflight` true forever and publishing never resumes:
+      // the timeout makes the `.finally` below always reachable.
+      signal: AbortSignal.timeout(8000),
     })
       .then((res) => {
         sample(t0, t1, t2, t3, performance.now());
