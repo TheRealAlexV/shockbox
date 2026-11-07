@@ -484,15 +484,23 @@ function build(ctx) {
           role: roleOf(req),
           ref: refPath(req),
           // The bus's request carries no clientId (see `attach` in the page): it is owned by role.
+          // `client=` is a human label, not the ack identity, so it is reported and never matched.
           clientId: null,
+          label: opts && typeof opts.client === 'string' ? opts.client.slice(0, 64) : null,
           remote: req.socket?.remoteAddress || '?',
           born: Date.now(),
           cap: BUS_MAX_MS,
         });
         res.on('close', () => {
           const age = Date.now() - rec.born;
+          // `superseded` is the hub's rule (core/events.mjs `attach`): a newer client of the same
+          // role, or of the ancestor's Referer path when the older row declared no role at all.
           const newer = [...streams.values()].some(
-            (s) => s !== rec && s.path === '/events' && s.role && s.role === rec.role && s.born > rec.born,
+            (s) =>
+              s !== rec &&
+              s.path === '/events' &&
+              s.born > rec.born &&
+              (s.role === rec.role || (!rec.role && s.role === rec.ref)),
           );
           closeStream(rec, age >= rec.cap - 2000 ? 'max age' : newer ? 'superseded' : 'client closed');
         });
@@ -527,6 +535,8 @@ function build(ctx) {
       rows.push({
         path: rec.path,
         role: rec.role || null,
+        // The page's own name for itself (`?client=`), when it sent one. A label, not an identity.
+        label: rec.label || null,
         clientId: rec.clientId || null,
         owner: rec.clientId ? (clientsById.has(rec.clientId) ? 'acked' : 'unknown') : 'unowned',
         current,

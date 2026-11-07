@@ -184,7 +184,6 @@ function reportRelayEvent(transition, detail = '') {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ clientId: diag.clientId || '', build: BUILD, events }),
-          keepalive: true,
         }).catch(() => {});
       } catch {
         /* a report must never break the stream it describes */
