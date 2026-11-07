@@ -437,6 +437,119 @@ function build(ctx) {
    */
   const clientsById = new Map();
   /**
+   * The socket census: one row per long-lived response this process holds open, with the identity
+   * that owns it and how long it has been open. The pane polls /status at 1 Hz, so it can read the
+   * inventory a socket table shows only as anonymous ESTABLISHED rows, and answer "which response
+   * is holding a slot, and whose is it" without a guess about identity.
+   *
+   * The bus is core's (`core/events.mjs`), so it is observed through its one public entry point:
+   * `attach` is wrapped read-only — it records the request's declared role/ref and the response's
+   * close, and never changes what attach does. The bus cap mirrors `SSE_MAX_MS` there; if the two
+   * ever disagree, only this label is wrong, never a response's life.
+   */
+  const BUS_MAX_MS = Number(process.env.SHOCKBOX_STREAM_MAX_MS) || 300_000;
+  const streams = new Map();
+  let streamSeq = 0;
+  // Closed responses, newest first: a cap close is the deterministic release an ack waits on, and
+  // this ring is how /status shows it without anyone tailing the log.
+  const streamRing = [];
+  const STREAM_RING_MAX = 16;
+
+  function openStream(row) {
+    const rec = { id: ++streamSeq, ...row };
+    streams.set(rec.id, rec);
+    return rec;
+  }
+
+  function closeStream(rec, why) {
+    if (!rec || !streams.delete(rec.id)) return;
+    streamRing.unshift({
+      path: rec.path,
+      role: rec.role,
+      clientId: rec.clientId,
+      ageMs: Math.max(0, Date.now() - rec.born),
+      capMs: rec.cap,
+      why,
+    });
+    if (streamRing.length > STREAM_RING_MAX) streamRing.length = STREAM_RING_MAX;
+  }
+
+  // Read-only: the hub keeps its own list; this only observes the responses it opens.
+  {
+    const rawAttach = events.attach;
+    events.attach = function attachObserved(req, res, opts) {
+      try {
+        const rec = openStream({
+          path: '/events',
+          role: roleOf(req),
+          ref: refPath(req),
+          // The bus's request carries no clientId (see `attach` in the page): it is owned by role.
+          clientId: null,
+          remote: req.socket?.remoteAddress || '?',
+          born: Date.now(),
+          cap: BUS_MAX_MS,
+        });
+        res.on('close', () => {
+          const age = Date.now() - rec.born;
+          const newer = [...streams.values()].some(
+            (s) => s !== rec && s.path === '/events' && s.role && s.role === rec.role && s.born > rec.born,
+          );
+          closeStream(rec, age >= rec.cap - 2000 ? 'max age' : newer ? 'superseded' : 'client closed');
+        });
+      } catch {
+        /* the census must never be the reason a bus does not attach */
+      }
+      return rawAttach.apply(this, arguments);
+    };
+  }
+
+  /**
+   * The census as /status reads it. `current` is asked of the identity the response declared: the
+   * freshest ack of its role. A response whose role already has a newer holder is a *predecessor*
+   * that was expected to be closed and was not — the row an operator needs to see. A stream with no
+   * clientId is `unowned`: `relay.endClient` can never end it.
+   */
+  function streamCensus(now) {
+    const freshest = new Map();
+    for (const c of clientsById.values()) {
+      if (!c.role) continue;
+      const prev = freshest.get(c.role);
+      if (!prev || (c.lastAckAt || 0) > (prev.lastAckAt || 0)) freshest.set(c.role, c);
+    }
+    const rows = [];
+    for (const rec of streams.values()) {
+      const holder = rec.role ? freshest.get(rec.role) || null : null;
+      const current = !holder
+        ? null
+        : rec.clientId
+          ? holder.id === rec.clientId
+          : rec.born >= (holder.firstAckAt || holder.lastAckAt || 0);
+      rows.push({
+        path: rec.path,
+        role: rec.role || null,
+        clientId: rec.clientId || null,
+        owner: rec.clientId ? (clientsById.has(rec.clientId) ? 'acked' : 'unknown') : 'unowned',
+        current,
+        predecessor: current === false,
+        ageMs: Math.max(0, now - rec.born),
+        capMs: rec.cap,
+        ref: rec.ref || null,
+        remote: rec.remote,
+      });
+    }
+    rows.sort((a, b) => b.ageMs - a.ageMs);
+    return {
+      // Cross-check for the rows above: core's own count of bus responses.
+      busClients: events.clientCount,
+      busChannels: events.clientsByChannel(),
+      open: rows.length,
+      streams: rows,
+      closed: streamRing.slice(),
+      caps: { eventBusMs: BUS_MAX_MS, cameraMs: CAMERA_MAX_MS },
+    };
+  }
+
+  /**
    * Which clientId is currently holding the relay open by asking for frames, or null. Reported on
    * /status so "nobody asked for frames" is a visible fact instead of an `idle` feed with no error.
    */
@@ -1029,6 +1142,10 @@ function build(ctx) {
       // reported beside it. A second document of a role can no longer mask the real one, and a
       // null-role row from before `?role=` existed answers for nothing.
       pageRoles: rolesView(now),
+      // Every long-lived response this process is holding, and the identity that owns it. The
+      // inventory a socket table cannot give: path, role, clientId, age, cap, and whether the
+      // declared identity is still the current one. See `streamCensus`.
+      sockets: streamCensus(now),
       // The page's own error reports, newest first, capped at 50. Empty until a page reports.
       pageEvents: pageEvents.slice(),
       // Block testimony from the watchdog worker, newest first. A page whose main thread is blocked
@@ -1205,13 +1322,33 @@ function build(ctx) {
             'content-type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`,
             'cache-control': 'no-store',
           });
-          relay.addClient(res, role, refPath(req), streamClientId);
           // A clean end at CAMERA_MAX_MS: no error status, so the page's next `fetch` simply opens
           // a new stream. `relay.addClient` already drops its client on `close`.
           const born = Date.now();
           const remote = req.socket?.remoteAddress || '?';
           let why = 'client closed';
-          const age = setTimeout(() => {
+          const rec = openStream({
+            path: '/api/handfx/camera/stream',
+            role,
+            ref: refPath(req),
+            clientId: streamClientId,
+            remote,
+            born,
+            cap: CAMERA_MAX_MS,
+          });
+          let age = null;
+          // Registered before the attach: a throw in the relay must not leak a census row.
+          res.on('close', () => {
+            closeStream(rec, res.reaped ? 'reaped' : res.superseded ? 'superseded' : why);
+            if (!age) return;
+            clearTimeout(age);
+            // `superseded` is set by the relay when a newer stream of the same identity arrived:
+            // this response was ended on purpose, not by the page leaving.
+            log.info(
+              `handfx camera stream client=${remote} role=${role || '-'} closed (${res.reaped ? 'reaped' : res.superseded ? 'superseded' : why}) after ${Math.round((Date.now() - born) / 1000)} s`,
+            );
+          });
+          age = setTimeout(() => {
             why = 'max age';
             try {
               res.end();
@@ -1220,14 +1357,7 @@ function build(ctx) {
             }
           }, CAMERA_MAX_MS);
           if (age.unref) age.unref();
-          res.on('close', () => {
-            clearTimeout(age);
-            // `superseded` is set by the relay when a newer stream of the same identity arrived:
-            // this response was ended on purpose, not by the page leaving.
-            log.info(
-              `handfx camera stream client=${remote} role=${role || '-'} closed (${res.reaped ? 'reaped' : res.superseded ? 'superseded' : why}) after ${Math.round((Date.now() - born) / 1000)} s`,
-            );
-          });
+          relay.addClient(res, role, refPath(req), streamClientId);
           return new Promise((resolve) => res.on('close', resolve));
         },
       },
