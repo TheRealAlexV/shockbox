@@ -28,7 +28,7 @@ export async function rearmCamera({ state, relay, tracker, autoCamera, userStopp
   if (userStopped || !visible) return false;
   const live = Boolean(state.tracking && !state.synthetic);
   if (!live && !cameraWanted(state.settings)) return false;
-  relay.stop({ forget: false });
+  relay.stop({ forget: false, why: 'rearm' });
   tracker.stop();
   // Synthetic stays, so the view is honest: nothing is a camera until the next relay frame lands.
   if (state.cameraSource === 'relay' || state.cameraSource === 'device') state.cameraSource = 'none';

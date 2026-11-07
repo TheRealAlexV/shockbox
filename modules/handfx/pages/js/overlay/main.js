@@ -196,6 +196,37 @@ function reportRelayEvent(transition, detail = '') {
   }
 }
 
+/**
+ * Ack and beat live on a worker thread with their own timer. The render loop decodes 30 JPEG
+ * frames a second, and a main thread blocked by that work used to take liveness down with it: the
+ * server saw a silent page while frames were flowing. The worker carries the last payload the page
+ * handed it and posts on its own clock, so a blocked loop reads as "ack fresh, draws stale" in the
+ * server's truth table instead of as a dead page. The inline fetch below stays as the fallback.
+ */
+let ackWorker = null;
+try {
+  if (!PREVIEW && typeof Worker === 'function') {
+    ackWorker = new Worker(new URL('./ack-worker.js', import.meta.url));
+    ackWorker.onmessage = (event) => {
+      const msg = event.data || {};
+      if (msg.type === 'ack-ok') {
+        state.ackOkAt = Date.now();
+        state.ackFails = 0;
+        watchdog.ok();
+        diag.phase('first-ack');
+        return;
+      }
+      if (msg.type === 'ack-fail') ackFailed();
+    };
+    ackWorker.onerror = () => {
+      ackWorker = null;
+    };
+  }
+} catch (err) {
+  ackWorker = null;
+  diagError('boot-step', err, 'ack worker');
+}
+
 const relay = createRelay({
   // `?role=` on the stream too, so a predecessor's leaked stream is ended when this one attaches.
   url: `/api/handfx/camera/stream?role=${encodeURIComponent(ROLE)}&clientId=${encodeURIComponent(diag.clientId || '')}`,
@@ -649,7 +680,7 @@ function releaseSockets() {
     // `pageshow`) — so forgetting here left the feed dead for the rest of the document's life the
     // first time an OBS browser source fired `pagehide`. relay.js's own pagehide listener has
     // always passed `forget: false` for exactly this reason.
-    if (typeof relay?.stop === 'function') relay.stop({ forget: false });
+    if (typeof relay?.stop === 'function') relay.stop({ forget: false, why: 'release-sockets' });
   } catch {
     /* already stopped */
   }
@@ -1055,7 +1086,7 @@ function stopTracking({ manual = true, keepView = false } = {}) {
   // the synthetic fallback) must keep `wanted`: it is what every re-open path tests. The default
   // `forget: true` erased it here, so one 120 s cap close became permanent — relay.js's
   // `wantReopen` timer then bailed on `!wanted` and nothing asked for the stream again.
-  relay.stop({ forget: manual });
+  relay.stop({ forget: manual, why: manual ? 'operator-stop' : 'tracking-torn-down' });
   state.cameraSource = 'none';
   state.tracking = false;
   state.synthetic = false; // the rig's frame loop is gone with the tracker; the flag goes with it
@@ -1431,6 +1462,13 @@ function ack(now = performance.now()) {
     // No request started, so the latch was never taken: the 500 ms beat survives a bad field read.
     ackInFlight = false;
     diagError('ack-body', err, 'ack body');
+    return;
+  }
+  // The worker paces itself and guards its own in-flight request, so the latch and the timeout
+  // belong to the fallback path only. A frozen main thread still hands over its last payload, and
+  // the worker keeps posting it: that is what makes liveness independent of the render loop.
+  if (ackWorker) {
+    ackWorker.postMessage({ type: 'payload', body: payload });
     return;
   }
   // Only now, with a body in hand, is the gate closed. `.finally` is the only place that frees it.

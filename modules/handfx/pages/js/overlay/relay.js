@@ -242,9 +242,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     emit('error');
   }
 
-  function stop({ forget = true } = {}) {
+  function stop({ forget = true, why = 'unspecified' } = {}) {
     if (forget) wanted = false;
-    note('stop', `forget=${forget} wanted=${wanted}`);
+    note('stop', `forget=${forget} wanted=${wanted} why=${why}`);
     // A pending re-open belongs to the intent being stopped: a page that forgot the stream must not
     // be reopened by a timer it no longer owns.
     cancelReopen();
@@ -260,6 +260,11 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       emit('idle');
     }
     live = false;
+    // A stop that keeps `wanted` means the page still wants frames, so something must own the
+    // resume. `pagehide` has `pageshow`; every other caller gets the ordinary backoff here. Without
+    // this a teardown left `wanted` true with no socket and no timer, and only `start()` could ever
+    // leave that state — which is how a live, drawing page sat at zero stream clients.
+    if (wanted && why !== 'pagehide') wantReopen();
   }
 
   async function decode(bytes) {
@@ -433,7 +438,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
   // source that is hidden and shown again (bfcache) reacquired on the visibilitychange above, but
   // `stop()` with its default `forget: true` cleared `wanted` and nothing could ever start again —
   // that is how the relay sat at 0 clients while publish still had a reader.
-  window.addEventListener('pagehide', () => stop({ forget: false }));
+  window.addEventListener('pagehide', () => stop({ forget: false, why: 'pagehide' }));
   window.addEventListener('pageshow', () => {
     if (wanted && !ctrl) void start();
   });
