@@ -110,6 +110,14 @@ const HEADLINE_ROLE = '/shockfx';
 const CLIENT_CANDIDATE_MS = PAGE_FRESH_MS;
 /** A per-client ack entry is forgotten after this much silence: a closed tab is not a client. */
 const CLIENTS_TTL_MS = 10 * 60 * 1000;
+/**
+ * A client silent this long is reaped: its long-lived responses are ended and its row dropped.
+ * Chosen as the 120 s camera cap plus one 25 s build-poll cycle plus margin. A live document
+ * cannot be silent that long; a frozen one will never be heard from again, and it cannot free the
+ * socket it still holds (its build poll runs inside the render loop it lost). Reaping on silence,
+ * not on the page's cooperation, is what makes the six-per-origin budget self-healing.
+ */
+const CLIENT_REAP_MS = 180_000;
 /** One log line when an established client goes quiet for this long — never one per poll. */
 const CLIENT_SILENT_MS = 30_000;
 // No server-held connection may outlive CAMERA_MAX_MS, so a document that vanished without closing
@@ -552,6 +560,14 @@ function build(ctx) {
       // A beat is proof of life too: a mute page (acks broken, beats arriving) must not be swept
       // out from under the truth table just because its ack path is the thing that failed.
       const silentFor = now - Math.max(c.lastAckAt || 0, c.beatAt || 0);
+      if (silentFor > CLIENT_REAP_MS) {
+        // Silence, not cooperation: end the readers this document still holds so the next ack of a
+        // live successor can get a socket at all.
+        const ended = relay.endClient(id);
+        clientsById.delete(id);
+        log.info(`handfx page: reaped clientId=${id} after ${Math.round(silentFor / 1000)}s silence, ended=${ended} stream(s)`);
+        continue;
+      }
       if (silentFor > CLIENTS_TTL_MS) {
         clientsById.delete(id);
         continue;
@@ -1111,18 +1127,21 @@ function build(ctx) {
       {
         path: '/camera/stream',
         method: 'GET',
-        handler: (req, res) => {
+        handler: (req, res, url) => {
           relay.sync();
           if (!relay.enabled()) return send(res, 503, { ok: false, error: 'camera relay is off' });
           // Which document this stream belongs to. The relay ends any older stream of the same
           // identity before taking this one (see `addClient`), so a reloaded page cannot leave its
           // predecessor holding a socket out of the browser's six-per-origin budget.
           const role = roleOf(req);
+          // The client id the document acks with: binds this stream to that client so the reaper
+          // can end exactly this reader when the document goes silent, never its successor.
+          const streamClientId = String(url.searchParams.get('clientId') || '').slice(0, 64) || null;
           res.writeHead(200, {
             'content-type': `multipart/x-mixed-replace; boundary=${BOUNDARY}`,
             'cache-control': 'no-store',
           });
-          relay.addClient(res, role, refPath(req));
+          relay.addClient(res, role, refPath(req), streamClientId);
           // A clean end at CAMERA_MAX_MS: no error status, so the page's next `fetch` simply opens
           // a new stream. `relay.addClient` already drops its client on `close`.
           const born = Date.now();
@@ -1142,7 +1161,7 @@ function build(ctx) {
             // `superseded` is set by the relay when a newer stream of the same identity arrived:
             // this response was ended on purpose, not by the page leaving.
             log.info(
-              `handfx camera stream client=${remote} role=${role || '-'} closed (${res.superseded ? 'superseded' : why}) after ${Math.round((Date.now() - born) / 1000)} s`,
+              `handfx camera stream client=${remote} role=${role || '-'} closed (${res.reaped ? 'reaped' : res.superseded ? 'superseded' : why}) after ${Math.round((Date.now() - born) / 1000)} s`,
             );
           });
           return new Promise((resolve) => res.on('close', resolve));

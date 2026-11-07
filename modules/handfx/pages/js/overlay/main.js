@@ -156,24 +156,41 @@ const tracker = new Tracker({ onFrame: onFrame, onState: onTrackerState });
 // The relayed camera: the server's ffmpeg feed of the WebcamSwitcher virtual camera. The page
 // cannot open that device itself (WebcamSwitcher holds it), so it reads the MJPEG stream instead
 // and feeds each decoded frame to the tracker's own detect path.
+const relayEventQueue = [];
+let relayEventTimer = 0;
+
 /**
- * One line per relay transition, posted to `/api/handfx/page-event` so it reaches the node log as
- * `handfx page: relay <phase> <message>`. Fire and forget: never awaited, never able to throw.
+ * One line per relay transition, batched. A transition burst (a cap close plus its re-open) used
+ * to be five POSTs landing exactly when the ack needed its socket; now it is one. `/events` is
+ * server-to-page only, so the ledger cannot ride it without adding a client-to-server route.
+ * Fire and forget: never awaited, never able to throw.
  */
 function reportRelayEvent(transition, detail = '') {
   try {
-    void fetch('/api/handfx/page-event', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        kind: 'relay',
-        phase: String(transition || 'note').slice(0, 40),
-        message: String(detail || '').slice(0, 300),
-        build: BUILD,
-        t: Date.now(),
-      }),
-      keepalive: true,
-    }).catch(() => {});
+    relayEventQueue.push({
+      kind: 'relay',
+      phase: String(transition || 'note').slice(0, 40),
+      message: String(detail || '').slice(0, 300),
+      build: BUILD,
+      t: Date.now(),
+    });
+    if (relayEventTimer) return;
+    relayEventTimer = setTimeout(() => {
+      relayEventTimer = 0;
+      if (!relayEventQueue.length) return;
+      const events = relayEventQueue.splice(0, relayEventQueue.length);
+      try {
+        void fetch('/api/handfx/page-event', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ clientId: diag.clientId || '', build: BUILD, events }),
+          keepalive: true,
+        }).catch(() => {});
+      } catch {
+        /* a report must never break the stream it describes */
+      }
+    }, 150);
+    relayEventTimer.unref?.();
   } catch {
     /* a report must never break the stream it describes */
   }
@@ -181,7 +198,7 @@ function reportRelayEvent(transition, detail = '') {
 
 const relay = createRelay({
   // `?role=` on the stream too, so a predecessor's leaked stream is ended when this one attaches.
-  url: `/api/handfx/camera/stream?role=${encodeURIComponent(ROLE)}`,
+  url: `/api/handfx/camera/stream?role=${encodeURIComponent(ROLE)}&clientId=${encodeURIComponent(diag.clientId || '')}`,
   onEvent: reportRelayEvent,
   onFrame: (bitmap) => tracker.pushFrame(bitmap),
   onState: (s) => {

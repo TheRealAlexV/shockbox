@@ -535,10 +535,25 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     if (log && typeof log.warn === 'function') log.warn(`handfx camera: ${counters.error}`);
   }
 
+  /**
+   * Does anything need the producer? An attached reader holds it by construction, and so does a
+   * reader that detaches only for the reconnect gap: the page re-attaches well inside this grace
+   * window, and tearing the child down in that gap handed the reattaching reader a producer that
+   * was still restarting — the one-frame-per-cap-cycle symptom. `demand` still arms the producer
+   * for a page with no stream attached, and `keepWarm` still overrides everything.
+   */
+  const CLIENT_GRACE_MS = 10_000;
+  function wantsProducer() {
+    if (clients.size) return true;
+    if (cfg.keepWarm) return true;
+    if (demand) return true;
+    return lastClientAt > 0 && Date.now() - lastClientAt < CLIENT_GRACE_MS;
+  }
+
   /** Retry the given path under the normal backoff. Always logs the transition. */
   function scheduleRestart(nextMode) {
     if (restartTimer || !cfg.enabled) return;
-    if (!clients.size && !demand && !cfg.keepWarm) {
+    if (!wantsProducer()) {
       state = 'idle';
       stopWatchdog();
       return;
@@ -565,7 +580,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       state = 'off';
       return;
     }
-    if (!clients.size && !demand && !cfg.keepWarm) {
+    if (!wantsProducer()) {
       state = 'idle';
       stopWatchdog();
       return;
@@ -708,7 +723,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       if (state !== 'off') state = 'off';
       return;
     }
-    if (!clients.size && !demand && !cfg.keepWarm) {
+    if (!wantsProducer()) {
       // Enabled but nobody is reading and keep-warm is off: there is nothing to do.
       if (child || pipeSocket) stopChild();
       else state = 'idle';
@@ -888,14 +903,14 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     lastClientAt = Date.now();
     // Keep-warm means the camera does not depend on a page being connected; a page's demand does
     // the same for as long as its heartbeat keeps asking.
-    if (!clients.size && !demand && !cfg.keepWarm) scheduleStop();
+    if (!wantsProducer()) scheduleStop();
   }
 
   function scheduleStop() {
     clearStop();
     stopTimer = setTimeout(() => {
       stopTimer = null;
-      if (!clients.size && !demand) stopChild();
+      if (!wantsProducer()) stopChild();
     }, STOP_AFTER_MS);
     stopTimer.unref?.();
   }
@@ -1056,9 +1071,27 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
       if (next) {
         clearStop();
         start();
-      } else if (!clients.size && !cfg.keepWarm) {
+      } else if (!wantsProducer()) {
         scheduleStop();
       }
+    },
+
+    /** End the streams bound to one client id, so a silent document cannot hold a reader slot. */
+    endClient(clientId) {
+      if (!clientId) return 0;
+      let ended = 0;
+      for (const old of [...clients]) {
+        if (old.clientId !== clientId) continue;
+        old.res.reaped = true;
+        clients.delete(old);
+        try {
+          old.res.end();
+        } catch {
+          /* already gone */
+        }
+        ended += 1;
+      }
+      return ended;
     },
 
     /**
@@ -1072,7 +1105,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
      * keeps a reload from wedging the page. Only the same identity is touched — a different page's
      * stream is never ended — and the response that just attached is not in the set yet.
      */
-    addClient(res, role = null, ref = null) {
+    addClient(res, role = null, ref = null, clientId = null) {
       if (role) {
         for (const old of [...clients]) {
           if (old.role === role || (!old.role && old.ref === role)) {
@@ -1088,7 +1121,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
           }
         }
       }
-      const client = { res, role, ref, busy: false, pending: null };
+      const client = { res, role, ref, clientId, busy: false, pending: null };
       const drop = () => removeClient(client);
       res.on('close', drop);
       res.on('error', drop);

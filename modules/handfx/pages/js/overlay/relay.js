@@ -120,6 +120,10 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
   let retryDelay = 0; // 0 = the next re-open is immediate
   const RETRY_BASE = 500;
   const RETRY_MAX = 15000;
+  /** A stream must have lived this long before its close earns an immediate re-open. */
+  const RELIVE_MIN_MS = 2000;
+
+  let liveSince = 0;
 
   /**
    * Report one transition to the page's event channel (`POST /api/handfx/page-event`), which the
@@ -159,6 +163,10 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
 
   function close() {
     clearStall();
+    // Drop the queued frame with the connection: `drain()` would otherwise hand the old stream's
+    // last JPEG to the new one, inflating `dropped` on every reconnect and painting a stale frame
+    // across the gap.
+    latest = null;
     if (ctrl) {
       ctrl.abort();
       ctrl = null;
@@ -284,6 +292,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
         if (!live) {
           live = true;
           error = null;
+          liveSince = Date.now();
           // A frame arrived: the next drop (including the server's max-age close) reopens at once.
           retryDelay = 0;
           cancelReopen();
@@ -330,7 +339,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       }
       // The server ends every stream at its max age, so this is the healthy path back, not the end:
       // reopen at once (the socket is free and the server is up) with the retry loop behind it.
-      if (wanted) wantReopen(true);
+      if (wanted) wantReopen(Date.now() - liveSince > RELIVE_MIN_MS);
       else note('reopen-refused', 'wanted=false: the page was told to forget the stream');
     }
   }
