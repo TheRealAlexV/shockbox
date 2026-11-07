@@ -456,6 +456,15 @@ function build(ctx) {
    *   feed live, fresh ack camera  → effectiveSource 'camera', not stale
    *   feed live, fresh ack other   → effectiveSource = that source, not stale
    */
+  /**
+   * One rule for every payload-derived value: if the payload is older than `PAGE_FRESH_MS`, the
+   * value is last-known and is reported as null. Two passes were read against numbers that were
+   * not live because this was patched per field; it is applied once, to all of them.
+   */
+  function fresh(at, value) {
+    return at && Date.now() - at <= PAGE_FRESH_MS ? value : null;
+  }
+
   function pageTruth(feed, page, now) {
     const live = feed.state === 'live';
     const pageAckAgeMs = page && page.lastAckAt ? Math.max(0, now - page.lastAckAt) : Infinity;
@@ -997,19 +1006,24 @@ function build(ctx) {
       // Two independent clocks for bracketing a freeze: the worker's tick count and the provenance
       // of the last ack. A page frozen mid-draw while these advance is a thread-level stall; these
       // stopping with it is a wedged renderer process.
-      workerTicks,
+      // Every payload-derived field goes through `fresh()`: a value from a payload older than
+      // PAGE_FRESH_MS is last-known, not current, and reads null. `workerTickAt` and `ackViaAt`
+      // stay raw so the age is always visible. Client rows keep their own marker (`state: stale`
+      // plus `ackAgeMs`) rather than being nulled, because the verdict reads those fields.
+      workerTicks: fresh(workerTickAt, workerTicks),
+      workerTickGapMs: fresh(workerTickAt, workerTickGapMs),
+      workerTickSinceOk: fresh(workerTickAt, workerTickSinceOk),
+      workerAckStats: fresh(workerTickAt, workerAckStats),
       workerTickAt,
-      workerTickGapMs,
-      workerTickSinceOk,
+      payloadFresh: {
+        tick: Boolean(workerTickAt && Date.now() - workerTickAt <= PAGE_FRESH_MS),
+        ack: Boolean(ackViaAt && Date.now() - ackViaAt <= PAGE_FRESH_MS),
+      },
+      ackVia: fresh(ackViaAt, ackVia),
+      ackViaAt,
       ackRequests,
       touchClientCalls,
       ackNewClient,
-      workerAckStats,
-      // A current fact, not a memory: a worker ack that stopped arriving must not keep asserting
-      // that acks are arriving while pageAckAgeMs says they are not. Null once the stamp is older
-      // than the freshness window that the rest of the truth table already uses.
-      ackVia: ackViaAt && Date.now() - ackViaAt <= PAGE_FRESH_MS ? ackVia : null,
-      ackViaAt,
       // The per-role verdict: one entry per document role present, and the headline role's row
       // (`/shockfx`). The top-level `pageState`/`clientBuild` follow this row; the other roles are
       // reported beside it. A second document of a role can no longer mask the real one, and a
