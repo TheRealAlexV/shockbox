@@ -102,6 +102,23 @@ const PAGE_FRESH_MS = 10_000;
  */
 const PAGE_BEAT_STALE_MS = 5000;
 /**
+ * A camera reader is *consuming* when the relay handed it a frame this recently. The relay's
+ * `sent` counter only advances when the previous frame's bytes left Node's queue (a `write()` that
+ * returned true, or a `drain` that arrived after one that returned false). A page that stopped
+ * reading cannot satisfy this: its kernel send buffer fills within a frame or two, `write()` starts
+ * returning false, no `drain` ever comes, and the counter freezes while the camera keeps producing.
+ * Its own TCP window is the clock — nothing the page can fake from JS.
+ */
+const STREAM_LIVE_MS = 2500;
+/**
+ * How long a reader may sit in backpressure before it is not consuming. One frame at the relay's
+ * configured rate is tens of milliseconds; a second and a half is ~45 missed frames, far past any
+ * GC pause, and short enough that a frozen page is caught while the operator is still watching.
+ */
+const STREAM_BLOCKED_MAX_MS = 1500;
+/** A reader whose unflushed queue is this deep is not draining it, whatever its counters say. */
+const STREAM_BUFFER_MAX = 1024 * 1024;
+/**
  * The document that decides the headline verdict. The OBS browser source is served at `/shockfx`,
  * and a page's role is its `location.pathname`, so this is the page the operator watches. Other
  * roles are reported beside it and can never answer in its place.
@@ -461,6 +478,50 @@ function build(ctx) {
     return rec;
   }
 
+  /**
+   * Per-stream frame accounting, installed on the response the camera route owns before the relay
+   * is handed it. The relay writes every frame through this same `res`, so wrapping `write` sees
+   * exactly the frames it hands over, and `writableLength` sampled at that moment is the socket's
+   * own backlog.
+   *
+   * This is the honest liveness signal, and it is honest because of what it *cannot* do:
+   *
+   *   - `write()` returning true is not evidence on its own — Node accepts into its own queue
+   *     whether or not the peer reads. So `frames` advancing is never used alone.
+   *   - What is used is the pair: frames still going out (`lastWriteAt` recent) **while** the
+   *     unflushed backlog stays bounded (`buffered`) **and** the stream is not parked in `drain`
+   *     (`blockedSince`). A page that stopped reading fills the kernel send buffer within a frame
+   *     or two, `write()` starts returning false, no `drain` ever fires, and all three go false
+   *     together while the camera keeps producing at 30 fps.
+   *
+   * The residual gap, stated rather than hidden: this proves bytes left this server's socket, not
+   * that the page decoded them. The difference is bounded by the OS and Chrome receive buffers —
+   * well under a second at this rate — and the only thing that could close it is the ack path,
+   * which the six-socket cap starves. `ackAgeMs` stays published so that starvation stays visible.
+   */
+  function meterStream(res, rec) {
+    const meter = { frames: 0, lastWriteAt: 0, buffered: 0, blockedSince: 0 };
+    const rawWrite = res.write.bind(res);
+    res.write = function meteredWrite(chunk, ...rest) {
+      const ok = rawWrite(chunk, ...rest);
+      meter.frames += 1;
+      meter.lastWriteAt = Date.now();
+      meter.buffered = res.writableLength;
+      if (ok) {
+        meter.blockedSince = 0;
+      } else if (!meter.blockedSince) {
+        meter.blockedSince = Date.now();
+      }
+      return ok;
+    };
+    res.on('drain', () => {
+      meter.buffered = res.writableLength;
+      meter.blockedSince = 0;
+    });
+    rec.meter = meter;
+    return meter;
+  }
+
   function closeStream(rec, why) {
     if (!rec || !streams.delete(rec.id)) return;
     streamRing.unshift({
@@ -588,15 +649,60 @@ function build(ctx) {
     return at && Date.now() - at <= PAGE_FRESH_MS ? value : null;
   }
 
-  function pageTruth(feed, page, now) {
+  /**
+   * The camera readers that are provably *consuming* frames right now, keyed by the client id their
+   * stream was opened with. Read from the meters the camera route installs (see `meterStream`), the
+   * one population that has a writer to sample:
+   *
+   *   - `sentAgeMs` — the relay handed this reader a frame within `STREAM_LIVE_MS`. It advances only
+   *     while bytes are leaving the socket, so it freezes when the peer stops reading.
+   *   - `buffered` — the response's `writableLength`, sampled at each write: shallow when drained.
+   *   - `blockedMs` — the reader is not parked in backpressure. A page that stops reading fills the
+   *     kernel send buffer within a frame or two, `write()` returns false, no `drain` ever comes,
+   *     and this grows without bound while `frames` freezes.
+   *
+   * A page that stopped reading therefore fails all three within about a second at this frame rate.
+   * The residual limit is stated in `meterStream`: this proves the bytes left the socket, not that
+   * the page decoded them, and that gap is bounded by the OS/Chrome receive buffers.
+   */
+  function consumingReaders(now) {
+    const out = new Map();
+    for (const rec of streams.values()) {
+      if (rec.path !== '/api/handfx/camera/stream') continue;
+      const m = rec.meter;
+      if (!m || !rec.clientId || !m.frames) continue;
+      const sentAgeMs = m.lastWriteAt ? Math.max(0, now - m.lastWriteAt) : null;
+      const blockedMs = m.blockedSince ? Math.max(0, now - m.blockedSince) : 0;
+      if (sentAgeMs == null || sentAgeMs > STREAM_LIVE_MS) continue;
+      if ((m.buffered || 0) > STREAM_BUFFER_MAX) continue;
+      if (blockedMs > STREAM_BLOCKED_MAX_MS) continue;
+      out.set(rec.clientId, {
+        clientId: rec.clientId,
+        sent: m.frames,
+        sentAgeMs,
+        buffered: m.buffered || 0,
+        blockedMs,
+      });
+    }
+    return out;
+  }
+
+  function pageTruth(feed, page, now, consuming) {
     const live = feed.state === 'live';
     const pageAckAgeMs = page && page.lastAckAt ? Math.max(0, now - page.lastAckAt) : Infinity;
     const pageBeatAgeMs = page && page.beatAt ? Math.max(0, now - page.beatAt) : Infinity;
     const pageFresh = pageAckAgeMs <= PAGE_FRESH_MS;
     const beatFresh = pageBeatAgeMs <= PAGE_BEAT_STALE_MS;
+    // Precedence, in the order the evidence is worth: a page consuming the camera stream is alive by
+    // construction (it is being handed 30 frames a second and taking them), then a fresh ack, then
+    // nothing. `livenessBasis` names which one answered so a reading is never ambiguous.
+    const streamReader = live && page && page.id && consuming ? consuming.get(page.id) || null : null;
+    const streamLive = Boolean(streamReader);
+    const livenessBasis = streamLive ? 'stream' : pageFresh ? 'ack' : 'none';
+    const alive = streamLive || pageFresh;
     // The three page states, named. Acks are the page *talking*; beats are the page *running*, and
     // they travel different paths on purpose, so the pair says which of the two failed.
-    const pageState = pageFresh ? 'live' : beatFresh ? 'page-mute' : 'page-dead';
+    const pageState = alive ? 'live' : beatFresh ? 'page-mute' : 'page-dead';
     const loopStale = clientLoopStale(page, now);
     const aged = (ms) => (Number.isFinite(ms) ? `${Math.round(ms / 1000)} s` : 'never');
     if (!live) {
@@ -608,13 +714,14 @@ function build(ctx) {
         pageBeatAgeMs,
         beatFresh,
         loopStale,
+        livenessBasis,
         stale: true,
         effectiveSource: 'stale',
         state: feed.state,
         reason: `feed ${feed.state}${feed.reason || feed.error ? `: ${feed.reason || feed.error}` : ''}`,
       };
     }
-    if (!pageFresh) {
+    if (!alive) {
       return {
         live,
         pageFresh,
@@ -623,6 +730,7 @@ function build(ctx) {
         pageBeatAgeMs,
         beatFresh,
         loopStale,
+        livenessBasis,
         stale: true,
         effectiveSource: 'stale',
         // Not 'live': the pipe is running, but the page is not reporting what it draws. The two
@@ -635,7 +743,11 @@ function build(ctx) {
           : 'page dead: no page has ever acked or beaten',
       };
     }
-    const source = ['camera', 'synthetic', 'none'].includes(page.source) ? page.source : 'none';
+    const acked = ['camera', 'synthetic', 'none'].includes(page.source) ? page.source : 'none';
+    // What is driving, not what was last acked. A page taking the camera stream is on the camera by
+    // construction — `main.js` only opens `/camera/stream` when the camera is wanted — so a stream
+    // reading answers `camera` even where the ack path is too starved to say anything.
+    const source = streamLive && !pageFresh ? 'camera' : acked;
     return {
       live,
       pageFresh,
@@ -644,17 +756,32 @@ function build(ctx) {
       pageBeatAgeMs,
       beatFresh,
       loopStale,
+      livenessBasis,
       stale: false,
       effectiveSource: source,
       state: 'live',
-      reason: loopStale
-        ? `feed live, page live: ack ${aged(pageAckAgeMs)} ago, but its loop has not advanced for ${aged(now - (page.loopAdvAt || now))} — reporting, not drawing`
-        : `feed live, page live: ack ${aged(pageAckAgeMs)} ago, reporting ${source}`,
+      // Reader evidence, so the basis is inspectable rather than a bare enum.
+      stream: streamReader
+        ? { clientId: streamReader.clientId, sent: streamReader.sent, sentAgeMs: streamReader.sentAgeMs, buffered: streamReader.buffered, blockedMs: streamReader.blockedMs }
+        : null,
+      reason: streamLive
+        ? `feed live, page live on the stream: ${streamReader.sent} frames sent to reader ${streamReader.clientId}, last ${aged(streamReader.sentAgeMs)} ago, ${streamReader.buffered} B queued${pageFresh ? `; ack ${aged(pageAckAgeMs)} ago` : `; no ack for ${aged(pageAckAgeMs)} — the ack path is starved, not the page`}`
+        : loopStale
+          ? `feed live, page live: ack ${aged(pageAckAgeMs)} ago, but its loop has not advanced for ${aged(now - (page.loopAdvAt || now))} — reporting, not drawing`
+          : `feed live, page live: ack ${aged(pageAckAgeMs)} ago, reporting ${source}`,
     };
   }
 
-  /** Is this client still reporting at all? An ack or a beat inside the candidate window. */
-  function clientAlive(c, now) {
+  /**
+   * Is this client still reporting at all? An ack or a beat inside the candidate window, or a
+   * camera reader it owns that is provably taking frames. The third is not a courtesy: under the
+   * six-socket cap the ack POST and the beat `<img>` are both starved for most of every camera-cap
+   * cycle, so a page that is demonstrably consuming 30 fps would otherwise be dropped from candidacy
+   * and the headline would fall to "no page ever reported". Consuming is stronger evidence than
+   * either ack or beat, so it has to count here.
+   */
+  function clientAlive(c, now, consuming) {
+    if (consuming && c.id && consuming.has(c.id)) return true;
     const seen = Math.max(c.lastAckAt || 0, c.beatAt || 0);
     return seen > 0 && now - seen <= CLIENT_CANDIDATE_MS;
   }
@@ -663,20 +790,23 @@ function build(ctx) {
    * How good one client is as its role's answer. Ranked first on whether it is drawing *now* — a
    * document that survived has an advancing paint clock, one that died mid-boot does not — and only
    * then on ack recency. Recency alone is what let a transient boot row outrank the live document.
+   * A consuming stream counts as drawing: frames are arriving and being taken, which is the one
+   * thing a dead document cannot do.
    */
-  function candidateRank(c, now) {
+  function candidateRank(c, now, consuming) {
+    const streaming = Boolean(consuming && c.id && consuming.has(c.id));
     const ackFresh = c.lastAckAt > 0 && now - c.lastAckAt <= PAGE_FRESH_MS;
-    const drawing = ackFresh && c.loopTicks > 0 && !clientLoopStale(c, now);
-    return [drawing ? 2 : ackFresh ? 1 : 0, c.lastAckAt || 0];
+    const drawing = streaming || (ackFresh && c.loopTicks > 0 && !clientLoopStale(c, now));
+    return [drawing ? 2 : ackFresh ? 1 : 0, Math.max(c.lastAckAt || 0, streaming ? Number.MAX_SAFE_INTEGER : 0)];
   }
 
   /** The best live client matching `match`, or null. */
-  function bestClient(now, match) {
+  function bestClient(now, match, consuming) {
     let best = null;
     let bestRank = null;
     for (const c of clientsById.values()) {
-      if (!match(c) || !clientAlive(c, now)) continue;
-      const r = candidateRank(c, now);
+      if (!match(c) || !clientAlive(c, now, consuming)) continue;
+      const r = candidateRank(c, now, consuming);
       if (!best || r[0] > bestRank[0] || (r[0] === bestRank[0] && r[1] > bestRank[1])) {
         best = c;
         bestRank = r;
@@ -690,8 +820,8 @@ function build(ctx) {
    * (a document cached from before `?role=` existed) matches no role at all, so it can never be
    * handed back here however recent its `lastAckAt` is.
    */
-  function rolePage(role, now) {
-    return role ? bestClient(now, (c) => (c.role || null) === role) : null;
+  function rolePage(role, now, consuming) {
+    return role ? bestClient(now, (c) => (c.role || null) === role, consuming) : null;
   }
 
   /**
@@ -700,13 +830,13 @@ function build(ctx) {
    * (its path changed), so it answers. Only a tree with no role-bearing client at all — a page
    * cached before `?role=` existed — falls back to the old any-client behaviour.
    */
-  function freshestPage(now) {
-    const headline = rolePage(HEADLINE_ROLE, now);
+  function freshestPage(now, consuming) {
+    const headline = rolePage(HEADLINE_ROLE, now, consuming);
     if (headline) return headline;
-    const other = bestClient(now, (c) => Boolean(c.role));
+    const other = bestClient(now, (c) => Boolean(c.role), consuming);
     if (other) return other;
     if ([...clientsById.values()].some((c) => c.role)) return null; // roles exist, none reporting
-    const legacy = bestClient(now, () => true);
+    const legacy = bestClient(now, () => true, consuming);
     if (legacy) return legacy;
     // A document cached before `clientId` existed still acks, and calling it dead because it has no
     // id would be a worse lie than trusting the one stamp it does send.
@@ -867,24 +997,29 @@ function build(ctx) {
    * nothing is known about a loop that is not reporting. `candidate` is what a role's verdict may
    * pick: a real role, still reporting.
    */
-  function clientVerdict(c, now) {
+  function clientVerdict(c, now, consuming) {
     const ackAgeMs = c.lastAckAt ? Math.max(0, now - c.lastAckAt) : null;
     const beatAgeMs = c.beatAt ? Math.max(0, now - c.beatAt) : null;
     const ackFresh = ackAgeMs != null && ackAgeMs <= PAGE_FRESH_MS;
     const beatFresh = beatAgeMs != null && beatAgeMs <= PAGE_BEAT_STALE_MS;
-    const alive = clientAlive(c, now);
+    const streamReader = consuming && c.id ? consuming.get(c.id) || null : null;
+    const streaming = Boolean(streamReader);
+    const alive = clientAlive(c, now, consuming);
     // Read-only: this client is acking but its paint counter has stopped advancing. Asked of one
     // client so a second page's ticking cannot answer for it.
     const loopStale = clientLoopStale(c, now);
+    const livenessBasis = streaming ? 'stream' : ackFresh ? 'ack' : 'none';
     return {
-      state: ackFresh ? 'live' : beatFresh ? 'page-mute' : alive ? 'page-dead' : 'stale',
-      live: ackFresh,
+      state: streaming || ackFresh ? 'live' : beatFresh ? 'page-mute' : alive ? 'page-dead' : 'stale',
+      live: streaming || ackFresh,
+      livenessBasis,
       ackAgeMs,
       beatAgeMs,
       candidate: Boolean(c.role) && alive,
       // A page acking forever with a frozen loop is alive and not drawing; a page drawing has an
-      // advancing `loopTicks` and no stale loop.
-      drawing: ackFresh ? c.loopTicks > 0 && !loopStale : null,
+      // advancing `loopTicks` and no stale loop. A consuming camera stream is drawing by
+      // construction: the frames are arriving and being taken.
+      drawing: streaming ? true : ackFresh ? c.loopTicks > 0 && !loopStale : null,
       loopStale,
     };
   }
@@ -895,7 +1030,7 @@ function build(ctx) {
    * report are still counted in `documents` but never become a role's answer. The `null` group is
    * documents from before `?role=` existed: reported, never authoritative for any role.
    */
-  function rolesView(now) {
+  function rolesView(now, consuming) {
     const groups = new Map();
     for (const c of clientsById.values()) {
       const key = c.role || null;
@@ -904,8 +1039,8 @@ function build(ctx) {
     }
     const roles = [];
     for (const [role, list] of groups) {
-      const best = role ? rolePage(role, now) : bestClient(now, (c) => !c.role);
-      const verdict = best ? clientVerdict(best, now) : null;
+      const best = role ? rolePage(role, now, consuming) : bestClient(now, (c) => !c.role, consuming);
+      const verdict = best ? clientVerdict(best, now, consuming) : null;
       roles.push({
         role,
         state: verdict ? verdict.state : 'absent',
@@ -927,14 +1062,14 @@ function build(ctx) {
   }
 
   /** The public shape: the barest facts, no internal bookkeeping (`silentLogged` stays here). */
-  function clientList() {
+  function clientList(consuming) {
     const now = Date.now();
     return [...clientsById.values()].map((c) => ({
       id: c.id,
       // Which document this is, independent of the ephemeral clientId: two entries with the same
       // role are one page's predecessor and successor, and /status can say so.
       role: c.role || null,
-      ...clientVerdict(c, now),
+      ...clientVerdict(c, now, consuming),
       firstAckAt: c.firstAckAt,
       lastAckAt: c.lastAckAt,
       lastDrawAt: c.lastDrawAt,
@@ -1024,8 +1159,11 @@ function build(ctx) {
     const now = Date.now();
     sweepClients(now);
     const feed = relay.status();
-    const page = freshestPage(now);
-    const truth = pageTruth(feed, page, now);
+    // One read of the per-stream metering, shared by every verdict below, so the payload cannot
+    // say two things about the same reader.
+    const consuming = consumingReaders(now);
+    const page = freshestPage(now, consuming);
+    const truth = pageTruth(feed, page, now, consuming);
     const stale = truth.stale;
     // The build the authoritative page reports, which is the headline role's row whenever it has
     // one: `draw.build` is the overlay's own last ack and cannot see a second document take over.
@@ -1077,6 +1215,10 @@ function build(ctx) {
       // and drawing, not reporting) or `page-dead` (both stale). Passed through from the feed's own
       // state when the feed is not live. `truth.reason` says the same thing in words.
       pageState: truth.pageState,
+      // Which evidence `pageState`/`effectiveSource` were derived from — `stream` (a camera reader
+      // that is provably taking frames: the basis outranks acks), `ack` (a fresh ack) or `none`.
+      // A reading is never ambiguous about why it says what it says.
+      livenessBasis: truth.livenessBasis,
       beatFresh: truth.beatFresh === true,
       beatAgeMs: Number.isFinite(truth.pageBeatAgeMs) ? Math.round(truth.pageBeatAgeMs) : null,
       // The beat itself: when the freshest page last proved it is running, and the counters it
@@ -1125,7 +1267,7 @@ function build(ctx) {
       // `stale: true`. The rest of the relay's report is carried through untouched, and `clients`
       // stays the number of stream readers it has always been; `clientCount`/`clientList` are the
       // acking pages, which is a different population.
-      cameraFeed: { ...feed, state: truth.state, live: truth.live, reason: truth.reason, clientCount: clientsById.size, clientList: clientList() },
+      cameraFeed: { ...feed, state: truth.state, live: truth.live, reason: truth.reason, clientCount: clientsById.size, clientList: clientList(consuming) },
       // Two independent clocks for bracketing a freeze: the worker's tick count and the provenance
       // of the last ack. A page frozen mid-draw while these advance is a thread-level stall; these
       // stopping with it is a wedged renderer process.
@@ -1151,7 +1293,7 @@ function build(ctx) {
       // (`/shockfx`). The top-level `pageState`/`clientBuild` follow this row; the other roles are
       // reported beside it. A second document of a role can no longer mask the real one, and a
       // null-role row from before `?role=` existed answers for nothing.
-      pageRoles: rolesView(now),
+      pageRoles: rolesView(now, consuming),
       // Every long-lived response this process is holding, and the identity that owns it. The
       // inventory a socket table cannot give: path, role, clientId, age, cap, and whether the
       // declared identity is still the current one. See `streamCensus`.
@@ -1367,6 +1509,10 @@ function build(ctx) {
             }
           }, CAMERA_MAX_MS);
           if (age.unref) age.unref();
+          // Frame accounting for the liveness verdict, installed on this response before the relay
+          // ever writes to it (see `meterStream`). Read-only with respect to the stream: the wrapper
+          // passes every byte and write()'s return value straight through.
+          meterStream(res, rec);
           relay.addClient(res, role, refPath(req), streamClientId);
           return new Promise((resolve) => res.on('close', resolve));
         },
