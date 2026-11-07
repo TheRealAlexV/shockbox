@@ -62,6 +62,13 @@ function bundleBuild() {
   };
   try {
     walk(path.join(HERE, 'pages'));
+    // The module's own server source is part of what the rig runs, so it is part of the identity.
+    // Hashing only `pages/` let a `server.js` or `camera-relay.mjs` deploy leave BUILD untouched,
+    // and a hash that quietly covers half the tree is the same trap as no witness at all.
+    for (const name of fs.readdirSync(HERE).sort()) {
+      if (!/\.m?js$/.test(name)) continue;
+      h.update(name).update('\0').update(fs.readFileSync(path.join(HERE, name)));
+    }
     return h.digest('hex').slice(0, 12);
   } catch {
     return 'unknown';
@@ -118,6 +125,20 @@ const CLIENTS_TTL_MS = 10 * 60 * 1000;
  * not on the page's cooperation, is what makes the six-per-origin budget self-healing.
  */
 const CLIENT_REAP_MS = 180_000;
+/**
+ * The worker's own clock. `workerTicks` counts ticks posted from the page's ack worker, a thread
+ * the render loop cannot occupy; `workerTickAt` is when the last one landed. Kept as a counter
+ * rather than a log line so a freeze can be bracketed by two independent timelines without adding
+ * two lines a second to the log.
+ */
+let workerTicks = 0;
+let workerTickAt = 0;
+/** The worker's own view of its clock: inter-tick gap, and ticks since its last successful POST. */
+let workerTickGapMs = 0;
+let workerTickSinceOk = 0;
+/** Which thread last acked, and when: page main thread or ack worker. */
+let ackVia = null;
+let ackViaAt = 0;
 /** One log line when an established client goes quiet for this long — never one per poll. */
 const CLIENT_SILENT_MS = 30_000;
 // No server-held connection may outlive CAMERA_MAX_MS, so a document that vanished without closing
@@ -960,6 +981,15 @@ function build(ctx) {
       // stays the number of stream readers it has always been; `clientCount`/`clientList` are the
       // acking pages, which is a different population.
       cameraFeed: { ...feed, state: truth.state, live: truth.live, reason: truth.reason, clientCount: clientsById.size, clientList: clientList() },
+      // Two independent clocks for bracketing a freeze: the worker's tick count and the provenance
+      // of the last ack. A page frozen mid-draw while these advance is a thread-level stall; these
+      // stopping with it is a wedged renderer process.
+      workerTicks,
+      workerTickAt,
+      workerTickGapMs,
+      workerTickSinceOk,
+      ackVia,
+      ackViaAt,
       // The per-role verdict: one entry per document role present, and the headline role's row
       // (`/shockfx`). The top-level `pageState`/`clientBuild` follow this row; the other roles are
       // reported beside it. A second document of a role can no longer mask the real one, and a
@@ -1300,6 +1330,14 @@ function build(ctx) {
             if (body.pageOpen) body.lastPoseAt = Date.now();
             return send(res, 200, { ok: true });
           }
+          // Provenance: an ack with no main-thread involvement is the proof the worker is live and
+          // posting. Logged only when it changes, so the ledger does not become a 2/s feed.
+          const ackViaNow = req.headers['x-handfx-via'] === 'worker' ? 'worker' : 'page';
+          if (ackViaNow !== ackVia) {
+            ackVia = ackViaNow;
+            log.info(`handfx page: ack via=${ackVia} clientId=${typeof bodyIn.clientId === 'string' ? bodyIn.clientId.slice(0, 64) : '-'}`);
+          }
+          ackViaAt = Date.now();
           // Per-page identity, optional by design: a document cached before `clientId` existed still
           // acks, and those acks keep counting through `draw` (see `freshestPage`).
           if (typeof bodyIn.clientId === 'string' && bodyIn.clientId && bodyIn.clientId.length <= 64) {
@@ -1398,6 +1436,14 @@ function build(ctx) {
         handler: (req, res, url, bodyIn) => {
           try {
             const body = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
+            // The worker's clock, not the page's: one tick per 500 ms from the ack thread.
+            if (body.kind === 'worker-tick') {
+              workerTicks = Number(body.message) || workerTicks + 1;
+              workerTickAt = Date.now();
+              workerTickGapMs = Number(body.gapMs) || 0;
+              workerTickSinceOk = Number(body.sinceOk) || 0;
+              return send(res, 200, { ok: true });
+            }
             const list = Array.isArray(body.events) ? body.events : [body];
             for (const raw of list) {
               if (!raw || typeof raw !== 'object') continue;
