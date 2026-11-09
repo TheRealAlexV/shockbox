@@ -147,7 +147,8 @@ const CLIENT_REAP_MS = 180_000;
  * exists: at the page's 500 ms cadence this is 120 missed acks, six times `PAGE_FRESH_MS` and a
  * third of `CLIENT_REAP_MS`. Long enough that a throttled timer or a GC pause cannot trip it;
  * short enough that a duplicate removed from OBS hours ago stops being counted as a client and
- * stops holding a reader slot. The census flags `frozen-ack` at this same line, and it is the only
+ * stops holding a reader slot. The census flags `ack-stale` from this line only when the beat is
+ * stale too (see `violationsNow`), and it is the only
  * line the registry prunes on: hidden is not a prune reason (a non-composited source still acks)
  * and neither is a beat, so `page-mute` stays diagnosable for this window and then goes.
  */
@@ -968,7 +969,7 @@ function build(ctx) {
       // of a live page that lost the slot race, and pruning it RSTs the camera stream it is still
       // reading and restarts the attach loop. The beat is the second signal: a 1 s `<img>` GET that
       // shares no `fetch` with the ack, so it still lands when the ack cannot. Both stale is the
-      // only death sentence; ack stale + beat fresh is starvation, already reported as `frozen-ack`
+      // only death sentence; ack stale + beat fresh is starvation, already reported as `ack-stale`
       // by `violationsNow` above. `hidden` is legitimate (a non-composited source still acks) and a
       // beat is not an ack, so a mute page stays diagnosable for this window. The invariant was
       // read before the reap, so the pass that prunes also reports.
@@ -1017,11 +1018,16 @@ function build(ctx) {
     // /status publishes, so the standing check and the census cannot disagree.
     const consuming = consumingReaders(now);
     const rows = streamCensus(now, consuming).streams;
-    // budget-exhausted: CEF allows six sockets per origin. At six there is no slot left for the
-    // ack POST or the beat `<img>` — the failure this census exists to name.
+    // origin-sockets-exhausted: CEF allows six sockets per origin. At six there is no slot left for
+    // the ack POST or the beat `<img>` — the failure this census exists to name. `rows` is every
+    // long-lived stream on the origin, so this is a headcount of the origin, not an allowance held
+    // by any one client: nobody here is over budget. `oldestClientId` is merely the oldest row's
+    // owner, kept for orientation; the per-owner check is `owner-over-budget` below. (This used to
+    // be called `budget-exhausted` with an `owner` field, which read as client blame and caused a
+    // wrong diagnosis. Do not put `owner` back.)
     if (rows.length >= SOCKET_BUDGET) {
       const oldest = rows.reduce((a, b) => (a.ageMs >= b.ageMs ? a : b));
-      out.push({ kind: 'budget-exhausted', owner: oldest.clientId, path: oldest.path, open: rows.length, budget: SOCKET_BUDGET });
+      out.push({ kind: 'origin-sockets-exhausted', open: rows.length, budget: SOCKET_BUDGET, path: oldest.path, oldestClientId: oldest.clientId });
     }
     const byOwner = new Map();
     for (const row of rows) {
@@ -1037,14 +1043,15 @@ function build(ctx) {
           out.push({ kind: 'unowned-stream', clientId: row.clientId, path: row.path, role: row.role, localPort: row.localPort, remotePort: row.remotePort, reason: 'clientId never acked on this server' });
         }
       }
-      // half-closed-unreaped: an open response nobody is speaking for. A row with an owner record
-      // is judged by that owner's silence (ack or beat, so a mute-but-beating page is not swept); a
-      // row with no owner can only be judged by its own age. This is the predicate that catches a
-      // `FinWait1` pair held for ten minutes while the peer still reads it ESTABLISHED.
+      // silent-unreaped: an open response nobody is speaking for. A row with an owner record is
+      // judged by that owner's silence (ack or beat, so a mute-but-beating page is not swept); a
+      // row with no owner can only be judged by its own age. This reads ack/beat timestamps and
+      // nothing else — it does not inspect socket state, so it cannot vouch that a peer is
+      // half-closed (FIN_WAIT); only that nothing has spoken for this long.
       const c = row.clientId ? clientsById.get(row.clientId) || null : null;
       const silentFor = c ? now - Math.max(c.lastAckAt || 0, c.beatAt || 0) : row.ageMs;
       if (silentFor <= CLIENT_REAP_MS) continue;
-      out.push({ kind: 'half-closed-unreaped', owner: row.clientId, path: row.path, silentMs: Math.round(silentFor) });
+      out.push({ kind: 'silent-unreaped', owner: row.clientId, path: row.path, silentMs: Math.round(silentFor) });
     }
     for (const [clientId, list] of byOwner) {
       // owner-over-budget: one document may declare its bus response and at most one camera
@@ -1054,12 +1061,16 @@ function build(ctx) {
         out.push({ kind: 'owner-over-budget', clientId, open: list.length, allowed: LONG_LIVED_PER_CLIENT, paths: list.map((r) => r.path) });
       }
     }
-    // misattributed: the draw title resolved to a document that is not painting, or the census and
-    // the relay disagree about which response is taking frames.
+    // draw-client-hidden: the draw document reported `document.hidden === true`. That is a
+    // visibility flag and nothing more — an occluded OBS source, a non-composited source and a
+    // throttled rAF all leave it false or true independently, so it is not evidence the page
+    // stopped painting. Reported as the observation it is; do not read it as "misattributed".
+    // misattributed below is reserved for the two cases that are genuine set-disagreement: the
+    // census and the relay naming different responses as the frame consumer.
     const page = freshestPage(now, consuming);
     const drawPage = page && Number.isFinite(page.drawCount) ? page : null;
     if (drawPage && drawPage.hidden === true) {
-      out.push({ kind: 'misattributed', owner: drawPage.id, path: drawPage.pagePath || null, why: 'drawClientId is a hidden document' });
+      out.push({ kind: 'draw-client-hidden', owner: drawPage.id, path: drawPage.pagePath || null, why: 'drawClientId document reports hidden=true (visibility flag, not proof it stopped painting)' });
     }
     for (const row of rows) {
       if (row.path !== '/api/handfx/camera/stream') continue;
@@ -1074,16 +1085,49 @@ function build(ctx) {
     const streamClients = relay.status().clients;
     for (const c of clientsById.values()) {
       const ackAgeMs = c.lastAckAt ? Math.max(0, now - c.lastAckAt) : null;
-      // frozen-ack: a registered client whose `lastAckAt` has stopped moving. Not hidden-dependent:
-      // a non-composited source still acks, so a frozen one is gone, not merely dark.
-      if (ackAgeMs != null && ackAgeMs > CLIENT_ACK_GONE_MS) {
-        out.push({ kind: 'frozen-ack', clientId: c.id, role: c.role || null, ackAgeMs, hidden: c.hidden === true });
-      } else if (streamClients === 0 && !(ackAgeMs != null && ackAgeMs <= PAGE_FRESH_MS)) {
-        // client-not-live: counted in `clientList` while the relay has no reader and this client
-        // has no fresh ack. The population and the verdict disagree, which is how a dead duplicate
-        // read as a client while `cameraFeed.clientCount` stayed 2.
-        out.push({ kind: 'client-not-live', clientId: c.id, role: c.role || null, state: ackAgeMs == null ? 'never-acked' : 'stale', ackAgeMs });
+      const ackFresh = ackAgeMs != null && ackAgeMs <= PAGE_FRESH_MS;
+      if (ackFresh) continue;
+      const beatAgeMs = c.beatAt ? Math.max(0, now - c.beatAt) : null;
+      const beatFresh = beatAgeMs != null && beatAgeMs <= PAGE_BEAT_STALE_MS;
+      // The ack is the one channel this file documents as unreliable under load: a `fetch` out of
+      // the same six-per-origin pool the page's `/events` EventSource and camera stream keep full,
+      // so a stale ack is the ordinary look of a live page that lost the slot race. Liveness is
+      // read from all three testimonies — `lastAckAt`, `beatAt` (a 1 s `<img>` GET on its own
+      // path) and the relay's consuming set — the same inputs the reap and `pageTruth` use.
+      // `consuming` is per document; `streamClients` is the pool-level count and is carried as
+      // evidence, because a nonzero relay count does not vouch for *this* client.
+      const streaming = Boolean(consuming && c.id && consuming.has(c.id));
+      // ack-stale: acks stopped, but the page is still running (fresh beat) or still taking frames
+      // (a consuming reader). That is a starved request path, not a dead page. Say what was
+      // observed; do not conclude the page is gone from the one channel that lies under pressure.
+      if (beatFresh || streaming) {
+        out.push({
+          kind: 'ack-stale',
+          clientId: c.id,
+          role: c.role || null,
+          ackAgeMs,
+          beatAgeMs,
+          streaming,
+          streamClients,
+          hidden: c.hidden === true,
+          why: `${ackAgeMs == null ? 'no ack ever' : `no ack for ${Math.round(ackAgeMs / 1000)} s`}, ${beatAgeMs == null ? 'no beat ever' : `beat ${Math.round(beatAgeMs / 1000)} s old`}, ${streaming ? 'relay is handing this client frames' : 'relay has no reader for this client'} — ack path starved, liveness not judged dead`,
+        });
+        continue;
       }
+      // client-not-live: every channel is silent — the ack past `PAGE_FRESH_MS`, the beat past
+      // `PAGE_BEAT_STALE_MS` (or never), and no consuming reader. That is the only death verdict,
+      // and the `ack-stale` split above does not loosen it: a page with no ack, no beat and no
+      // consumer still lands here.
+      out.push({
+        kind: 'client-not-live',
+        clientId: c.id,
+        role: c.role || null,
+        state: ackAgeMs == null ? 'never-acked' : 'stale',
+        ackAgeMs,
+        beatAgeMs,
+        streamClients,
+        why: `${ackAgeMs == null ? 'no ack ever' : `no ack for ${Math.round(ackAgeMs / 1000)} s`}, ${beatAgeMs == null ? 'no beat ever' : `no beat for ${Math.round(beatAgeMs / 1000)} s`}, relay has no reader for this client — no channel testifies for the page`,
+      });
     }
     return out;
   }
@@ -1108,6 +1152,7 @@ function build(ctx) {
     // erasing the first capture.
     if (!c.userAgent) c.userAgent = clientUa(req);
     if (!c.pagePath) c.pagePath = clientPath(req, roleIn);
+    if (!c.firstAckAt) c.firstAckAt = now;
     c.lastAckAt = now;
     c.silentLogged = false;
     if (Number.isFinite(bodyIn.draws)) c.drawCount = Math.max(c.drawCount, Math.max(0, bodyIn.draws | 0));
@@ -1181,6 +1226,9 @@ function build(ctx) {
     if (typeof phase === 'string') c.beatPhase = phase.slice(0, 40);
     const build = q.get('b');
     if (typeof build === 'string' && build && !c.build) c.build = build.slice(0, 64);
+    // Demand is re-evaluated here as well as on the ack, so a page whose acks died (the one
+    // transport that can die alone) neither loses the camera nor leaves it armed forever.
+    applyFeedDemand();
   }
 
   /**
@@ -1219,8 +1267,12 @@ function build(ctx) {
   }
 
   /**
-   * Arm or release the camera relay from the pages' own heartbeats. Any fresh client whose ack says
-   * `wantsFeed` holds the producer; when none does, it is released. The heartbeat is the only
+   * Arm or release the camera relay from the pages' own heartbeats. Any client whose ack says
+   * `wantsFeed` holds the producer while it is *fresh*, and freshness is read from the beat, not the
+   * ack: the beat is a plain `<img>` GET, so one broken transport (the ack POST) must never take the
+   * camera from a page that is demonstrably alive. `lastAckAt` is the fallback only until the first
+   * beat arrives, so a client that has acked but not yet beaten is not dropped in its first second.
+   * When no client holds, the producer is released. The heartbeat is the only
    * subscription involved, so a page that reconnects after a node restart re-arms the camera with
    * its next ack — no reload, no operator action, and nothing to lose on a reconnect.
    */
@@ -1229,7 +1281,8 @@ function build(ctx) {
     let holder = null;
     for (const c of clientsById.values()) {
       if (c.wantsFeed !== true) continue;
-      if (now - c.lastAckAt > PAGE_FRESH_MS) continue;
+      const heardAt = c.beatAt || c.lastAckAt || 0;
+      if (!heardAt || now - heardAt > PAGE_FRESH_MS) continue;
       if (!holder || c.lastAckAt > holder.lastAckAt) holder = c;
     }
     feedArmedBy = holder ? holder.id : null;

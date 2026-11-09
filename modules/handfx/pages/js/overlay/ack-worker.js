@@ -6,8 +6,8 @@
  * truth table instead of as a dead page.
  *
  * Both POSTs here have the same shape: at most one in flight, skipped while one is outstanding,
- * a 4 s abort, and a `.finally` that clears the latch. The ack carries `keepalive` and the tick
- * does not; each says why where it is sent.
+ * a 4 s abort, and a `.finally` that clears the latch. Neither carries `keepalive`; the ack says
+ * why where it is sent.
  */
 let payload = null;
 let timer = 0;
@@ -65,13 +65,13 @@ function tick() {
       headers: { 'content-type': 'application/json', 'x-handfx-via': 'worker' },
       body: payload,
       signal: ctrl.signal,
-      // `keepalive` is the point of this worker's ack: it draws on Chromium's keep-alive quota
-      // instead of competing for one of the six sockets per origin that the overlay's `/events`
-      // EventSource and camera stream hold open. On the shared pool a starved ack went stale,
-      // the server reaped the client on that age alone, and the RST of its live camera stream
-      // restarted the attach loop on a flat ~60 s beat. The 4 s abort above bounds this request,
-      // so it cannot sit on the keep-alive quota the way an un-aborted hang would.
-      keepalive: true,
+      // No `keepalive` here, and do not add it back. It was added to dodge the six-socket pool that
+      // the overlay's `/events` EventSource and camera stream hold open, but a drained keep-alive
+      // quota does not queue the request: every later keepalive fetch rejects with an instant
+      // `TypeError`, one per tick, for the life of the document. That killed this lane for 529 s
+      // (1057 `type` errors, `lastAckAt` frozen on the server) while each failure measured as ~1 ms
+      // and looked like a fast success. A page-lifetime ack does not need to outlive unload; the
+      // plain fetch path used by the camera and page-event POSTs is proven on this rig.
     });
   } catch (err) {
     clearTimeout(timerId);
@@ -93,6 +93,10 @@ function tick() {
       } else postMessage({ type: 'ack-fail', status: res.status });
     })
     .catch((err) => {
+      // A failed attempt must not report the previous attempt's status: `lastStatus` set only in
+      // `.then` kept showing the last real 200 while the lane was dead, and `lastMs` from an
+      // instant `TypeError` reads as ~1 ms — a dead ack looked fast and healthy.
+      stats.lastStatus = 0;
       stats.lastMs = Date.now() - started;
       const name = (err && err.name) || 'Error';
       if (name === 'AbortError') stats.abort += 1;

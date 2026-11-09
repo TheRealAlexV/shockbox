@@ -1162,6 +1162,10 @@ function onTrackerState(snap) {
   }
   if (snap.state === 'running' && snap.source === 'camera') camWasLive = true;
   else if (snap.state === 'error' || snap.state === 'idle') {
+    // No tracker session, no source: a camera that ended on its own must not leave `device` (or
+    // `relay`) on /ack while the page draws nothing. Camera-only mode never reaches the synthetic
+    // fallback that would rewrite it; the fallback below sets `synthetic` when it claims the view.
+    state.cameraSource = 'none';
     if (userStopped || !fx.view) state.anchors = 'none';
     // A camera that failed or ended hands the page back to the synthetic rig.
     if (camWasLive || (snap.state === 'error' && camAttempted)) {

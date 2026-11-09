@@ -80,19 +80,45 @@ self.__handfxWatchdog = { createWatchdog, GAP_MS, BLAME_PATH: '/api/handfx/page-
 /* ------------------------------------------------------------ worker runtime */
 
 if (typeof setInterval === 'function' && typeof self.postMessage === 'function') {
+  // Both fetches below are bounded, and a failed probe is counted rather than dropped: this worker's
+  // own dead fetch is the one fault it cannot report through the page, so the count rides the next
+  // blame URL that does reach the server.
+  const PROBE_TIMEOUT_MS = 4000;
+  let probeFails = 0;
   const watchdog = createWatchdog({
     now: () => Date.now(),
     send: (clientId, gap, last) => {
+      const extra = probeFails ? `&probeFails=${probeFails}` : '';
       const url =
         `${BLAME_PATH}?c=${encodeURIComponent(clientId)}&why=main-thread-blocked` +
-        `&gap=${Math.round(gap)}&last=${last}`;
+        `&gap=${Math.round(gap)}&last=${last}${extra}`;
       // The worker's own fetch on the worker's own thread. Nothing here waits on the page.
+      //
+      // No `keepalive`, and do not add it back. A drained keep-alive quota does not queue the
+      // request: every later keepalive fetch rejects instantly with a `TypeError`, for the life of
+      // the document — so the one instrument whose job is to notice silence would go silent itself,
+      // in exactly the situation it exists to detect. (overlay/ack-worker.js lost 529 s to that:
+      // 1057 instant `type` errors while its `lastAckAt` stayed frozen and its status looked fine.)
+      //
+      // And it carries a deadline: an unbounded fetch that hangs never settles, so there is no
+      // failure, no retry and no evidence. The timer is cleared in `finally` either way.
+      const ctrl = new AbortController();
+      const timerId = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+      let p;
       try {
-        const p = fetch(url, { cache: 'no-store', keepalive: true });
-        if (p && typeof p.catch === 'function') p.catch(() => {});
-      } catch {
-        /* the page is still blocked; the next window tries again */
+        p = fetch(url, { cache: 'no-store', signal: ctrl.signal });
+      } catch (err) {
+        clearTimeout(timerId);
+        probeFails += 1;
+        return;
       }
+      p.then((res) => {
+        if (!res.ok) throw new Error(`blame ${res.status}`);
+      })
+        .catch(() => {
+          probeFails += 1;
+        })
+        .finally(() => clearTimeout(timerId));
     },
   });
 
@@ -115,10 +141,19 @@ if (typeof setInterval === 'function' && typeof self.postMessage === 'function')
       const text = (err && err.message) || String(msg || 'worker error');
       if (watchdog.state.clientId) {
         const last = encodeLast({ error: text.slice(0, 300), line: line || 0, col: col || 0 });
+        // Last-resort report: still fire-and-forget, but bounded and counted. A hang here would
+        // never settle and a rejection was dropped on the floor, so a watchdog error that could not
+        // be reported left no trace anywhere; the count reaches the server on the next blame URL.
+        const ctrl = new AbortController();
+        const timerId = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
         fetch(
           `${BLAME_PATH}?c=${encodeURIComponent(watchdog.state.clientId)}&why=watchdog-error&gap=0&last=${last}`,
-          { cache: 'no-store' },
-        ).catch(() => {});
+          { cache: 'no-store', signal: ctrl.signal },
+        )
+          .catch(() => {
+            probeFails += 1;
+          })
+          .finally(() => clearTimeout(timerId));
       }
     } catch {
       /* nothing left to report with */

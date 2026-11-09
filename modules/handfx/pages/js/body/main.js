@@ -107,10 +107,26 @@ function post(msg, transfer) {
   }
 }
 
-async function loadStatus() {
-  const res = await fetch('/api/handfx/status', { cache: 'no-store' });
-  if (!res.ok) throw new Error(`status ${res.status}`);
-  return res.json();
+/** Boot reads this once and waits on it, so it is bounded: an endpoint that hangs must not hold the
+ *  camera, the models and the loop behind it forever. One read at a time, as the overlay's does. */
+let statusInFlight = null;
+const STATUS_TIMEOUT_MS = 8000;
+
+async function loadStatus(timeoutMs = STATUS_TIMEOUT_MS) {
+  if (statusInFlight) return statusInFlight;
+  statusInFlight = (async () => {
+    try {
+      const res = await fetch('/api/handfx/status', {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      return await res.json();
+    } finally {
+      statusInFlight = null;
+    }
+  })();
+  return statusInFlight;
 }
 
 /* ---------------------------------------------------------------- models */
@@ -407,9 +423,17 @@ async function start() {
     stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false });
     video.srcObject = stream;
     await video.play();
-    const status = await loadStatus();
-    if (!status.runtime || !status.runtime.vendored) throw new Error('MediaPipe runtime is not vendored (modules/handfx/vendor/README.md)');
-    const facts = status.bodyModels || {};
+    // A status that cannot be read is not a reason to hang the boot: the read above is bounded, and
+    // an unreachable endpoint falls through to the default model route. Only a server that answered
+    // can say the runtime is missing.
+    let status = null;
+    try {
+      status = await loadStatus();
+    } catch (err) {
+      setStatus(`body page: status unavailable (${(err && err.message) || err}); continuing with defaults`, 'warn');
+    }
+    if (status && (!status.runtime || !status.runtime.vendored)) throw new Error('MediaPipe runtime is not vendored (modules/handfx/vendor/README.md)');
+    const facts = (status && status.bodyModels) || {};
     state.pose = 'loading';
     state.segmenter = 'loading';
     setStatus('body page: loading models…');
@@ -508,6 +532,40 @@ function stop() {
   setStatus('body page: stopped', 'idle');
 }
 
+/* The 2 s "body open" beat. One at a time and bounded: a hung POST would otherwise leave one
+ * pending request per tick for the life of the page. It carries no `keepalive` — a drained
+ * keep-alive quota does not queue such a request, it rejects every later one instantly with a
+ * `TypeError` (see overlay/ack-worker.js), and this page would keep posting into that wall. */
+const BEAT_TIMEOUT_MS = 4000;
+let beatInFlight = false;
+
+function beatBodyOpen() {
+  if (beatInFlight) return;
+  beatInFlight = true;
+  const ctrl = new AbortController();
+  const timerId = setTimeout(() => ctrl.abort(), BEAT_TIMEOUT_MS);
+  let req;
+  try {
+    req = fetch('/api/handfx/ack', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: 'body', open: true }),
+      signal: ctrl.signal,
+    });
+  } catch {
+    // A fetch that throws before returning its promise never reaches `.finally`.
+    clearTimeout(timerId);
+    beatInFlight = false;
+    return;
+  }
+  req
+    .catch(() => {})
+    .finally(() => {
+      clearTimeout(timerId);
+      beatInFlight = false;
+    });
+}
+
 let lastVideoTime = -1;
 let poseFrame = 0;
 function loop() {
@@ -519,11 +577,7 @@ function loop() {
     if (!EMBED && now - (tick._beatAt || 0) > 2000) {
       tick._beatAt = now;
       // The beat's only job is the pane's "body page open" fact; it carries no picture.
-      fetch('/api/handfx/ack', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ source: 'body', open: true }),
-      }).catch(() => {});
+      beatBodyOpen();
     }
     if (video.readyState >= 2 && video.videoWidth && video.currentTime !== lastVideoTime) {
       lastVideoTime = video.currentTime;

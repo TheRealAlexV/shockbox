@@ -35,6 +35,12 @@ const MODEL_KEY_CDN = '/handfx/model/hand_landmarker.task?from=cdn';
 export const DETECT_TIMEOUT = 3000;
 /** The same patience for a rebuilt worker's handshake: a wasm compile is slower than a frame. */
 export const INIT_TIMEOUT = 10000;
+/**
+ * Patience for a boot handshake. Larger than `INIT_TIMEOUT` on purpose: that one covers a rebuild
+ * on an already-warm thread, while this also covers a cold CEF start plus GPU init on top of the
+ * 7.8 MB model and 9.3 MB wasm binary, all served from disk on the rig.
+ */
+const BOOT_TIMEOUT = 30000;
 /** Consecutive deadlines, with no ready+result between them, before tracking is called failed. */
 export const HANG_LIMIT = 3;
 
@@ -527,12 +533,43 @@ export class Tracker {
     return worker;
   }
 
-  _bootWorker() {
+  _bootWorker(attempt = 1) {
     const ready = new Promise((resolve, reject) => {
       this._bootWait = { resolve, reject };
     });
+    // Nothing else can time this handshake out: `_arm(INIT_TIMEOUT)` hangs off `_onHang`, which
+    // only `_flush` schedules, and `_flush` returns while `state !== 'running'` — a state a boot
+    // never reaches. Without this deadline a `createFromOptions` that never settles parks the page
+    // at `starting` forever, with no error, no arming and no retry.
+    let bootTimer = 0;
+    let timedOut = false;
+    const deadline = new Promise((resolve, reject) => {
+      bootTimer = this._setTimer(() => {
+        bootTimer = 0;
+        timedOut = true;
+        reject(new MediaError('model', `detector boot timed out after ${BOOT_TIMEOUT / 1000} s`));
+      }, BOOT_TIMEOUT);
+    });
     this._startWorker();
-    return ready;
+    return Promise.race([ready, deadline]).then(
+      (runtime) => {
+        // The handshake landed: this timer must never fire on a healthy document.
+        if (bootTimer) this._clearTimer(bootTimer);
+        return runtime;
+      },
+      (err) => {
+        if (bootTimer) this._clearTimer(bootTimer);
+        // A constructor throw or an `error` message has already been reported by its own path.
+        if (!timedOut) throw err;
+        // The deadline expired: kill the thread that never answered and try one fresh one. A
+        // second expiry is a real fault, so it ends in `error` instead of another attempt.
+        this._bootWait = null;
+        this._stopWorker();
+        if (attempt === 1) return this._bootWorker(2);
+        this._setState({ state: 'error', error: err.message });
+        throw err;
+      },
+    );
   }
 
   _stopWorker() {

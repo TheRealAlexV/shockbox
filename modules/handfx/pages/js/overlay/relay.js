@@ -359,12 +359,24 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     const ac = new AbortController();
     ctrl = ac;
     error = null;
+    // Every other bound here starts after the response exists: the first-frame wait below, the 3 s
+    // stall timer. A `fetch` that never returns headers is therefore unbounded, and a hung
+    // acquisition leaves `starting` set forever — nothing retries a promise that never settles. One
+    // re-acquire after the max-age EOF did exactly that and the relay was silent for seven minutes.
+    // `timedOut` separates this abort from the page's own (`stop()`, a re-arm), which stays silent.
+    let timedOut = false;
+    const acquireTimer = setTimeout(() => {
+      timedOut = true;
+      ac.abort();
+    }, ACQUIRE_TIMEOUT);
     try {
       const res = await fetch(url, {
         signal: ac.signal,
         cache: 'no-store',
         headers: { accept: 'multipart/x-mixed-replace' },
       });
+      // Headers are in; the first-frame wait owns the rest of the bound from here.
+      clearTimeout(acquireTimer);
       if (!res.ok) throw new Error(`stream answered ${res.status}`);
       if (!res.body) throw new Error('stream carried no body');
       const type = res.headers.get('content-type') || '';
@@ -391,15 +403,26 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     } catch (err) {
       // A stop or a re-arm aborted this fetch: that is the page's intent, not a camera failure, so
       // it must not report an error the retry loop would then explain with "relay: aborted".
-      if (ac.signal.aborted) {
+      if (ac.signal.aborted && !timedOut) {
         if (ctrl === ac) close();
         return false;
       }
+      // A deadline abort is a failed acquisition like any other: it gets a reason and it owes the
+      // feed a retry, so it must not read as the page's own abort above.
+      const message = timedOut
+        ? `relay: no response within ${Math.round(ACQUIRE_TIMEOUT / 1000)} s`
+        : `relay: ${err && err.message ? err.message : err}`;
       if (ctrl === ac) close();
       live = false;
-      error = `relay: ${err && err.message ? err.message : err}`;
+      error = message;
+      note('failed', message);
       emit('error');
+      // Nothing downstream owns the next attempt here: `start()`'s shared promise is about to clear,
+      // and a caller that is not `wantReopen` would otherwise leave the feed down for good.
+      if (wanted) wantReopen();
       return false;
+    } finally {
+      clearTimeout(acquireTimer);
     }
   }
 
