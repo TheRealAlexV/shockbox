@@ -385,6 +385,13 @@ let raf = 0;
 let stream = null;
 
 async function start() {
+  // Only an OBS-rendered document takes the device. A stray tab of this URL would hold the camera
+  // against the OBS body source on the one virtual camera DirectShow hands out exclusively.
+  const fromObs = /OBS\//i.test(navigator.userAgent) || new URLSearchParams(location.search).has('obs');
+  if (!EMBED && !fromObs) {
+    setStatus('body page: the camera preview and mask controls live in the ShockBox admin pane. This page only opens the camera when OBS renders it.', 'warn');
+    return;
+  }
   // The camera open itself, closed in embed mode. OBS owns the device; a second open steals it.
   if (EMBED) {
     setStatus('embedded preview: OBS owns the camera. This view only watches it; press Start in the ShockFX pane.', 'warn');

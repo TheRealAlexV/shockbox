@@ -110,8 +110,19 @@ export class Tracker {
     this.raf = 0;
     this.lastVideoTime = -1;
     this.lastFrameAt = 0;
+    // Stamped on every frame, unlike `lastFrameAt`, which only moves when the fps window rolls.
+    this._lastFrameSeenAt = 0;
     this.frames = 0;
     this.fps = 0;
+    // The last *completed* detection result, written by `_onMessage` and read by `snapshot()`. Kept
+    // here so the snapshot is a pure read before `start()`, with no worker, and in `error` too.
+    this._lastHands = 0;
+    this._lastLandmarks = 0;
+    this._lastDetectAt = null;
+    // Worker results that found a hand versus found none. `handsOf` collapses "no hands" and
+    // "nothing came back" to the same `[]`, so only these separate the two cases.
+    this._detects = 0;
+    this._empties = 0;
     this.deviceLabel = '';
     // Where the camera acquisition failed (`enumerate` | `getUserMedia` | `track`) and the error's
     // own name, so the overlay can report what actually happened instead of a lone sentence.
@@ -167,6 +178,20 @@ export class Tracker {
       feed: this.feed,
       fps: this.fps,
       frames: this.frames,
+      // The last completed detection result, not the last frame submitted: `at` is stamped where
+      // the worker's answer lands, so a stalled worker shows a frozen `lastDetectAt` and a growing
+      // `lastFrameAgeMs`. Every field has a default, so this is safe before `start()`.
+      hands: Number.isFinite(this._lastHands) ? this._lastHands : 0,
+      landmarks: Number.isFinite(this._lastLandmarks) ? this._lastLandmarks : 0,
+      lastDetectAt: Number.isFinite(this._lastDetectAt) ? this._lastDetectAt : null,
+      // `lastFrameAt` is a `performance.now()` mark (see `countFrame`), so its age is measured on the
+      // same clock; `Date.now()` here would be the epoch offset, not an age. `_lastFrameSeenAt`
+      // moves on every frame; `lastFrameAt` only when the fps window rolls.
+      lastFrameAgeMs: this._lastFrameSeenAt ? Math.max(0, Math.round(performance.now() - this._lastFrameSeenAt)) : null,
+      hangCount: Number.isFinite(this._hangCount) ? this._hangCount : 0,
+      // Cumulative worker results with at least one hand, versus with none.
+      detects: Number.isFinite(this._detects) ? this._detects : 0,
+      empties: Number.isFinite(this._empties) ? this._empties : 0,
     };
   }
 
@@ -361,7 +386,12 @@ export class Tracker {
    * point the camera loop uses, so a relayed frame is a camera frame to everything downstream.
    */
   pushFrame(bitmap, at = performance.now()) {
-    if (this.state !== 'running' || this.feed !== 'relay' || !this.landmarker) return false;
+    if (this.state !== 'running' || !this.landmarker) return false;
+    // A synthetic rig (`startSynthetic` clears `feed` via `stop()`) is the only other live feed.
+    // The relay socket is already open, so nothing calls `startRelay` again after a recovery
+    // cycle: the next relayed bitmap has to take tracking back itself or it is dropped forever.
+    if (this.feed !== 'relay' && this.source !== 'synthetic') return false;
+    const reclaim = this.feed !== 'relay';
     const { width, height } = this.size;
     let c = this._frameCanvas;
     if (!c) c = this._frameCanvas = document.createElement('canvas');
@@ -374,7 +404,18 @@ export class Tracker {
     // The underlay paints this canvas (main.js), so the drawn copy keeps happening here even
     // though detection now reads the bitmap on the other thread.
     g.drawImage(bitmap, 0, 0, width, height);
-    return this._submit(bitmap, at, width, height);
+    const accepted = this._submit(bitmap, at, width, height);
+    // Reclaim only once the worker has taken the frame: cancelling the synthetic rig on a frame
+    // the dead worker refused would leave the page with no feed at all.
+    if (accepted && reclaim) {
+      cancelAnimationFrame(this.raf);
+      this.raf = 0;
+      this.synthetic = null;
+      this._t0 = 0;
+      console.log('handfx tracker: relay reclaimed tracking from synthetic');
+      this._setState({ source: 'camera', feed: 'relay' });
+    }
+    return accepted;
   }
 
   /**
@@ -546,6 +587,15 @@ export class Tracker {
     // Reset only here, never on `ready` alone: a worker that handshakes and then hangs forever must
     // reach the limit instead of terminate-looping behind a page that still claims to track.
     this._hangCount = 0;
+    // The detection result is the only place these advance. Recorded before the frame is handed on
+    // so `snapshot()` never has to parse the frame itself.
+    this._lastHands = Array.isArray(msg.hands) ? msg.hands.length : 0;
+    if (this._lastHands > 0) this._detects += 1;
+    else this._empties += 1;
+    this._lastLandmarks = Array.isArray(msg.hands)
+      ? msg.hands.reduce((n, h) => n + (h && Array.isArray(h.landmarks) ? h.landmarks.length : 0), 0)
+      : 0;
+    this._lastDetectAt = Date.now();
     const frame = this._inflight;
     this._inflight = null;
     countFrame(this);
@@ -673,6 +723,7 @@ export class Tracker {
 function countFrame(self) {
   self.frames++;
   const now = performance.now();
+  self._lastFrameSeenAt = now;
   if (now - self.lastFrameAt > 1000) {
     self.fps = Math.round((self.frames / (now - self.lastFrameAt)) * 1000);
     self.frames = 0;
