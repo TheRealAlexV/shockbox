@@ -962,18 +962,23 @@ function build(ctx) {
     // in the same pass. Published as `census.violations`; empty means healthy.
     lastCensusViolations = violationsNow(now);
     for (const [id, c] of clientsById) {
-      // No ack for a minute is a document that is gone: the page acks every 500 ms (`ACK_MS`), and
-      // nothing makes a live renderer miss 120 of them in a row. This is what stops
-      // `cameraFeed.clientCount` counting a duplicate removed from OBS an hour ago. Acks only,
-      // deliberately: `hidden` is legitimate (a non-composited source still acks) and a beat is not
-      // an ack, so a mute page stays diagnosable for this window and its row goes when the acks
-      // themselves stopped. `violationsNow` has already read the invariant above, so the pass that
-      // prunes also reports.
-      if (c.lastAckAt && now - c.lastAckAt > CLIENT_ACK_GONE_MS) {
+      // A page is gone only when it has stopped both ways. Ack age alone used to be the line, but
+      // the ack is a `fetch` out of the same six-per-origin pool the page's `/events` EventSource
+      // and camera stream keep full: an ack 120 ticks stale (`ACK_MS` 500 ms) is the ordinary look
+      // of a live page that lost the slot race, and pruning it RSTs the camera stream it is still
+      // reading and restarts the attach loop. The beat is the second signal: a 1 s `<img>` GET that
+      // shares no `fetch` with the ack, so it still lands when the ack cannot. Both stale is the
+      // only death sentence; ack stale + beat fresh is starvation, already reported as `frozen-ack`
+      // by `violationsNow` above. `hidden` is legitimate (a non-composited source still acks) and a
+      // beat is not an ack, so a mute page stays diagnosable for this window. The invariant was
+      // read before the reap, so the pass that prunes also reports.
+      const ackGoneMs = c.lastAckAt ? now - c.lastAckAt : 0;
+      const beatGoneMs = c.beatAt ? now - c.beatAt : Infinity;
+      if (ackGoneMs > CLIENT_ACK_GONE_MS && beatGoneMs > PAGE_BEAT_STALE_MS) {
         const ended = relay.endClient(id);
         const busEnded = events.endClient(id);
         clientsById.delete(id);
-        log.info(`handfx page: pruned clientId=${id}: no ack for ${Math.round((now - c.lastAckAt) / 1000)}s, ended=${ended} stream(s), ${busEnded} bus response(s)`);
+        log.info(`handfx page: pruned clientId=${id}: no ack for ${Math.round(ackGoneMs / 1000)}s, no beat for ${Number.isFinite(beatGoneMs) ? `${Math.round(beatGoneMs / 1000)}s` : 'ever'}, ended=${ended} stream(s), ${busEnded} bus response(s)`);
         continue;
       }
       // A beat is proof of life too: a mute page (acks broken, beats arriving) must not be swept

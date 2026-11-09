@@ -6,8 +6,8 @@
  * truth table instead of as a dead page.
  *
  * Both POSTs here have the same shape: at most one in flight, skipped while one is outstanding,
- * a 4 s abort, and a `.finally` that clears the latch. Neither carries `keepalive`; see the tick
- * interval for why.
+ * a 4 s abort, and a `.finally` that clears the latch. The ack carries `keepalive` and the tick
+ * does not; each says why where it is sent.
  */
 let payload = null;
 let timer = 0;
@@ -65,6 +65,13 @@ function tick() {
       headers: { 'content-type': 'application/json', 'x-handfx-via': 'worker' },
       body: payload,
       signal: ctrl.signal,
+      // `keepalive` is the point of this worker's ack: it draws on Chromium's keep-alive quota
+      // instead of competing for one of the six sockets per origin that the overlay's `/events`
+      // EventSource and camera stream hold open. On the shared pool a starved ack went stale,
+      // the server reaped the client on that age alone, and the RST of its live camera stream
+      // restarted the attach loop on a flat ~60 s beat. The 4 s abort above bounds this request,
+      // so it cannot sit on the keep-alive quota the way an un-aborted hang would.
+      keepalive: true,
     });
   } catch (err) {
     clearTimeout(timerId);
