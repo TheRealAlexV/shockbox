@@ -346,7 +346,10 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
         // The frame carries the connection that received it: a decode that outlives this one must
         // not be mistaken for the current stream's (see `decode`).
         latest = { bytes: jpeg, conn };
-        armStall();
+        // The silence clock belongs to a connection too, and this was the one consumer of a frame's
+        // identity that did not check it: a part from a connection that is no longer current must
+        // not re-arm the clock for whichever one replaced it. Same rule as the live block below.
+        if (conn === gen) armStall();
         if (!decoding) void drain();
       }
     }
