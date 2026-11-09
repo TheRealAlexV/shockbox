@@ -234,6 +234,168 @@ for (const page of declaredPages) {
   }
 }
 
+// --- handfx socket census: ownership, and a reload's baseline -----------------------------
+// Both of these were asserted true while false on the live rig: seven `/events` rows with
+// `clientId: null` (no `endClient` could end any of them, and two sat in FinWait1 for ten
+// minutes), and the count at 8 against a budget of 6 after a navigation. A page that still
+// draws cannot see either, so the invariants are asserted here — against the wire identity the
+// page now persists in sessionStorage and sends on its own stream (`/events?clientId=`), which
+// is what makes a row endable by identity at all.
+const censusId = 'smoke-census-1';
+const censusRole = '/shockfx';
+const opened = [];
+
+const openBus = (clientId, role) =>
+  new Promise((resolve, reject) => {
+    const call = http.get(
+      `${base}/events?clientId=${encodeURIComponent(clientId)}&role=${encodeURIComponent(role)}`,
+      (res) => {
+        res.on('data', () => {}); // drain, never end: the row exists only while the response is attached
+        res.on('error', () => {});
+        opened.push(res);
+        resolve(res);
+      },
+    );
+    call.on('error', reject);
+  });
+
+const statusDoc = async () => (await req('GET', '/api/handfx/status')).data;
+const rowsOf = (doc) => (doc && doc.sockets && Array.isArray(doc.sockets.streams) ? doc.sockets.streams : []);
+const closedOf = (doc) => (doc && doc.sockets && Array.isArray(doc.sockets.closed) ? doc.sockets.closed : []);
+const censusShaped = (doc) => Boolean(doc && doc.census && Array.isArray(doc.census.violations));
+// Absent is null, never []: mapping a missing census to "no violations" is the fail-open this
+// section exists to end, so each reader below must prove the shape before it reads the list.
+const violationsOf = (doc) => (censusShaped(doc) ? doc.census.violations : null);
+// Every fact a reader needs to find the offending row without another probe.
+const where = (r) =>
+  `path=${r.path} role=${r.role} localPort=${r.localPort} remotePort=${r.remotePort} ownerReason=${r.ownerReason} clientId=${r.clientId}`;
+
+// The record has to exist before its stream: `owner` is read from the ack ledger, so a row whose
+// identity never acked is exactly the failure this checks for ("clientId never acked").
+const ackRes = await req('POST', '/api/handfx/ack', {
+  clientId: censusId,
+  role: censusRole,
+  build: 'smoke',
+  anchors: 'none',
+  draws: 0,
+  loopTicks: 0,
+});
+ok(ackRes.status === 200, 'POST /api/handfx/ack registers the census identity', ackRes.data);
+
+await openBus(censusId, censusRole);
+const baselineDoc = await statusDoc();
+const baseline = rowsOf(baselineDoc);
+const mineNow = baseline.filter((r) => r.clientId === censusId);
+
+ok(
+  mineNow.length === 1 && mineNow[0].owner === 'acked',
+  'a long-lived /events row is owned by the document that opened it',
+  mineNow.map(where),
+);
+
+// The standing invariant, as its own producer states it: every row that no `endClient` call can
+// reach is named here with the half of the identity that is missing.
+// The census must be *published* before "no violations" means anything: a /status that stopped
+// publishing it would otherwise read as a clean rig.
+ok(
+  censusShaped(baselineDoc),
+  '/status publishes census.violations as an array',
+  baselineDoc && baselineDoc.census
+    ? { censusKeys: Object.keys(baselineDoc.census), violationsType: typeof baselineDoc.census.violations }
+    : { census: 'missing', docKeys: baselineDoc ? Object.keys(baselineDoc) : 'no document' },
+);
+const baselineViolations = violationsOf(baselineDoc);
+const unowned = (baselineViolations || []).filter((v) => v.kind === 'unowned-stream');
+ok(
+  Array.isArray(baselineViolations) && unowned.length === 0,
+  'no long-lived response is left unowned',
+  unowned.map(
+    (v) => `kind=${v.kind} path=${v.path} role=${v.role} localPort=${v.localPort} remotePort=${v.remotePort} ownerReason=${v.reason} clientId=${v.clientId}`,
+  ),
+);
+ok(Array.isArray(baselineViolations) && baselineViolations.length === 0, 'a clean rig reports no census violations', baselineViolations);
+
+// A green census over a population this harness cannot create proves nothing: the six squatters
+// (/notify, /dialogs, /wall/portrait ×2, shell, /wall/render) only attach when their surfaces are
+// open, so `violations: []` is vacuously true here. Inject the failure the detector exists for —
+// one /events with no clientId, a row no `endClient` call can reach — and require the census to
+// name it with the row's own path and ports. A detector that cannot detect now goes red.
+const stray = await new Promise((resolve, reject) => {
+  const call = http.get(`${base}/events`, (res) => {
+    res.on('data', () => {}); // drain, never end: the row exists only while the response is attached
+    res.on('error', () => {});
+    resolve(res);
+  });
+  call.on('error', reject);
+});
+const strayDoc = await statusDoc();
+// The row publishes the server's two socket ends; from this side they are mirrored.
+const strayLocalPort = stray.socket ? stray.socket.remotePort : null;
+const strayRemotePort = stray.socket ? stray.socket.localPort : null;
+const strayDocsList = violationsOf(strayDoc);
+const strayRow = rowsOf(strayDoc).find((r) => r.localPort === strayLocalPort && r.remotePort === strayRemotePort);
+const strayViolations = (strayDocsList || []).filter(
+  (v) => v.kind === 'unowned-stream' && v.localPort === strayLocalPort && v.remotePort === strayRemotePort,
+);
+ok(
+  Boolean(strayRow) && strayRow.clientId == null &&
+    Array.isArray(strayDocsList) &&
+    strayViolations.length === 1 && strayViolations[0].path === '/events',
+  'the census names an unnamed /events as a single unowned-stream',
+  `localPort=${strayLocalPort} remotePort=${strayRemotePort}` +
+    ` row=${strayRow ? where(strayRow) : 'missing'}` +
+    ` violations=${JSON.stringify(strayDocsList)}`,
+);
+stray.destroy();
+let strayCleared = false;
+for (let i = 0; i < 20 && !strayCleared; i++) {
+  await sleep(100);
+  const doc = await statusDoc();
+  const list = violationsOf(doc);
+  const row = rowsOf(doc).find((r) => r.localPort === strayLocalPort && r.remotePort === strayRemotePort);
+  strayCleared = Array.isArray(list) && !list.some((v) => v.localPort === strayLocalPort && v.remotePort === strayRemotePort) && !row;
+}
+ok(
+  strayCleared,
+  'destroying the unnamed stream clears its unowned-stream violation',
+  `localPort=${strayLocalPort} remotePort=${strayRemotePort}`,
+);
+
+// A navigation is a new document under the same persisted identity, so a reload is a second
+// `/events` for the same clientId and role. The total staying put proves nothing on its own — a
+// leaky attach satisfies that too — so the unit is the identity: one row per identity, and the
+// predecessor row ended (recorded in `sockets.closed` with why=superseded), across two reloads.
+const steady = baseline.length;
+for (const reload of [1, 2]) {
+  await openBus(censusId, censusRole);
+  const doc = await statusDoc();
+  const rows = rowsOf(doc).filter((r) => r.clientId === censusId);
+  const superseded = closedOf(doc).filter((c) => c.clientId === censusId && c.why === 'superseded');
+  ok(
+    rows.length === 1,
+    `reload ${reload}: one row for one identity, no predecessor left attached`,
+    rows.map(where),
+  );
+  ok(
+    superseded.length >= reload,
+    `reload ${reload}: the predecessor row for that identity is ended`,
+    { identity: censusId, superseded },
+  );
+  ok(
+    rows[0] && rows[0].owner === 'acked',
+    `reload ${reload}: the surviving row is owned`,
+    rows.map(where),
+  );
+  ok(
+    rowsOf(doc).length === steady,
+    `reload ${reload}: the per-identity steady state holds`,
+    { baseline: steady, now: rowsOf(doc).length, rows: rowsOf(doc).map(where) },
+  );
+}
+
+// Release this section's responses so the smoke process can exit; the server reaps the rest.
+for (const res of opened) res.destroy();
+
 // --- cleanup ------------------------------------------------------------
 await req('DELETE', `/api/pool/all/messages/${dialogId}`);
 await req('DELETE', `/api/pool/all/messages/${notifId}`);
