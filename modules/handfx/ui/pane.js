@@ -65,6 +65,27 @@ export async function render(container, ctx) {
     cameraRestartErr: null,
   };
 
+  /* ------------------------------------------------------------ apply gate */
+  // Every write to the server funnels through patch() and bus() below. Auto Apply off makes those
+  // collect instead of send (settings in pendingPatch, page commands in pendingCmds); one Apply
+  // flushes both and re-reads the status. The pane has no prefs store, so localStorage remembers
+  // the choice.
+  //
+  // The gate is about the document the OBS page follows, never about the preview: the preview is
+  // that page itself and stays live either way. Restarting the camera relay is the one write that
+  // is not a settings key, and it queues the same way (restartCamera).
+  const AUTO_KEY = 'handfx.autoApply';
+  let autoApply = true;
+  try {
+    const saved = localStorage.getItem(AUTO_KEY);
+    if (saved !== null) autoApply = saved === '1';
+  } catch { /* storage can be denied: keep the live default */ }
+
+  const pendingPatch = Object.create(null);
+  const pendingCmds = []; // { name, args } for /api/handfx/cmd, or { name, restart: true }
+  let applying = false;
+  let applyBtn = null; // the header's Apply button; rebuilt with the header
+
   // The pane asks OBS's body source to start or stop on the control channel. It never publishes a
   // mask and never opens the body camera: pages/js/body/main.js owns 'handfx.body' publishing.
   const bodyCtl = 'BroadcastChannel' in window ? new BroadcastChannel('handfx.body.ctl') : null;
@@ -75,23 +96,131 @@ export async function render(container, ctx) {
     s.status = await api.get('/api/handfx/status');
     s.settings = Object.fromEntries(Object.entries(s.status.settings || {}).map(([k, d]) => [k, d.value]));
     s.underlay = s.settings.underlay !== false;
+    // A poll just replaced the document: put the queued edits back on top of it, so the pane
+    // keeps showing what Apply will send instead of snapping to the OBS source's old values.
+    paintQueued();
     return s.status;
   }
 
-  async function patch(key, value) {
-    const before = s.settings[key];
-    const res = await api.patch('/api/handfx/settings', { [key]: value });
+  /** One settings object through PATCH (which also broadcasts). The pane's whole settings view is
+   *  replaced by the server's answer, so a control can never disagree with the document. */
+  async function sendPatch(patchObj) {
+    const res = await api.patch('/api/handfx/settings', patchObj);
     s.settings = Object.fromEntries(Object.entries(res.settings || {}).map(([k, d]) => [k, d.value]));
+    return res;
+  }
+
+  /** One settings key. With Auto Apply off and no {force}, it is collected instead of sent. */
+  async function patch(key, value, { force = false } = {}) {
+    if (signal.aborted) return null;
+    if (!autoApply && !force) return queuePatch({ [key]: value });
+    const before = s.settings[key];
+    const res = await sendPatch({ [key]: value });
     if (Array.isArray(res.changed) && !res.changed.includes(key)) {
       push(`“${key}” did not change on the server (sent ${JSON.stringify(value)})`, 'warn');
     }
     return { before, res };
   }
 
-  async function bus(cmd, args) {
+  /** One page command. With Auto Apply off and no {force}, it is collected instead of sent. */
+  async function bus(cmd, args, { force = false } = {}) {
+    if (signal.aborted) return null;
+    if (!autoApply && !force) return queueCmd(cmd, args);
     const res = await api.post('/api/handfx/cmd', { cmd, args });
     push(`${cmd} → accepted by the server (seq ${res.seq ?? '—'})`, 'ok');
     return res;
+  }
+
+  /** The camera relay restart is a write to the OBS feed, not a settings key, so it takes the
+   *  same gate and drains through the same queue. */
+  async function restartCamera({ force = false } = {}) {
+    if (signal.aborted) return null;
+    if (!autoApply && !force) return queueCmd('camera.restart', undefined, { restart: true });
+    const res = await api.post('/api/handfx/cameras/restart', {});
+    push('camera restart sent. The feed drops for a second or two, then comes back on the selected device.', 'warn');
+    return res;
+  }
+
+  /* ------------------------------------------------------- apply gate: queue */
+
+  function pendingCount() {
+    return Object.keys(pendingPatch).length + pendingCmds.length;
+  }
+
+  function paintPending() {
+    if (!applyBtn) return;
+    const n = pendingCount();
+    applyBtn.textContent = n ? `Apply (${n})` : 'Apply';
+    applyBtn.disabled = autoApply || applying;
+  }
+
+  /** Show collected edits on the pane the way a server answer would, so nothing snaps back. */
+  function mirrorQueuedPatch(patchObj) {
+    s.settings = { ...s.settings, ...patchObj };
+    if ('underlay' in patchObj) s.underlay = patchObj.underlay !== false;
+  }
+
+  /** Re-assert the queued view after a poll replaced s.settings with the server's document. */
+  function paintQueued() {
+    if (autoApply) return;
+    if (Object.keys(pendingPatch).length) mirrorQueuedPatch(pendingPatch);
+  }
+
+  function queuePatch(patchObj) {
+    const keys = Object.keys(patchObj);
+    const before = keys.length === 1 ? s.settings[keys[0]] : undefined;
+    Object.assign(pendingPatch, patchObj);
+    mirrorQueuedPatch(patchObj);
+    render(); // redraws the Apply count and the controls from the queued values
+    return { before, res: { ok: true, queued: true, settings: null } };
+  }
+
+  function queueCmd(name, args, opts = undefined) {
+    pendingCmds.push(opts && opts.restart ? { name, restart: true } : { name, args });
+    render();
+    return { ok: true, queued: true };
+  }
+
+  function setAutoApply(on) {
+    autoApply = !!on;
+    try { localStorage.setItem(AUTO_KEY, autoApply ? '1' : '0'); } catch { /* not fatal */ }
+    paintPending();
+  }
+
+  /** Send what was collected, in the wall's order: one settings PATCH, then the commands one at a
+   *  time. A failure keeps the rest queued and stops, so nothing is silently lost. */
+  async function applyPending() {
+    if (applying || signal.aborted) return;
+    applying = true;
+    paintPending();
+    try {
+      const patchObj = { ...pendingPatch };
+      if (Object.keys(patchObj).length) {
+        try {
+          await sendPatch(patchObj);
+        } catch (err) {
+          push(`not applied: ${err.message}`, 'bad');
+          return; // everything stays queued for the next Apply
+        }
+        for (const k of Object.keys(patchObj)) delete pendingPatch[k];
+      }
+      while (pendingCmds.length) {
+        const c = pendingCmds[0];
+        try {
+          if (c.restart) await restartCamera({ force: true });
+          else await bus(c.name, c.args, { force: true });
+        } catch (err) {
+          push(`not applied: ${c.name}: ${err.message}`, 'bad');
+          break; // it stays at the head of the queue, and the rest behind it
+        }
+        pendingCmds.shift();
+      }
+      await refresh();
+      render();
+    } finally {
+      applying = false;
+      paintPending();
+    }
   }
 
   function push(text, tone = 'info') {
@@ -273,12 +402,37 @@ export async function render(container, ctx) {
     renderLog();
   }
 
+  /** The gate beside the title, built with the header: the wall's markup and words, wired to this
+   *  pane's queue. */
+  function applyGate() {
+    const box = el('input', { type: 'checkbox', id: 'handfx-auto-apply' });
+    box.checked = autoApply;
+    box.addEventListener('change', () => {
+      setAutoApply(box.checked);
+      // turning the gate back on must not strand what was collected while it was off
+      if (box.checked) void applyPending();
+    });
+    const n = pendingCount();
+    applyBtn = el('button', {
+      type: 'button', class: 'btn btn-sm', text: n ? `Apply (${n})` : 'Apply',
+      title: 'Send the held settings and commands to the OBS overlay, then re-read the status',
+    });
+    applyBtn.disabled = autoApply || applying;
+    applyBtn.addEventListener('click', () => { void applyPending(); });
+    return el('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
+      el('label', { class: 'switch-inline', for: 'handfx-auto-apply', title: 'Controls the OBS overlay source, not the preview: on, every change reaches the source at once; off, changes are held and reach it with Apply. The preview is always live.' },
+        box, el('span', { text: 'Auto Apply to OBS' })),
+      applyBtn,
+    );
+  }
+
   function header(status, reg, page, enabled) {
     const list = (s.settings.effects || []).filter((id) => reg.some((e) => e.id === id));
     const bar = el('div', { class: 'hfx-head' });
     bar.append(
-      el('div', { class: 'hfx-head-left' },
+      el('div', { class: 'hfx-head-left', style: { flexWrap: 'wrap', rowGap: '6px' } },
         el('span', { class: 'hfx-title', text: 'ShockFX' }),
+        applyGate(),
         el('span', { class: 'hfx-dot', 'data-tone': enabled ? 'ok' : 'idle' }),
         el('span', { class: 'hfx-state', text: enabled ? 'effects on' : 'effects off' }),
         el('span', { class: 'hfx-sep' }),
@@ -297,7 +451,9 @@ export async function render(container, ctx) {
       el('span', { class: 'hfx-pill', 'data-tone': window.crossOriginIsolated ? 'ok' : 'warn' }, window.crossOriginIsolated ? 'cross-origin isolated' : 'not isolated (pane)'),
       el('span', { class: 'hfx-pill', 'data-tone': page.tone }, page.text),
     );
-    return el('div', { class: 'hfx-hero' }, bar, strip);
+    return el('div', { class: 'hfx-hero' }, bar,
+      el('p', { class: 'hfx-note hfx-gate-desc', text: 'The preview is the overlay page itself, so it shows what OBS draws. With Auto Apply off, the OBS source keeps the applied settings until you press Apply.' }),
+      strip);
   }
 
   function banner(text, tone) {
@@ -388,17 +544,20 @@ export async function render(container, ctx) {
 
   // The camera dropdown lives here, in the pane, on the main page. Nothing opens a second window,
   // and the separate device window is gone: the select is the whole device list.
-  const PAGE_ACK_FRESH_MS = 5000;
 
-  /** The relay's own facts, plus the device the operator selected in settings. */
+  /**
+   * The relay's own facts, plus the device the operator selected in settings.
+   *
+   * `drawing` is the server's own answer from the page's draw progress (its paint clock or an
+   * advancing draw counter), not `lastAckAt`: a page can ack while painting nothing, and a socket
+   * still taking frames proves nothing about the picture. `=== true` on purpose — the field is
+   * `null` when nothing is known, and unknown must not be read as healthy.
+   */
   function cameraFacts() {
     const f = (s.status && s.status.cameraFeed) || {};
     const selected = String(s.settings.cameraRelaySource || '');
     const clients = Array.isArray(f.clientList) ? f.clientList : [];
-    const now = Date.now();
-    const drawing = clients.find(
-      (c) => c && c.source === 'camera' && !c.hidden && Number(c.lastAckAt) > 0 && now - Number(c.lastAckAt) <= PAGE_ACK_FRESH_MS,
-    );
+    const drawing = clients.find((c) => c && c.drawing === true && c.source === 'camera' && !c.hidden);
     return { f, selected, clients, drawing, state: String(f.state || 'unknown') };
   }
 
@@ -549,9 +708,14 @@ export async function render(container, ctx) {
       restart.textContent = 'restarting…';
       s.cameraRestartErr = null;
       try {
-        await api.post('/api/handfx/cameras/restart', {});
+        const res = await restartCamera();
+        if (res && res.queued) {
+          // held until Apply: the feed still reads the old device, so cameraPending stays set
+          push('camera restart held. It reaches the relay when you press Apply.', 'warn');
+          render();
+          return;
+        }
         s.cameraPending = null;
-        push('camera restart sent. The feed drops for a second or two, then comes back on the selected device.', 'warn');
         await refresh();
       } catch (err) {
         s.cameraRestartErr = `${err.message}. Nothing was restarted.`;
