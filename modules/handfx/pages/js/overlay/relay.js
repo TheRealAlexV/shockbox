@@ -106,6 +106,11 @@ export class MultipartFrames {
  */
 export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onState = () => {}, onEvent = null, timeout = ACQUIRE_TIMEOUT } = {}) {
   let ctrl = null; // AbortController of the live fetch
+  // Identity of the current connection. Bumped whenever one starts or ends, so a frame can carry
+  // the connection that received it: `ctrl` alone cannot tell "the stream I came from is gone" from
+  // "some other stream is current now", and a decode that outlives its own connection used to
+  // report an attach for it. See `decode` and `drain`.
+  let gen = 0;
   let wanted = false; // the page asked for frames (so a hidden tab can resume)
   let live = false;
   let current = null; // newest ImageBitmap, closed when replaced
@@ -163,6 +168,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
 
   function close() {
     clearStall();
+    // The connection ends here: every frame already received from it is now stale, including one
+    // that is still decoding. Bumping the generation is what makes `decode` able to see that.
+    gen += 1;
     // Drop the queued frame with the connection: `drain()` would otherwise hand the old stream's
     // last JPEG to the new one, inflating `dropped` on every reconnect and painting a stale frame
     // across the gap.
@@ -233,7 +241,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     if (firstWaiter) {
       const w = firstWaiter;
       firstWaiter = null;
-      w(false);
+      w.resolve(false);
     }
     if (current) {
       current.close();
@@ -267,12 +275,15 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     if (wanted && why !== 'pagehide') wantReopen();
   }
 
-  async function decode(bytes) {
+  async function decode(bytes, conn) {
     const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
-    if (!ctrl) {
+    // Staleness is about *this frame's* connection, not about whether anything is current: a decode
+    // can outlive its own connection (the server's max-age EOF lands inside one every two minutes)
+    // and a newer connection can already own `ctrl` when it resolves. Both drop here.
+    if (!ctrl || conn !== gen) {
       // The stream died while this was decoding: drawing it now would revive the frozen frame.
       bitmap.close();
-      return;
+      return false;
     }
     const prev = current;
     current = bitmap;
@@ -283,18 +294,24 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       // Synchronous consumer: the previous frame has been drawn, nothing else can hold it.
       if (prev) prev.close();
     }
+    return true;
   }
 
   /** Decode the newest frame, then the one that arrived while we were busy. */
   async function drain() {
     if (decoding) return;
     decoding = true;
+    let conn = -1; // the connection of the frame being decoded, for the catch below
     try {
       while (latest && ctrl) {
-        const bytes = latest;
+        const frame = latest;
         latest = null;
-        await decode(bytes);
-        if (!live) {
+        conn = frame.conn;
+        if (!(await decode(frame.bytes, conn))) continue;
+        // Only the connection that is still current may report an attach: a frame from a closed one
+        // used to set `live` here, cancel the reopen the EOF had just scheduled, and leave the page
+        // claiming a feed with no socket behind it.
+        if (conn === gen && !live) {
           live = true;
           error = null;
           liveSince = Date.now();
@@ -303,21 +320,22 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
           cancelReopen();
           emit('live');
           note('attached', `frames=${frames} dropped=${dropped}`);
-          if (firstWaiter) {
+          if (firstWaiter && firstWaiter.conn === conn) {
             const w = firstWaiter;
             firstWaiter = null;
-            w(true);
+            w.resolve(true);
           }
         }
       }
     } catch (err) {
-      if (ctrl) fail(`relay: ${err && err.message ? err.message : err}`);
+      // An error from a dead connection's frame must not fail the one that is current.
+      if (ctrl && conn === gen) fail(`relay: ${err && err.message ? err.message : err}`);
     } finally {
       decoding = false;
     }
   }
 
-  async function read(res, ac) {
+  async function read(res, ac, conn) {
     const reader = res.body.getReader();
     const parser = new MultipartFrames();
     for (;;) {
@@ -325,7 +343,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       if (done) break;
       for (const jpeg of parser.push(value)) {
         if (latest) dropped += 1; // the decoder was still busy: keep only the newest
-        latest = jpeg;
+        // The frame carries the connection that received it: a decode that outlives this one must
+        // not be mistaken for the current stream's (see `decode`).
+        latest = { bytes: jpeg, conn };
         armStall();
         if (!decoding) void drain();
       }
@@ -358,6 +378,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
   async function acquire() {
     const ac = new AbortController();
     ctrl = ac;
+    // A new connection is a new identity: frames from the one before it are stale from here on.
+    gen += 1;
+    const conn = gen;
     error = null;
     // Every other bound here starts after the response exists: the first-frame wait below, the 3 s
     // stall timer. A `fetch` that never returns headers is therefore unbounded, and a hung
@@ -384,14 +407,17 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       // The connection is open: from here on, 3 s without a complete frame is a dead camera.
       armStall();
       // Losing the connection after the first frame is a state change, not a start failure.
-      void read(res, ac).catch((err) => {
+      void read(res, ac, conn).catch((err) => {
         if (ac.signal.aborted || !ctrl) return;
         fail(`relay: ${err && err.message ? err.message : err}`);
       });
       const got = await new Promise((resolve) => {
-        firstWaiter = resolve;
+        // The waiter belongs to this connection: a frame from any other one must not resolve it,
+        // and this acquisition's deadline must not resolve a newer acquisition's waiter.
+        const waiter = { conn, resolve };
+        firstWaiter = waiter;
         setTimeout(() => {
-          if (firstWaiter) {
+          if (firstWaiter === waiter) {
             firstWaiter = null;
             resolve(false);
           }
@@ -470,7 +496,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     start,
     stop,
     /** Frames are flowing and `onFrame` is being called. */
-    isLive: () => live && Boolean(current),
+    isLive: () => Boolean(ctrl) && live && Boolean(current),
     /** Why the stream is not live (string), null while it is. */
     reason: () => error,
     stats: () => ({ frames, dropped, live }),

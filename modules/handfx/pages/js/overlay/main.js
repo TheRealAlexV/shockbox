@@ -50,9 +50,12 @@ const canAcquire = !PREVIEW || CAMERA_PREVIEW;
  * stream — instead of letting them keep two of the browser's six sockets to this origin, which is
  * what starves the successor's acks (`ack request: signal timed out` with six sockets held).
  * The path is used rather than a fresh clientId because a clientId is new on every load and could
- * never match a predecessor. A preview shares the path but opens neither stream.
+ * never match a predecessor. A plain preview opens neither stream, so its role never matters; a
+ * preview with `?camera=1` does open the camera stream, and must not claim the OBS source's role —
+ * the relay ends the older client of a role, so sharing it would kill the source's feed every time
+ * the pane toggled its underlay.
  */
-const ROLE = location.pathname;
+const ROLE = PREVIEW ? `${location.pathname}/preview` : location.pathname;
 /** The bundle this document was loaded from: the `?v=` the page loader put on this module's URL. */
 const BUILD = new URL(import.meta.url).searchParams.get('v') || 'unknown';
 
@@ -212,6 +215,21 @@ function reportRelayEvent(transition, detail = '') {
   } catch {
     /* a report must never break the stream it describes */
   }
+}
+
+/**
+ * The camera→synthetic fallback is a transition, and it used to leave no trace: a 20-minute outage
+ * read as a healthy page because only the state was reported, never the change. One line per
+ * crossing, through the same page-event path as the relay's own notes, naming the reason and how
+ * old the last real frame was at the moment it happened — never per frame.
+ */
+let notedSource = null;
+function noteSource(source, reason) {
+  if (source === notedSource) return;
+  const from = notedSource || 'none';
+  notedSource = source;
+  const age = state.lastFrameAt ? `${Math.round(performance.now() - state.lastFrameAt)} ms` : 'never';
+  reportRelayEvent('source', `${from} -> ${source} (${reason || 'unspecified'}), last frame ${age} old`);
 }
 
 /**
@@ -509,10 +527,13 @@ function applyBusCommand(msg) {
       renderState();
       ack();
     }
-  } else if (cmd === 'tracking.toggle') {
-    // The synthetic rig runs from load; only a real camera session counts as "started" here.
-    if (state.tracking && !state.synthetic) stopTracking();
-    else startTracking({ fromBus: true });
+  } else if (cmd === 'tracking.set' || cmd === 'tracking.toggle') {
+    // One verb for the pane's three controls (camera, synthetic, off); `tracking.toggle` is the deck
+    // key's one-button form and keeps its own rule. Both are acted on in *this* document, so the
+    // OBS source is the only page a command can reach: the pane's preview opens no bus at all.
+    const mode = cmd === 'tracking.toggle' ? 'toggle' : msg.args && msg.args.mode;
+    if (!applyTrackingMode(mode)) setBanner(`Unknown tracking mode: ${String(mode)}`, 'warn');
+    renderState();
   } else if (cmd === 'projectile.fire') {
     const skin = msg.args && msg.args.skin;
     if (skin && state.settings) fx.setSettings({ skins: { ...(state.settings.skins || {}), shoot: skin } });
@@ -832,13 +853,19 @@ setInterval(() => {
 
 /* ---------------------------------------------------------------- camera + tracking */
 
-/** The camera needs an explicit action in this document: a click, or (for the deck) this tab
- *  already showing, already permitted, and in the foreground. A background tab that opens a
- *  camera on a bus command is exactly what browsers block, and what the pane must never do. */
+/** The camera needs an explicit action before a command may open it: the operator used this page
+ *  recently (started, or pressed something on it). */
 function canStartFromBus() {
-  // The operator has used this page recently (started, or pressed anything on it): a deck key may
-  // continue that session, never open the first camera of a page nobody has touched.
-  return document.visibilityState === 'visible' && (performance.now() - (startClicks.at || 0)) < 20000;
+  // The operator has used this page recently (started, or pressed anything on it): a deck key or
+  // the pane may continue that session, never open the first camera of a page nobody has touched.
+  //
+  // No visibility gate, for the reason `autoCamera` states above its own start: an OBS browser
+  // source reports `hidden` whenever it is not in the program, and this command travels the relay
+  // path, which needs neither a gesture nor permission. Requiring "visible" protected nothing and
+  // refused the camera in exactly the state the pane's button exists for, while the button had
+  // already reported success. What is left is the one thing that is actually unsafe: a command
+  // arriving at a page the operator has not touched within 20 s — that still refuses, below.
+  return (performance.now() - (startClicks.at || 0)) < 20000;
 }
 const startClicks = { at: 0 };
 
@@ -1035,17 +1062,54 @@ async function startRelay(opts) {
   return true;
 }
 
-async function startTracking({ fromBus = false, synthetic = false } = {}) {
+/**
+ * The bus's tracking command, in one place: `camera`, `synthetic`, `off`, or `toggle` (the deck
+ * key's one-button form). Idempotent — asking for the state the page is already in does nothing, so
+ * a second press can never restart a healthy relay. False means a mode this build does not know.
+ */
+function applyTrackingMode(mode) {
+  const syntheticNow = Boolean(state.tracking && state.synthetic);
+  if (mode === 'off') {
+    stopTracking();
+    return true;
+  }
+  if (mode === 'synthetic') {
+    if (!syntheticNow) {
+      if (state.tracking) stopTracking({ manual: false, keepView: true });
+      void startTracking({ fromBus: true, synthetic: true, explicit: true });
+    }
+    return true;
+  }
+  if (mode === 'camera') {
+    if (state.tracking && !syntheticNow) return true; // already this camera's session
+    // The pane's button is the operator's own click, just in another document: open the same
+    // gesture window a press on this page would. A deck key has no such click and stays gated.
+    noteStartClick();
+    if (state.tracking) stopTracking({ manual: false, keepView: true });
+    void startTracking({ fromBus: true, explicit: true });
+    return true;
+  }
+  if (mode === 'toggle') {
+    // The deck key, unchanged: a live camera stops, anything else starts what the setting asks for.
+    if (state.tracking && !state.synthetic) stopTracking();
+    else startTracking({ fromBus: true });
+    return true;
+  }
+  return false;
+}
+
+async function startTracking({ fromBus = false, synthetic = false, explicit = false } = {}) {
   if (!canAcquire && !synthetic) return; // a plain preview never acquires a camera or the relay
   // A running camera owns the view; a running synthetic rig gives way to a real camera (the
   // overlay starts on synthetic when no camera arrives, so the Start button must still work).
   if (trackingClaimLive()) return;
   if (state.tracking) stopTracking({ manual: false, keepView: true });  userStopped = false;
-  // The persisted mode wins over the button and the bus: `synthetic` never opens a camera, and
-  // needs no gesture to do it. `camera` never draws a synthetic frame.
-  const wantSynthetic = synthetic || state.trackingSource === 'synthetic';
+  // An explicit mode wins over the persisted setting: `camera` starts the camera whatever the page
+  // was last left on, and `synthetic` never opens one. Without a mode the persisted setting decides
+  // — the boot path and the deck key's toggle, unchanged.
+  const wantSynthetic = explicit ? synthetic : synthetic || state.trackingSource === 'synthetic';
   if (fromBus && !canStartFromBus() && !wantSynthetic) {
-    setBanner('Camera not started: press Start once in this page (a browser only opens a camera from a real click).', 'warn');
+    setBanner('Camera not started: this page has not been used for 20 s (a browser only opens a camera after a real click).', 'warn');
     renderState();
     return;
   }
@@ -1118,6 +1182,8 @@ function ensureSyntheticAnchors() {
   state.synthetic = true;
   state.tracking = true;
   state.cameraSource = 'synthetic';
+  // Before the synthetic fill frame below, so the age reported is the last real frame's.
+  noteSource('synthetic', state.error || state.relayError || 'no camera frames');
   // Fill the view in this same tick, so a command fired now draws on the very next frame instead
   // of on the first frame of the synthetic loop.
   onFrame({
@@ -1139,6 +1205,7 @@ function onTrackerState(snap) {
   // Relay and device both report camera anchors; the feed says which pipe carried them.
   if (snap.state === 'running' && snap.source === 'camera') {
     state.cameraSource = snap.feed === 'relay' ? 'relay' : 'device';
+    noteSource(state.cameraSource, 'camera frames arriving');
   }
   // The overlay's start is the operator's action for the bus: a deck key may start a session the
   // operator has just opened this page for, and may never open a camera on its own. The synthetic
