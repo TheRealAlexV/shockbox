@@ -607,6 +607,18 @@ function build(ctx) {
   }
 
   /**
+   * Does a live document on this server own this identity? Two ledgers hold owners: handfx's own
+   * ack/beat record, and the bus's open responses — exactly the set `events.endClient` can end.
+   * The wall documents only appear in the second: they mint a stable clientId in `sessionStorage`
+   * and send it as `?clientId=` on `/events`, so the bus can supersede and end their rows, but they
+   * never ack. They must not ack either — an ack puts a non-handfx document in `clientsById`, which
+   * `freshestPage` would then name as "the page", and the beat `<img>` would add a 1 s request
+   * cadence to a document that already posts every 2 s. So ownership is read from both ledgers.
+   */
+  const ownedByDocument = (clientId) =>
+    Boolean(clientId) && (clientsById.has(clientId) || events.ownsClient(clientId));
+
+  /**
    * The census as /status reads it. `current` is asked of the identity the response declared: the
    * relay's live consuming reader first (`consuming` outranks ack recency, because only the reader
    * being handed frames at 30 fps can be the one taking them), then the freshest ack of its role.
@@ -641,12 +653,20 @@ function build(ctx) {
         // The page's own name for itself (`?client=`), when it sent one. A label, not an identity.
         label: rec.label || null,
         clientId: rec.clientId || null,
-        owner: rec.clientId ? (clientsById.has(rec.clientId) ? 'acked' : 'unknown') : 'unowned',
+        // `bus`: no ack record, but the bus holds an open response for this identity, so
+        // `events.endClient` can still end the row. `unknown` is the one that cannot be reaped.
+        owner: rec.clientId
+          ? clientsById.has(rec.clientId)
+            ? 'acked'
+            : events.ownsClient(rec.clientId)
+              ? 'bus'
+              : 'unknown'
+          : 'unowned',
         // Why this row cannot be reaped by `endClient`, when that is the case: no identity on the
-        // request, or one that never acked here. `owner: unowned` alone was the misleading half of
-        // the old reading — the row said who did not own it and never why.
+        // request, or one that neither ledger holds. `owner: unowned` alone was the misleading half
+        // of the old reading — the row said who did not own it and never why.
         ownerReason: rec.clientId
-          ? (clientsById.has(rec.clientId) ? null : 'clientId never acked on this server')
+          ? (ownedByDocument(rec.clientId) ? null : 'no live document owns this clientId')
           : 'request carried no clientId',
         // The socket's two ends and when the response opened: the row's per-socket identity.
         localPort: rec.localPort ?? null,
@@ -1042,8 +1062,8 @@ function build(ctx) {
         const list = byOwner.get(row.clientId);
         if (list) list.push(row);
         else byOwner.set(row.clientId, [row]);
-        if (!clientsById.has(row.clientId)) {
-          out.push({ kind: 'unowned-stream', clientId: row.clientId, path: row.path, role: row.role, localPort: row.localPort, remotePort: row.remotePort, reason: 'clientId never acked on this server' });
+        if (!ownedByDocument(row.clientId)) {
+          out.push({ kind: 'unowned-stream', clientId: row.clientId, path: row.path, role: row.role, localPort: row.localPort, remotePort: row.remotePort, reason: 'no live document owns this clientId' });
         }
       }
       // silent-unreaped: an open response nobody is speaking for. A row with an owner record is

@@ -301,6 +301,10 @@ export function createEvents({ log }) {
       // The document's own ack identity, when it sent one. `null` for a page cached before the
       // parameter existed: it stays owned by role, exactly as before.
       clientId: clientIdOf(req),
+      // Which kind of long-lived response this row is. One owner is allowed
+      // LONG_LIVED_PER_CLIENT = 2 (modules/handfx/server.js) — a bus plus at most one camera
+      // stream — so the supersede below must key on the kind as well as the identity.
+      kind: 'bus',
       remote: client || req.socket?.remoteAddress || '?',
       born: Date.now(),
       ageTimer: null,
@@ -320,6 +324,19 @@ export function createEvents({ log }) {
     if (c.role) {
       for (const old of [...clients.values()]) {
         if (old !== c && (old.role === c.role || (!old.role && old.ref === c.role))) drop(old, 'superseded');
+      }
+    }
+    // The same document re-attaching with its ack identity (`?clientId=`, no `?role=`) is the
+    // common case, and the role rule above never sees it: `c.role` is null, the loop is skipped, and
+    // every predecessor stays open until its age cap. Match the clientId instead — but never the
+    // clientId alone. One owner is allowed LONG_LIVED_PER_CLIENT = 2 responses
+    // (modules/handfx/server.js): one bus plus at most one camera stream, by design. A clientId-only
+    // key encodes "one owner, one response" and is one step away from ending the other one; `kind`
+    // keeps that split explicit here, so if a second kind is ever registered in this map a bus
+    // re-attach supersedes this owner's previous bus and never the other response.
+    if (c.clientId) {
+      for (const old of [...clients.values()]) {
+        if (old !== c && old.kind === c.kind && old.clientId === c.clientId) drop(old, 'superseded');
       }
     }
     // The cap: at max age the response is ended cleanly (drop calls end(), never an error status),
@@ -394,6 +411,16 @@ export function createEvents({ log }) {
     },
     get clientCount() {
       return clients.size;
+    },
+    /**
+     * Is this identity held by an open bus response — the same set `endClient` below can end? The
+     * census asks this before it calls a stream unowned: a document that minted its own clientId
+     * can be reaped by identity whether or not it also posts its own acks.
+     */
+    ownsClient(clientId) {
+      if (!clientId) return false;
+      for (const c of clients.values()) if (c.clientId === clientId) return true;
+      return false;
     },
     /**
      * Close the bus responses one document owns, so a silent page cannot keep a slot out of CEF's
