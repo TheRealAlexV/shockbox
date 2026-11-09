@@ -46,9 +46,12 @@ function ok(name, pass, detail = '') {
   results.push({ name, pass, detail, skipped: false });
   console.log(`${pass ? 'ok  ' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`);
 }
-function skip(name, why) {
-  results.push({ name, pass: true, detail: why, skipped: true });
-  console.log(`skip ${name} — ${why}`);
+// A skip is not a pass. Only a check whose subject is genuinely environment-dependent (network,
+// camera hardware) may declare itself optional; anything else that declines to run is a failure,
+// because "could not check" and "checked, fine" are the two states this gate exists to separate.
+function skip(name, why, { optional = false } = {}) {
+  results.push({ name, pass: optional, detail: `${optional ? 'skipped' : 'skipped without declaring itself optional'}: ${why}`, skipped: true });
+  console.log(`${optional ? 'skip ' : 'FAIL '} ${name} — ${why}`);
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -64,13 +67,47 @@ async function freePort() {
   });
 }
 
-async function startServer() {
-  if (argUrl) return { url: argUrl, log: [], stop() {} };
+/**
+ * The server's own "a payload older than this is last-known, not current" window, read from the
+ * source rather than duplicated here, so this gate cannot drift from the constant it asserts
+ * against (`PAGE_FRESH_MS`, modules/handfx/server.js:96, used by `payloadFresh` at :1540-1543).
+ */
+function sourceConst(name) {
+  const src = fs.readFileSync(path.join(ROOT, 'modules/handfx/server.js'), 'utf8');
+  const m = src.match(new RegExp(`const ${name}\\s*=\\s*([\\d_]+)\\s*;`));
+  if (!m) throw new Error(`${name} not found in modules/handfx/server.js — the gate will not guess a threshold`);
+  return Number(m[1].replace(/_/g, ''));
+}
+
+function freshWindowMs() {
+  return sourceConst('PAGE_FRESH_MS');
+}
+
+/**
+ * The server's own paint-clock window: a client whose `lastDrawAt` (or whose `draws` counter) has
+ * not moved for longer than this is not drawing (`LOOP_STALE_MS`, modules/handfx/server.js:88, used
+ * by `clientDrawing` at :1203-1213). Read from the source so this gate cannot drift from it.
+ */
+function loopStaleWindowMs() {
+  return sourceConst('LOOP_STALE_MS');
+}
+
+async function startServer(env = {}) {
+  if (argUrl) {
+    // env cannot reach a process someone else started: a section that needs `SHOCKBOX_STREAM_MAX_MS`
+    // would silently assert against the live cap and fail misleadingly. Refuse instead.
+    const wanted = Object.keys(env);
+    if (wanted.length) {
+      throw new Error(`startServer(${wanted.join(',')}) needs its own process, but --url=${argUrl} was given; rerun without --url so the shortened-cap section owns its server`);
+    }
+    return { url: argUrl, log: [], stop() {} };
+  }
   const port = await freePort();
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-handfx-'));
   const child = spawn(process.execPath, [path.join(ROOT, 'server.mjs'), '--port', String(port), '--state', stateDir], {
     cwd: ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...env },
   });
   const log = [];
   child.stdout.on('data', (d) => log.push(String(d)));
@@ -314,7 +351,7 @@ async function main() {
 
       // The body page is a separate document: open it here (the listener already has one open for
       // the channel, but the driven page must be the one this session evaluates in).
-      await c.send('Page.navigate', { url: `${srv.url}/shockfx/body?drive=1` });
+      await c.send('Page.navigate', { url: `${srv.url}/shockfx/body?drive=1&obs=1&autostart=0` });
       const bodyBooted = await waitFor(c, 'Boolean(window.__handfxBody)', 15000).catch(() => false);
       if (!bodyBooted) console.log(`     body page console:\n       ${consoleLines.slice(-12).join('\n       ')}\n     url=${await evaluate(c, 'location.href')}`);
       // Drive the body page directly (a real click is the operator's path; the module's Start is
@@ -454,7 +491,7 @@ async function main() {
         up = false;
       }
       if (up) ok('model URL reachable (no local copy)', true, status.model.url);
-      else skip('model download', 'no local model and the CDN model URL is unreachable in this environment');
+      else skip('model download', 'no local model and the CDN model URL is unreachable in this environment', { optional: true });
       await modelRes.arrayBuffer().catch(() => {});
     }
 
@@ -585,6 +622,168 @@ async function main() {
       skip('tracker runs on camera frames', `model did not load here (${snap.model}${snap.error ? `: ${snap.error}` : ''}) — camera opened, tracking not claimed`);
     }
     await evaluate(c, 'window.__handfx.stopTracking()');
+
+    // ── 5b. a stale ack is never reported as drawing or loop-healthy ───────
+    // Measured on the deployed rig with the overlay frozen for 56 s:
+    //   clients[0]: { state: "live", drawing: true, loopStale: false, drawCount: 3718,
+    //                 loopTicks: 3719, lastAckAt: <56 s old>, beatAgeMs: 55913 }
+    //   payloadFresh: { tick: false, ack: false }
+    // `drawing` and `loopStale` were both derived from an ack that had already gone stale, so every
+    // consumer of clientList() — the pane, its badges, the headline — read a dead page as a live
+    // one. The a64 boot gate could not catch it: a page that reaches `loop-start` and draws once
+    // satisfies a boot assertion forever. The invariant below is the one that was violated, and it
+    // asserts BOTH fields together so a fix that rebinds one and not the other still fails here.
+    const freshMs = freshWindowMs();
+    const ackOnce = (id, base) => fetch(`${base}/api/handfx/ack?role=${encodeURIComponent('/shockfx')}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: id, effect: CANON[0], anchors: 'camera', draws: 3718, loopTicks: 3719,
+        wantsFeed: false, phases: ['module-start', 'first-ack', 'first-draw'],
+      }),
+    });
+    const staleId = `gate-stale-${process.pid}-${Date.now().toString(36)}`;
+    await ackOnce(staleId, srv.url);
+    // The window is the server's, so the wait is the server's too: there is no shorter honest way
+    // to age an ack past PAGE_FRESH_MS. 1.5 s of margin keeps scheduler jitter out of it.
+    await sleep(freshMs + 1500);
+    const staleStatus = await (await fetch(`${srv.url}/api/handfx/status`)).json();
+    const staleRows = (staleStatus.cameraFeed && staleStatus.cameraFeed.clientList) || [];
+    const staleRow = staleRows.find((c) => c.id === staleId);
+    const staleAckAge = staleRow ? staleRow.ackAgeMs : null;
+    const staleSaysDrawing = Boolean(staleRow) && staleRow.drawing === true;
+    const staleSaysLoopOk = Boolean(staleRow) && staleRow.loopStale === false;
+    ok(
+      'a stale ack is never reported as drawing or loop-healthy',
+      Boolean(staleRow) && staleAckAge != null && staleAckAge > freshMs && !staleSaysDrawing && !staleSaysLoopOk,
+      `id=${staleId} lastAckAt=${staleRow ? staleRow.lastAckAt : 'missing'}` +
+        ` beatAgeMs=${staleRow ? staleRow.beatAgeMs : '?'}` +
+        ` drawing=${staleRow ? staleRow.drawing : '?'} loopStale=${staleRow ? staleRow.loopStale : '?'}` +
+        ` payloadFresh=${JSON.stringify(staleStatus.payloadFresh || {})}` +
+        ` threshold=${freshMs}ms (PAGE_FRESH_MS modules/handfx/server.js:96) ackAgeMs=${staleAckAge}`,
+    );
+
+    // ── 5c. the ack clock is not coupled to the camera-stream cap ──────────
+    // a45 and a53 both froze within ~130 ms of a 120 s camera-cap close. No gate may hold a 120 s
+    // timer, so the cap is driven from the server's own constant: CAMERA_MAX_MS
+    // (modules/handfx/server.js:200, from SHOCKBOX_STREAM_MAX_MS), reported as `caps.cameraMs`
+    // (server.js:667). A dedicated server runs it at 2.5 s, the stream is held open and drained
+    // until the server closes it, and the client's lastAckAt is sampled on both sides of the close.
+    // This is the shortened-cap route, not a real 120 s timer.
+    const capSrv = await startServer({ SHOCKBOX_STREAM_MAX_MS: '2500' });
+    try {
+      const capStatus = await (await fetch(`${capSrv.url}/api/handfx/status`)).json();
+      const capMs = capStatus.sockets && capStatus.sockets.caps && capStatus.sockets.caps.cameraMs;
+      ok('the server reports the shortened camera cap', capMs === 2500, `sockets.caps.cameraMs=${capMs} (SHOCKBOX_STREAM_MAX_MS=2500, CAMERA_MAX_MS server.js:200)`);
+      const capId = `gate-cap-${process.pid}-${Date.now().toString(36)}`;
+      await ackOnce(capId, capSrv.url);
+      const started = Date.now();
+      const streamRes = await fetch(
+        `${capSrv.url}/api/handfx/camera/stream?role=${encodeURIComponent('/shockfx')}&clientId=${encodeURIComponent(capId)}`,
+        { signal: AbortSignal.timeout(capMs + 4000) },
+      ).catch((err) => ({ ok: false, status: `fetch:${err && err.message}` }));
+      if (!streamRes.ok) {
+        skip('a client ack keeps advancing across a camera-stream close', `camera relay refused the stream (${streamRes.status}) — no camera/ffmpeg in this environment; nothing to close; caps.cameraMs=${capMs}`, { optional: true });
+      } else {
+        // Drain in the background so the server's meter sees a live reader, and keep acking across
+        // the boundary. `closedAt` is the server's close, not a client-side abort.
+        let closedAt = 0;
+        const reader = streamRes.body.getReader();
+        const drain = (async () => {
+          try { for (;;) { const { done } = await reader.read(); if (done) break; } } catch { /* close */ }
+          closedAt = Date.now();
+        })();
+        const ackTimes = [];
+        while (!closedAt && Date.now() - started < capMs + 2000) {
+          ackTimes.push(Date.now());
+          await ackOnce(capId, capSrv.url).catch(() => {});
+          await sleep(250);
+        }
+        await drain.catch(() => {});
+        await sleep(300);
+        // One more ack after the close: the cadence has to outlive the boundary, not stop at it.
+        await ackOnce(capId, capSrv.url).catch(() => {});
+        const after = await (await fetch(`${capSrv.url}/api/handfx/status`)).json();
+        const capRow = ((after.cameraFeed && after.cameraFeed.clientList) || []).find((c) => c.id === capId);
+        const closeOffset = closedAt ? closedAt - started : null;
+        const atCap = closeOffset != null && closeOffset >= capMs - 500;
+        if (atCap) ok('the stream closed at the shortened cap', true, `${closeOffset} ms (cap ${capMs} ms)`);
+        else skip('the stream closed at the shortened cap', `close at ${closeOffset == null ? 'never' : `${closeOffset} ms`}, cap ${capMs} ms — relay ended for another reason (camera/ffmpeg), so only cadence is asserted`, { optional: true });
+        ok(
+          'a client ack keeps advancing across a camera-stream close',
+          Boolean(capRow) && capRow.ackAgeMs != null && capRow.ackAgeMs < freshMs && ackTimes.length >= 2 && closeOffset != null,
+          `id=${capId} capMs=${capMs} closeOffsetMs=${closeOffset == null ? 'never' : closeOffset}` +
+            ` acks=${ackTimes.length} lastAckAt=${capRow ? capRow.lastAckAt : 'missing'}` +
+            ` ackAgeMs=${capRow ? capRow.ackAgeMs : '?'} threshold=${freshMs}ms (PAGE_FRESH_MS modules/handfx/server.js:96)`,
+        );
+        // The same shape the rig showed, asserted on the field that lied: a stream the server is
+        // feeding, acks that keep arriving, and the page's own `draws` frozen at 3718. A fresh ack
+        // proves the page is talking; an attached stream proves the socket took bytes. Neither is
+        // painting, and `undefined` (a dropped field) must not read as honest either.
+        ok(
+          'a live stream does not make a frozen page drawing',
+          Boolean(capRow) && 'drawing' in capRow && capRow.drawing !== true,
+          `id=${capId} capMs=${capMs} draws=${capRow ? capRow.drawCount : '?'}` +
+            ` lastDrawAt=${capRow ? capRow.lastDrawAt : '?'} drawing=${capRow ? JSON.stringify(capRow.drawing) : 'missing'}`,
+        );
+      }
+    } finally {
+      capSrv.stop();
+    }
+
+    // ── 5d. frozen draws under live acks: the production regression ────────
+    // Measured on the rig: the overlay paints a burst (~1000-1800 frames at ~1000 fps), then
+    // nothing for ~57 s while its acks keep arriving every 500 ms and the server keeps handing it
+    // 30 fps. `drawing` read true through all of it, because it was derived from the ack (or from
+    // the attached stream) instead of from the page's own paint progress. This is that exact shape:
+    // one client, its camera stream held open, two acks with the SAME `draws` and a `lastDrawAt`
+    // that has not moved, separated by more than the server's own LOOP_STALE_MS.
+    const loopStaleMs = loopStaleWindowMs();
+    const freezeId = `gate-freeze-${process.pid}-${Date.now().toString(36)}`;
+    const frozenDraws = 1500;
+    const frozenLastDrawAt = () => Date.now() - loopStaleMs - 1000;
+    const freezeAck = () =>
+      fetch(`${srv.url}/api/handfx/ack?role=${encodeURIComponent('/shockfx')}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          clientId: freezeId, effect: CANON[0], anchors: 'camera', draws: frozenDraws,
+          loopTicks: frozenDraws, lastDrawAt: frozenLastDrawAt(), wantsFeed: false,
+          phases: ['module-start', 'first-ack', 'first-draw'],
+        }),
+      });
+    await freezeAck();
+    // Hold the camera stream open as this client, as the overlay does: a socket the server is
+    // feeding must never be mistaken for a page that is painting.
+    const freezeStream = await fetch(
+      `${srv.url}/api/handfx/camera/stream?role=${encodeURIComponent('/shockfx')}&clientId=${encodeURIComponent(freezeId)}`,
+      { signal: AbortSignal.timeout(loopStaleMs + 8000) },
+    ).catch((err) => ({ ok: false, status: `fetch:${err && err.message}` }));
+    const freezeStreamOk = Boolean(freezeStream.ok);
+    const freezeReader = freezeStreamOk && freezeStream.body ? freezeStream.body.getReader() : null;
+    const freezeDrain = freezeReader
+      ? (async () => { try { for (;;) { const { done } = await freezeReader.read(); if (done) break; } } catch { /* close */ } })()
+      : Promise.resolve();
+    if (freezeStreamOk) ok('the frozen-draws client holds a live camera stream', true, `HTTP ${freezeStream.status}`);
+    else skip('the frozen-draws client holds a live camera stream', `camera relay refused the stream (${freezeStream.status}) — no camera/ffmpeg here; the ack-only shape is still asserted`, { optional: true });
+    // Longer than the server's own window, so a counter that has not moved is genuinely stale and
+    // not merely between two acks.
+    await sleep(loopStaleMs + 500);
+    await freezeAck(); // same `draws`: the page is acking and not painting
+    const freezeStatus = await (await fetch(`${srv.url}/api/handfx/status`)).json();
+    const freezeRow = ((freezeStatus.cameraFeed && freezeStatus.cameraFeed.clientList) || []).find((r) => r.id === freezeId);
+    const freezeAckAge = freezeRow && freezeRow.lastAckAt ? Date.now() - freezeRow.lastAckAt : null;
+    ok(
+      'frozen draws under live acks are never reported as drawing',
+      Boolean(freezeRow) && freezeAckAge != null && freezeAckAge < freshMs &&
+        'drawing' in freezeRow && freezeRow.drawing !== true,
+      `id=${freezeId} draws=${freezeRow ? freezeRow.drawCount : '?'}` +
+        ` lastDrawAt=${freezeRow ? freezeRow.lastDrawAt : '?'} ackAgeMs=${freezeAckAge}` +
+        ` drawing=${freezeRow ? JSON.stringify(freezeRow.drawing) : 'missing'}` +
+        ` threshold=${loopStaleMs}ms (LOOP_STALE_MS modules/handfx/server.js:88) stream=${freezeStreamOk ? 'live' : 'refused'}`,
+    );
+    if (freezeReader) freezeReader.cancel().catch(() => {});
+    await freezeDrain.catch(() => {});
 
     // ── 6. synthetic hands through the real classifier and renderer ───────
     const synth = await evaluate(
@@ -992,7 +1191,7 @@ async function main() {
   }
 
   const failed = results.filter((r) => !r.pass);
-  const skipped = results.filter((r) => r.skipped);
+  const skipped = results.filter((r) => r.skipped && r.pass);
   console.log(`\n${results.length - failed.length - skipped.length}/${results.length - skipped.length} checks passed${skipped.length ? `, ${skipped.length} skipped` : ''}`);
   if (failed.length) {
     console.log(`\n${failed.length} failed:`);
