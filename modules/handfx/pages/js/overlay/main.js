@@ -28,11 +28,21 @@ import { FxRenderer, EFFECTS, anchorsFrom, fenceRectFor } from '../engine/fx.js'
 
 /**
  * `?preview=1` is the pane's live preview (public/src/preview.js appends it). A preview is a
- * viewer, not a source: it must never open the camera or the relay, never POST /ack, and never
- * report draws — otherwise a dead OBS source looks alive because the pane's iframe is painting.
- * It still runs the synthetic rig locally, so the effects are visible.
+ * viewer, not a source: it must never POST /ack, never report draws and never claim the OBS role —
+ * otherwise a dead OBS source looks alive because the pane's iframe is painting. It runs the
+ * synthetic rig locally, so the effects are visible.
  */
 const PREVIEW = new URLSearchParams(location.search).get('preview') === '1';
+/**
+ * `?preview=1&camera=1` is the pane's camera preview: the operator watching themselves and
+ * confirming tracking is live. Still a preview (no ack, no beat, no OBS role, no reload loop) but
+ * it acquires like a normal page — relay, tracker, and the camera underlay under the effects.
+ * Keyed on `preview` too, so the OBS document can never reach it: the OBS source paints effects
+ * only, never camera pixels.
+ */
+const CAMERA_PREVIEW = PREVIEW && new URLSearchParams(location.search).get('camera') === '1';
+/** May this document open the camera, the relay and the tracker at all? */
+const canAcquire = !PREVIEW || CAMERA_PREVIEW;
 /**
  * Which document this is, for the server's supersede rule (core/events.mjs `attach`, and the
  * camera relay's `addClient`): one path, one holder. A reload boots a *new* document at the same
@@ -51,7 +61,11 @@ const BUILD = new URL(import.meta.url).searchParams.get('v') || 'unknown';
  * module is even fetched. Every call is a no-op if that script was stripped (e.g. a hand-edited
  * page), so instrumentation can never be the reason the overlay fails.
  */
-const diag = self.__handfxDiag && typeof self.__handfxDiag.phase === 'function'
+// Every method this module calls on it, not just `phase`: the predicate used to test `phase` alone
+// and the loop then called `phaseList()` on its first frame, so a partial shim — exactly what a
+// harness injects — was selected and threw on tick 1. `clientId` is a property, not a method.
+const DIAG_METHODS = ['phase', 'phaseList', 'report', 'setBuild', 'setClient'];
+const diag = self.__handfxDiag && DIAG_METHODS.every((m) => typeof self.__handfxDiag[m] === 'function')
   ? self.__handfxDiag
   : { phase() {}, report() {}, setBuild() {}, setClient() {}, phaseList() { return []; }, clientId: '' };
 /**
@@ -99,7 +113,9 @@ const GESTURE_EFFECTS = {
 };
 
 const state = {
-  settings: null,
+  // The default document: enabled, no effects, no publisher. A boot whose /status read fails keeps
+  // this, so the loop's own gate (`enabled !== false`) is open and the page still draws.
+  settings: { enabled: true },
   cursor: 0,
   tracking: false,
   camera: 'off', // off | asking | on | denied | held | error
@@ -125,6 +141,9 @@ const state = {
   anchors: 'none', // camera | synthetic | none — where the current frame's anchors came from
   draws: 0, // frames the renderer actually drew: the loop's own counter, reported on /ack
   lastDrawAt: 0,
+  // Diagnostics that threw and were swallowed. A broken or partial shim counts here instead of
+  // reaching the loop: the readout and the phase() breadcrumbs are narration, never the picture.
+  diagFails: 0,
   // performance.now() of the newest tracker frame. A tracking claim without one is stale: the relay
   // reports `running/camera` before its first frame arrives.
   lastFrameAt: 0,
@@ -296,14 +315,17 @@ function setCameraError(stage, name, message) {
  *  probe and recovery, so a read that never settles would freeze all three. */
 let statusInFlight = null;
 const STATUS_TIMEOUT_MS = 8000;
+/** The boot's own read. It races the first frame, so it is bounded to a time no compositor frame
+ *  can notice: a status that lands later is worthless, because the loop must already be drawing. */
+const BOOT_STATUS_MS = 1500;
 
-async function loadStatus() {
+async function loadStatus(timeoutMs = STATUS_TIMEOUT_MS) {
   if (statusInFlight) return statusInFlight;
   statusInFlight = (async () => {
     try {
       const res = await fetch('/api/handfx/status', {
         cache: 'no-store',
-        signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) throw new Error(`status ${res.status}`);
       return await res.json();
@@ -326,18 +348,19 @@ function ratioOf(status) {
   return 'default';
 }
 
-function applySettings(status) {  // Values may arrive bare (the test and the pane's console hand in plain values) or wrapped as
+function applySettings(status = {}) {  // Values may arrive bare (the test and the pane's console hand in plain values) or wrapped as
   // `{ value }` (what server.js serves from settings.describe()). Both are the same document.
+  // No document at all is the default document: enabled, no effects, no publisher.
+  status = status || {};
   const s = {};
   for (const [k, d] of Object.entries(status.settings || {})) s[k] = d && typeof d === 'object' && 'value' in d ? d.value : d;
   const prevSource = state.trackingSource;
   state.settings = s;
   state.status = status;
   state.trackingSource = s.trackingSource === 'camera' || s.trackingSource === 'synthetic' ? s.trackingSource : 'auto';
-  // A preview never writes settings, and a preview of a camera we are not allowed to open would
-  // only show a still; the pane forces the underlay off for its own iframe so the preview is the
-  // effects on the pane's dark backdrop, not a claimed camera picture.
-  state.underlay = !PREVIEW && s.underlay !== false;
+  // The OBS document paints effects only; camera pixels belong to the pane's own camera preview.
+  // `underlay` as a setting is retired and deliberately not consulted.
+  state.underlay = CAMERA_PREVIEW;
   fx.setSettings({
     effects: s.effects && s.effects.length ? s.effects : [],
     intensity: s.intensity || {},
@@ -520,7 +543,9 @@ function scheduleRefresh() {
 function connectBus() {
   // `?role=` names this document to the server, which ends any older bus of the same role before
   // serving this one (see ROLE above). No new parameter for OBS to carry: it is this page's own path.
-  const es = new EventSource(`/events?role=${encodeURIComponent(ROLE)}`);
+  // `clientId` is the same identity the /ack POST carries, so the server can tie this socket to a
+  // client and reap it when that client is superseded instead of waiting out the age cap.
+  const es = new EventSource(`/events?${new URLSearchParams({ role: ROLE, clientId: CLIENT_ID })}`);
   bus = es;
   let retry = 250;
   es.addEventListener('handfx', (ev) => {
@@ -928,7 +953,7 @@ function scheduleCameraRetry(reason) {
 }
 
 async function autoCamera() {
-  if (PREVIEW) return false; // a preview never opens the camera or the relay
+  if (!canAcquire) return false; // a plain preview never opens the camera or the relay
   if (state.trackingSource === 'synthetic') return false; // the operator asked for synthetic only
   if (autoCam.busy) return false;
   // A retry is already armed: a stray caller must not shortcut the backoff.
@@ -1010,28 +1035,8 @@ async function startRelay(opts) {
   return true;
 }
 
-/**
- * The browser's own camera is not reachable on this rig: WebcamSwitcher opens every physical camera
- * in WinRT `ExclusiveControl`, so a second process only ever gets NotReadableError. The device path
- * used to be attempted here as a silent second choice; it is now a report, in plain words, and the
- * relay carries the frames. Reached only when the settings name a `deviceId` (an explicit choice).
- */
-function reportExclusiveControl() {
-  const message =
-    'The camera is held exclusively by WebcamSwitcher, so this page cannot open it directly. The relay camera is used instead.';
-  state.cameraError = {
-    at: Date.now(),
-    stage: 'exclusive',
-    name: 'ExclusiveControl',
-    message,
-  };
-  camLog(`device mode unavailable reason="ExclusiveControl"`);
-  setBanner(message, 'warn');
-  renderState();
-}
-
 async function startTracking({ fromBus = false, synthetic = false } = {}) {
-  if (PREVIEW && !synthetic) return; // a preview never acquires a camera or the relay
+  if (!canAcquire && !synthetic) return; // a plain preview never acquires a camera or the relay
   // A running camera owns the view; a running synthetic rig gives way to a real camera (the
   // overlay starts on synthetic when no camera arrives, so the Start button must still work).
   if (trackingClaimLive()) return;
@@ -1062,11 +1067,6 @@ async function startTracking({ fromBus = false, synthetic = false } = {}) {
     tracker.startSynthetic();
     return;
   }
-  // The relay is the only camera path on this rig: WebcamSwitcher holds every physical camera in
-  // `ExclusiveControl`, so `trackingSource: auto` resolves to the relay alone and a browser
-  // getUserMedia is never tried. An explicit `deviceId` (the operator's own device choice) still
-  // gets an answer, in plain words, and the relay carries the frames anyway.
-  if (s.deviceId) reportExclusiveControl();
   if (await startRelay(opts)) return;
   // Nothing else to try: the retry loop owns the next attempt.
   state.camera = state.relayError ? 'error' : 'off';
@@ -1107,9 +1107,9 @@ function stopTracking({ manual = true, keepView = false } = {}) {
  * and on /ack as `synthetic`, never claimed to be camera input. Returns whether it drew.
  */
 function ensureSyntheticAnchors() {
-  // A preview has no camera to show, so it always runs the rig locally; the pane labels it as the
-  // preview, never as the OBS source.
-  if (state.trackingSource === 'camera' && !PREVIEW) return false; // camera only: never draw a synthetic frame
+  // A plain preview has no camera to show, so it always runs the rig locally; the pane labels it
+  // as the preview, never as the OBS source. A camera preview has camera input like any page.
+  if (state.trackingSource === 'camera' && canAcquire) return false; // camera only: never draw a synthetic frame
   if (trackingClaimLive()) return false; // a camera session owns the view
   // Ask the tracker, never a remembered flag: a camera attempt (and a Stop) closes the rig's frame
   // loop, and `state.synthetic` stayed true across it — the rig was then never restarted, so no
@@ -1415,12 +1415,12 @@ function ack(now = performance.now()) {
       // Does this document need frames? This is the relay's arm signal, carried on the beat that
       // already exists: the server holds the capture while any live page says yes and releases it
       // when none does, so a node restart is recovered by the next ack instead of by a subscription
-      // a reconnect can lose. False in a preview (a viewer, and it never acks anyway), false when
-      // the settings name no camera (`cameraRelay: "off"` — synthetic is correct there) and false
-      // when the operator asked for synthetic only.
-      wantsFeed: !PREVIEW && cameraWanted(state.settings) && state.trackingSource !== 'synthetic',
+      // a reconnect can lose. False when the settings name no camera (`cameraRelay: "off"` —
+      // synthetic is correct there) and false when the operator asked for synthetic only.
+      wantsFeed: canAcquire && cameraWanted(state.settings) && state.trackingSource !== 'synthetic',
       effect: state.effect,
       tracking: state.tracking,
+      tracker: tracker.snapshot(),
       model: state.model,
       hands: state.hands,
       gesture: state.gesture,
@@ -1624,78 +1624,97 @@ function drawDebug(frame, hands, now) {
 let bodyTickAt = 0;
 /** The diagnostic readout's element: written on every loop tick, so it is as live as the paint. */
 const diagEl = document.getElementById('diag');
+/**
+ * A phase() breadcrumb that cannot be the reason the loop stops. A partial or broken shim is
+ * exactly what a harness injects, and a throw here used to strand the frame loop.
+ */
+function guardDiag(name) {
+  try {
+    diag.phase(name);
+  } catch (err) {
+    state.diagFails += 1;
+    diagError('diag-phase', err, `phase ${name}`);
+  }
+}
 function paintDiag() {
   if (!diagEl) return;
-  const ackAge = state.ackOkAt ? Date.now() - state.ackOkAt : -1;
-  const phases = diag.phaseList();
-  diagEl.textContent =
-    `t=${state.loopTicks} d=${state.draws} ack=${ackAge < 0 ? 'never' : ackAge} ` +
-    `fails=${state.ackFails} gate=${ackInFlight ? 1 : 0} ph=${phases.length ? phases[phases.length - 1] : ''}`;
+  try {
+    const ackAge = state.ackOkAt ? Date.now() - state.ackOkAt : -1;
+    const phases = diag.phaseList();
+    diagEl.textContent =
+      `t=${state.loopTicks} d=${state.draws} ack=${ackAge < 0 ? 'never' : ackAge} ` +
+      `fails=${state.ackFails} gate=${ackInFlight ? 1 : 0} ph=${phases.length ? phases[phases.length - 1] : ''}`;
+  } catch (err) {
+    // The readout is narration. Losing it leaves a blank line, not a dead page.
+    state.diagFails += 1;
+    diagError('diag-paint', err, 'paintDiag');
+  }
 }
 function loop(now) {
   // One frame may fail (a GL hiccup, a body bitmap, a broken effect); the loop may not. The frame
-  // is what the page has instead of a sign of life, so the next one is always scheduled, and the
-  // throw still reaches the console instead of being swallowed here.
+  // is what the page has instead of a sign of life, so the next one is scheduled here, first,
+  // before any statement that can throw: a re-arm in a `finally` only runs if the `try` was
+  // entered, and a throw in the diagnostics above it stranded the loop until the 15 s wedge
+  // self-reload. Invariant: every entry schedules exactly one next frame, and nothing between the
+  // entry and that line can throw.
+  requestAnimationFrame(loop);
   // The paint clock, stamped before anything can throw: /ack reports both, so the server can say
   // "not ticking" without guessing.
   state.loopTicks += 1;
   state.lastLoopAt = Date.now();
-  if (state.loopTicks === 1) diag.phase('first-frame');
   // The page's own clock, written where a screenshot can read it: loop ticks, draws, ack age,
   // failures and whether the ack gate is holding. One frame, one answer to mute-versus-dead.
+  // Both are guarded: narration that throws must not be the reason the picture stops.
+  if (state.loopTicks === 1) guardDiag('first-frame');
   paintDiag();
-  try {
-    // The body mask expires 1 s after its last message; checked twice a second, not per frame.
-    if (now - bodyTickAt > 500) {
-      bodyTickAt = now;
-      tickBody();
-    }
-    // The camera picture under the effects: the same surface the tracker is reading (the relay's
-    // frame canvas or the device's video element), so underlay never adds a second decode. Painted
-    // even when the effects are off: the underlay is the camera, not an effect.
-    // `state.synthetic` is a page-side claim, not a fact about this tick: a relay that reported
-    // `running` before a frame arrived leaves it stale, and requiring it here is what kept a live
-    // stream's frames off the screen. The tracker's own frame surface is the fact.
-    const camSurface = state.underlay && state.tracking && tracker.state === 'running'
-      ? tracker.frameSurface()
-      : null;
-    if (camSurface) paintUnderlay(camSurface);
-    if (state.settings && state.settings.enabled !== false && state.settings.obsHandFx !== false) {
-      // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
-      // sees something and the channel is up), each enabled body effect stays alive, so a mask
-      // that goes quiet releases them through the expiry above.
-      if (state.bodySeen) {
-        for (const id of ['bodyonfire', 'bodysmoke', 'frozenbody']) {
-          const live = fx.live.get(id);
-          if (effectiveEffects().includes(id) && (!live || !live.active || live.age > 6)) fx.trigger(id, {});
-        }
-      }
-      fx.render(now, fx.view || {});
-      // What actually reached the canvas: one count per render pass, and when. The pane and a
-      // `curl /status` read these back through /ack instead of assuming the picture is alive.
-      if (fx.supported) {
-        state.draws += 1;
-        state.lastDrawAt = Date.now();
-        if (state.draws === 1) diag.phase('first-draw');
-      }
-    }
-    // Publishing is not on this clock. The publisher owns a `setInterval` at the pipe's frame rate
-    // (publish.js `arm`) and is kicked by frame arrival (`onFrame`), because this loop only runs
-    // while the page paints: in a hidden or paused OBS source the loop stops dead while the camera
-    // stream keeps arriving, which froze `publish` at 2402 frames with `stage: "waiting"`.
-    // The draw truth rides the render loop, not the tracker's frame callback. On the device path
-    // `onFrame` was driven by this page's own rAF, so its `/ack` beat came free; a relayed frame
-    // instead arrives from the stream reader (relay.js `drain`), and a reader that stalls (or a
-    // throw inside `onFrame` before its own ack) left the loop drawing and counting while
-    // `/ack` went quiet, so `/status` showed a frozen `draws` next to a live `publish`.
-    //
-    // /ack is NOT called here any more. It rode this loop, and this loop only exists while Chrome
-    // paints the document: an occluded OBS source delivers no rAF, so the beat went silent while
-    // the page was alive, and /status said `stale` — the wrong fact, hiding the true one (nothing
-    // is being drawn). The beat is the timer below; this loop only reports its own clock.
-  } finally {
-    requestAnimationFrame(loop);
+  // The body mask expires 1 s after its last message; checked twice a second, not per frame.
+  if (now - bodyTickAt > 500) {
+    bodyTickAt = now;
+    tickBody();
   }
+  // The camera picture under the effects: the same surface the tracker is reading (the relay's
+  // frame canvas or the device's video element), so underlay never adds a second decode. Painted
+  // even when the effects are off: the underlay is the camera, not an effect.
+  // `state.synthetic` is a page-side claim, not a fact about this tick: a relay that reported
+  // `running` before a frame arrived leaves it stale, and requiring it here is what kept a live
+  // stream's frames off the screen. The tracker's own frame surface is the fact.
+  const camSurface = state.underlay && state.tracking && tracker.state === 'running'
+    ? tracker.frameSurface()
+    : null;
+  if (camSurface) paintUnderlay(camSurface);
+  if (state.settings && state.settings.enabled !== false && state.settings.obsHandFx !== false) {
+    // Body effects have no hand gesture of their own: while a mask keeps arriving (the body page
+    // sees something and the channel is up), each enabled body effect stays alive, so a mask
+    // that goes quiet releases them through the expiry above.
+    if (state.bodySeen) {
+      for (const id of ['bodyonfire', 'bodysmoke', 'frozenbody']) {
+        const live = fx.live.get(id);
+        if (effectiveEffects().includes(id) && (!live || !live.active || live.age > 6)) fx.trigger(id, {});
+      }
+    }
+    fx.render(now, fx.view || {});
+    // What actually reached the canvas: one count per render pass, and when. The pane and a
+    // `curl /status` read these back through /ack instead of assuming the picture is alive.
+    if (fx.supported) {
+      state.draws += 1;
+      state.lastDrawAt = Date.now();
+      if (state.draws === 1) guardDiag('first-draw');
+    }
+  }
+  // Publishing is not on this clock. The publisher owns a `setInterval` at the pipe's frame rate
+  // (publish.js `arm`) and is kicked by frame arrival (`onFrame`), because this loop only runs
+  // while the page paints: in a hidden or paused OBS source the loop stops dead while the camera
+  // stream keeps arriving, which froze `publish` at 2402 frames with `stage: "waiting"`.
+  // The draw truth rides the render loop, not the tracker's frame callback. On the device path
+  // `onFrame` was driven by this page's own rAF, so its `/ack` beat came free; a relayed frame
+  // instead arrives from the stream reader (relay.js `drain`), and a reader that stalls (or a
+  // throw inside `onFrame` before its own ack) left the loop drawing and counting while
+  // `/ack` went quiet, so `/status` showed a frozen `draws` next to a live `publish`.
+  //
+  // /ack is NOT called here any more. It rode this loop, and this loop only exists while Chrome
+  // paints the document: an occluded OBS source delivers no rAF, so the beat went silent while
+  // the page was alive, and /status said `stale` — the wrong fact, hiding the true one (nothing
+  // is being drawn). The beat is the timer below; this loop only reports its own clock.
 }
 
 /**
@@ -1782,15 +1801,16 @@ try {
     addEventListener('pagehide', bye);
     addEventListener('beforeunload', bye);
     // The cheap half of the socket leak: this document's two long-lived responses are closed as it
-    // goes, so the successor boots with slots to spare. `persisted` means bfcache — the page is
-    // coming back with its sockets intact, so closing them there would break the restored page.
-    // The server's supersede rule is what must hold; this only makes the leak rarer.
-    const release = (ev) => {
-      if (ev && ev.persisted) return;
-      releaseSockets();
-    };
-    addEventListener('pagehide', release);
-    addEventListener('beforeunload', release);
+    // goes, so the successor boots with slots to spare. `persisted` is deliberately not honoured: an
+    // OBS browser source is never restored from bfcache, and the server's supersede rule fires only
+    // inside a handler the successor cannot reach while the predecessor holds all six sockets.
+    addEventListener('pagehide', releaseSockets);
+    addEventListener('beforeunload', releaseSockets);
+    // A page restored from bfcache did lose its bus above; take it back. relay.js does the same for
+    // the camera stream on its own `pageshow`.
+    addEventListener('pageshow', (ev) => {
+      if (ev && ev.persisted && !bus) connectBus();
+    });
   }
 } catch (err) {
   blockWatch = null;
@@ -1842,13 +1862,38 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   // dead page until the camera's 120 s cap frees a slot. The ack is one short POST; the status
   // read it used to wait behind has a late refresh path (`scheduleRefresh`, the boot-step below).
   ack();
+  // The render loop starts here, before the boot's settings read and never gated on it: this page's
+  // job is to draw, and a fetch that is slow, refused, aborted or never answered must not cost the
+  // first frames. `state.settings` already holds the default document, so the loop's own gate is
+  // open from tick 1; the real document lands when it lands, through the read below and through
+  // `scheduleRefresh` once the bus opens.
+  diag.phase('loop-start');
+  requestAnimationFrame(loop);
   try {
-    const status = await loadStatus();
-    applySettings(status);
-    heard = true;
+    const status = await loadStatus(BOOT_STATUS_MS);
+    // `state-loaded` means the boot status request succeeded, so it is emitted the moment the read
+    // resolves and before anything is done with the document. A document this page cannot apply
+    // must not be able to hide a working fetch behind a missing breadcrumb.
     diag.phase('state-loaded');
-    if (!status.runtime || !status.runtime.vendored) setBanner('MediaPipe runtime is not vendored — run the vendor copy step (modules/handfx/vendor/README.md).', 'bad');
+    heard = true;
+    try {
+      applySettings(status);
+    } catch (err) {
+      // The loop already drew the defaults that `state.settings` holds. A document that cannot be
+      // applied is a `boot-step` on the event ring, where the pane can show it.
+      diagError('boot-step', err, 'applySettings (status)');
+    }
+    if (status && (!status.runtime || !status.runtime.vendored)) setBanner('MediaPipe runtime is not vendored — run the vendor copy step (modules/handfx/vendor/README.md).', 'bad');
   } catch (err) {
+    // The loop is already drawing the defaults. Put them through `applySettings` anyway (the
+    // renderer's own settings, the underlay, the publisher), then report the missing document on
+    // the banner and on the page's event ring, so a failed boot read is never again silent.
+    try {
+      applySettings();
+    } catch (e) {
+      diagError('boot-step', e, 'applySettings (defaults)');
+    }
+    diagError('boot-step', err, 'boot status');
     setBanner(`Cannot read /api/handfx/status: ${err.message}`, 'bad');
   }
   // A preview listens to the bus for nothing: every command it could receive would act on the
@@ -1883,13 +1928,13 @@ for (const b of document.querySelectorAll('[data-act="stop"]')) b.addEventListen
   } catch (err) {
     diagError('boot-step', err, 'ensureSyntheticAnchors');
   }
-  diag.phase('loop-start');
-  requestAnimationFrame(loop);
+  // The loop is already running: `loop-start` and the rAF request are issued before the boot's
+  // settings read, so nothing above can leave this page without frames.
   // The load attempt, without a gesture: an OBS browser source is never clicked, so a camera only
   // opens here if this page asks for it itself (`auto` and `camera`; `synthetic` skips it).
   autoCamera().catch((err) => diagError('boot-step', err, 'autoCamera'));
   document.addEventListener('visibilitychange', () => {
-    if (PREVIEW) return; // a preview never acquires, and never "recovers" a source it is not
+    if (!canAcquire) return; // a plain preview never acquires, and never "recovers" a source it is not
     if (document.visibilityState === 'visible') {
       // Shown again: a fresh backoff, because the camera may have changed hands while hidden.
       clearCameraRetry();
