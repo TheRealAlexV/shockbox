@@ -209,6 +209,9 @@ export const CMDS = [
   'effect.prev',
   'effect.set',
   'tracking.toggle',
+  // The admin pane's three controls: `{mode: 'camera' | 'synthetic' | 'off'}`. Same publish-only
+  // path as `tracking.toggle`; the page owns what it does with it.
+  'tracking.set',
   'mirror.toggle',
   'projectile.fire',
   'edit.clear',

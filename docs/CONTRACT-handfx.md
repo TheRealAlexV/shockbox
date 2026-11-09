@@ -71,6 +71,7 @@ one-shot.
 | `effect.next` / `effect.prev` | — | publish only; the page owns the cursor and reports it on `/ack` |
 | `effect.set` | `{value: [ids]}` or `{id}` | with `value`: validates every id, writes `settings.effects`, publishes; with `id`: validates and publishes (the page moves its cursor) |
 | `tracking.toggle` | — | flips `settings.enabled`, publishes with `{enabled}`, answers `{enabled, settings}` |
+| `tracking.set` | `{mode: 'camera'\|'synthetic'\|'off'}` | publish only; the page starts the camera, starts the synthetic rig, or stops. Acted on by the OBS source, which is the only document with a bus |
 | `mirror.toggle` | — | flips `settings.mirror`, publishes with `{mirror}`, answers `{mirror, settings}` |
 | `projectile.fire` | `{skin?: 'projectile'\|'heart'}` | records `settings.skins.shoot` when `skin` is given, publishes |
 | `edit.clear` | — | publish only; the page wipes the operator's drawn canvas |
@@ -275,6 +276,7 @@ the pane's skin switch and `projectile.fire {skin}` (`server.js:274-278`, which 
 | `effect.prev` | — | page | `{ok, seq}` |
 | `effect.set` | `{value: [effectId, …]}` — or legacy `{id: effectId}` | server writes `settings.effects` on `value`, else publishes | `{ok, changed, settings}` with `value`; `{ok, seq}` with `id`; 400 `unknown effect: …` |
 | `tracking.toggle` | — | server flips `settings.enabled` | `{ok, changed, enabled, settings}` |
+| `tracking.set` | `{mode: 'camera'\|'synthetic'\|'off'}` | page (the OBS source) starts or stops tracking; an idempotent mode is a no-op | `{ok, seq}` |
 | `mirror.toggle` | — | server flips `settings.mirror` | `{ok, changed, mirror, settings}` |
 | `projectile.fire` | `{skin?: 'projectile'\|'heart'}` | server records `settings.skins.shoot` when `skin` is given, then publishes | `{ok, seq}`; 400 `unknown skin: …` |
 | `edit.clear` | — | page wipes the operator's drawn canvas | `{ok, seq}` |
@@ -337,7 +339,9 @@ With only a preview open, `/status` reports `draws: 0`, `effectiveSource: "none"
 ## Privacy
 
 `getUserMedia` runs only from a user gesture (the pane's Start preview, the overlay's Start
-camera). `tracking.toggle` only starts a camera the page was already given. `/ack` is a status
+camera). `tracking.toggle` only starts a camera the page was already given. `tracking.set` from
+the pane is an explicit operator start and opens the same 20 s gesture window a press on the page
+would, without removing that guard. `/ack` is a status
 line (≤2/s in practice); no frame, landmark, mask or use-time intensity is ever sent.
 
 ## State files (`state/handfx/`)

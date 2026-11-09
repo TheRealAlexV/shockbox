@@ -56,9 +56,9 @@
     },
     "underlay": {
       "type": "boolean",
-      "default": true,
-      "label": "Camera picture under the effects",
-      "help": "On: the overlay page draws the camera it is reading beneath the effects, so the page is the picture. Off: the effects sit on a transparent page, which is what an OBS source laid over a camera source wants. Read by the page; the pane's live preview forces it off in its own iframe only (it never writes this setting).",
+      "default": false,
+      "label": "Camera picture under the effects (pane preview only)",
+      "help": "On: the admin pane's live preview draws the camera it is reading beneath the effects, so the operator sees what the tracker sees. Off (the default, matching the explicit toggle): the preview shows the effects over the dark backdrop. Read by the pane only, which puts ?camera=1 on its preview iframe; the OBS source never reads it, so this can never put camera pixels on air.",
       "group": "general"
     },
     "publish": {

@@ -112,6 +112,16 @@
   color: var(--fg-3);
 }
 .hfx-actions { flex-wrap: wrap; }
+/* The three tracking controls: start on the camera, start on the synthetic rig, stop. The active
+   one takes the same accent as the status pills above (`[data-tone='info']`); the "now:" line in
+   the card states it in words too, so the state is never colour alone. */
+.hfx-track-actions { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.hfx-track-actions .btn { flex: 0 0 auto; }
+.hfx-track-actions .btn[data-active='true'] {
+  color: var(--info);
+  border-color: rgba(111, 179, 255, 0.45);
+  background: rgba(111, 179, 255, 0.12);
+}
 .hfx-switch { flex: 0 0 auto; }
 .hfx-slider { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
 .hfx-slider input[type='range'] { flex: 1 1 auto; min-width: 60px; accent-color: var(--accent); }

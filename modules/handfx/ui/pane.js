@@ -53,7 +53,9 @@ export async function render(container, ctx) {
     settings: {}, // plain values from the settings describe
     page: null, // last honest status line from the overlay
     live: new Map(), // effect id -> {startedAt, hands, gesture} (from the overlay's reports)
-    underlay: true, // the camera feed under the effects; off leaves the dark backdrop
+    // The camera under the effects, in **this pane's preview only**: the toggle puts `?camera=1` on
+    // the preview iframe. Off by default — an explicit toggle — and the OBS source never reads it.
+    underlay: false,
     log: [],
     // Camera card. The device list is read once and only re-enumerated on a button press: listing
     // DirectShow launches the virtual-camera clients, so it is never polled.
@@ -85,6 +87,11 @@ export async function render(container, ctx) {
   const pendingCmds = []; // { name, args } for /api/handfx/cmd, or { name, restart: true }
   let applying = false;
   let applyBtn = null; // the header's Apply button; rebuilt with the header
+  // The underlay checkbox, built once in the preview header and re-synced by every refresh, so it
+  // can never keep showing a value the server (or the queue) no longer has.
+  let underlayInput = null;
+  /** Did a write get collected instead of sent? Auto Apply off makes patch() and bus() queue. */
+  const wasQueued = (out) => Boolean(out && (out.queued === true || (out.res && out.res.queued === true)));
 
   // The pane asks OBS's body source to start or stop on the control channel. It never publishes a
   // mask and never opens the body camera: pages/js/body/main.js owns 'handfx.body' publishing.
@@ -95,10 +102,14 @@ export async function render(container, ctx) {
   async function refresh() {
     s.status = await api.get('/api/handfx/status');
     s.settings = Object.fromEntries(Object.entries(s.status.settings || {}).map(([k, d]) => [k, d.value]));
-    s.underlay = s.settings.underlay !== false;
+    s.underlay = s.settings.underlay === true;
     // A poll just replaced the document: put the queued edits back on top of it, so the pane
     // keeps showing what Apply will send instead of snapping to the OBS source's old values.
     paintQueued();
+    // After paintQueued, never before: a queued `underlay` overwrites the server's value, and the
+    // checkbox and the preview's URL have to follow the value the pane is now showing. This also
+    // covers applyPending, which ends in refresh() after the queue has been sent.
+    syncUnderlay();
     return s.status;
   }
 
@@ -157,7 +168,7 @@ export async function render(container, ctx) {
   /** Show collected edits on the pane the way a server answer would, so nothing snaps back. */
   function mirrorQueuedPatch(patchObj) {
     s.settings = { ...s.settings, ...patchObj };
-    if ('underlay' in patchObj) s.underlay = patchObj.underlay !== false;
+    if ('underlay' in patchObj) s.underlay = patchObj.underlay === true;
   }
 
   /** Re-assert the queued view after a poll replaced s.settings with the server's document. */
@@ -471,14 +482,28 @@ export async function render(container, ctx) {
   let bodyPillEl = null;
   let bodyBeatEl = null;
 
+  /**
+   * The preview document's URL. `?camera=1` is the *one* thing that makes the page draw the camera
+   * under the effects (`main.js` CAMERA_PREVIEW); it is put here and nowhere else, so the OBS source
+   * — mounted without it — can never be given camera pixels by this toggle.
+   */
+  const previewSrcFor = (on) => (on ? '/shockfx?camera=1' : '/shockfx');
+  const previewSrc = () => previewSrcFor(s.underlay === true);
+  /** Point the checkbox and the preview at `s.underlay`. `setSrc` is a no-op when the URL already
+   *  matches, so the poll can call this on every tick without reloading the document. */
+  function syncUnderlay() {
+    if (underlayInput) underlayInput.checked = s.underlay === true;
+    pv?.setSrc(previewSrc());
+  }
+
   function previewCard() {
     if (!pv) {
       pv = mountPreview(previewHost, {
         title: 'Preview',
-        // A preview draws synthetic hands and forces the underlay off in its own iframe; say so,
-        // so the operator never reads the preview as the OBS source's exact look.
-        hint: 'live /shockfx · synthetic hands, underlay off in this preview',
-        src: '/shockfx',
+        // The preview is the overlay page itself, so it draws what OBS draws — except the camera
+        // underlay, which is this pane's own toggle and never reaches the source.
+        hint: 'live /shockfx · synthetic hands · camera underlay below',
+        src: previewSrc(),
         interactive: false,
         // The 9:16 collision column the particles are fenced to (`engine/fx.js`
         // fenceRectFor(9:16)` at 16:9: full height, w = 9/16 · h/w), in the preview frame's
@@ -770,10 +795,71 @@ export async function render(container, ctx) {
     return card;
   }
 
+  /**
+   * What the OBS source's tracker is doing, from /status. `tracker` is the overlay's own report
+   * (`state` + `source`), `cameraSource` the pipe carrying frames. `available: false` reads as
+   * "unknown" — the page has not reported, or has gone quiet — never as "off", so no control can
+   * be lit from a guess.
+   */
+  function trackingState() {
+    const st = s.status || {};
+    const tr = st.tracker || {};
+    if (!tr.available) return { mode: 'unknown', text: tr.reported ? 'page stopped reporting' : 'page has not reported' };
+    // The tracker's own vocabulary is idle | starting | running | error. `starting` is the relay and
+    // model load, a second or two: calling that "stopped" is the lie this card exists to avoid.
+    if (tr.state === 'starting') return { mode: 'starting', text: 'starting…' };
+    if (tr.state === 'error') return { mode: 'off', text: 'failed (camera note below)' };
+    if (tr.state !== 'running') return { mode: 'off', text: 'stopped' };
+    if (tr.source === 'synthetic' || st.cameraSource === 'synthetic') return { mode: 'synthetic', text: 'synthetic rig' };
+    return { mode: 'camera', text: `camera${st.cameraSource === 'relay' ? ' (relay)' : ''}` };
+  }
+
+  /**
+   * The three tracking controls. They post `tracking.set {mode}` through the pane's own bus helper,
+   * so a change reaches the OBS source — the real overlay — and never the preview: that iframe is
+   * inert, opens no bus, and is a viewer by construction. Which button reads as pressed comes from
+   * /status, not from the last click.
+   */
+  function trackingActions(now) {
+    const box = el('div', { class: 'hfx-track-actions' });
+    const mk = (label, mode, title) => {
+      const on = now.mode === mode;
+      const b = el('button', { type: 'button', class: `btn btn-sm${on ? '' : ' btn-quiet'}`, text: label, title });
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      if (on) b.dataset.active = 'true';
+      b.disabled = on; // the state the page reports: pressing it again would only restart it
+      b.addEventListener('click', async () => {
+        try {
+          const out = await bus('tracking.set', { mode });
+          if (signal.aborted) return;
+          const queued = wasQueued(out);
+          // "Sent" is the server accepting the command, not the camera starting: the page can still
+          // refuse it, so the button never claims the state — the pill and `now:` line read /status.
+          push(queued
+            ? `tracking.set ${mode} queued — Apply sends it to the OBS source`
+            : `tracking.set ${mode} sent to the OBS source; the state below is what it reports`,
+          queued ? 'warn' : 'ok');
+          scheduleRefresh();
+        } catch (err) {
+          push(`tracking.set ${mode}: ${err.message}`, 'bad');
+          render();
+        }
+      });
+      return b;
+    };
+    box.append(
+      mk('Start camera', 'camera', 'Starts the camera on the OBS source (the overlay page), not in this preview.'),
+      mk('Start synthetic', 'synthetic', 'Starts the synthetic rig on the OBS source: two hands, no camera is opened.'),
+      mk('Stop', 'off', 'Stops tracking on the OBS source. A stop is not a camera failure, so no fallback rig starts.'),
+    );
+    return box;
+  }
+
   function trackingCard() {
     const card = el('section', { class: 'panel' });
     const src = effectiveSource();
     const loop = renderLoop();
+    const now = trackingState();
     card.append(el('div', { class: 'panel-head' },
       el('span', { class: 'panel-title', text: 'Tracking' }),
       el('span', { class: 'hfx-pill', 'data-tone': src.tone, text: src.text }),
@@ -781,6 +867,8 @@ export async function render(container, ctx) {
     const body = el('div', { class: 'panel-body hfx-fields' });
     body.append(
       row('effects enabled', switchControl('enabled', s.settings.enabled !== false, async (v) => { await patch('enabled', v); if (v) await bus('tracking.toggle').catch(() => {}); })),
+      row('tracking', trackingActions(now)),
+      el('div', { class: 'hfx-note', text: `now: ${now.text}` }),
       // The persisted hand source. The pill above shows what it resolved to right now, so `auto`
       // that fell back to the rig is visible without reading the camera error.
       row('hand source', selectControl('trackingSource', s.settings.trackingSource || 'auto', (s.status?.settings?.trackingSource?.values) || ['auto', 'camera', 'synthetic'], (v) => patch('trackingSource', v))),
@@ -1023,20 +1111,32 @@ export async function render(container, ctx) {
   // remade), so the WebGL context survives the pane's status refresh.
   function underlayToggle() {
     const input = el('input', { type: 'checkbox', id: 'hfx-underlay' });
-    input.checked = s.underlay !== false;
+    input.checked = s.underlay === true;
+    underlayInput = input; // the poll keeps it honest (see refresh)
     input.addEventListener('change', async () => {
       const want = input.checked;
       s.underlay = want;
       try {
-        await patch('underlay', want);
-        push(`underlay ${want ? 'on' : 'off'}`, 'ok');
+        const out = await patch('underlay', want); // persisted for the next panel load
+        if (signal.aborted) return;
+        const queued = wasQueued(out);
+        // From `want`, never from `s.underlay`: a poll that lands while this PATCH is in flight
+        // puts the server's old value back, and reading it here reloaded the iframe without the
+        // camera even though the server had just stored `true`.
+        pv?.setSrc(previewSrcFor(want));
+        // With Auto Apply off this is the pane's queued view of what Apply will send (the pane shows
+        // queued edits everywhere); nothing is stored yet, and the message says so.
+        push(queued
+          ? `underlay ${want ? 'on' : 'off'} queued — Apply sends it; this preview shows it now`
+          : `underlay ${want ? 'on' : 'off'} in this preview`, queued ? 'warn' : 'ok');
       } catch (err) {
         s.underlay = !want;
         input.checked = !want;
+        pv?.setSrc(previewSrcFor(!want));
         push(`underlay refused: ${err.message}`, 'bad');
       }
     });
-    return el('label', { class: 'hfx-underlay', title: 'the camera feed under the effects' },
+    return el('label', { class: 'hfx-underlay', title: 'the camera feed under the effects, in this preview only — never in the OBS source' },
       input, el('span', { class: 'hfx-note', text: 'Underlay' }));
   }
 
