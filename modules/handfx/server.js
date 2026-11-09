@@ -27,7 +27,7 @@ import { createPublisher } from './publish-pipe.mjs';
 import { BOUNDARY, createCameraRelay } from './camera-relay.mjs';
 // The document identity a request declares (`?role=`) or inherits (its `Referer` path), shared with
 // the SSE hub so both long-lived responses are superseded by the same rule.
-import { roleOf, refPath, validRole } from '../../core/events.mjs';
+import { roleOf, refPath, validRole, clientIdOf } from '../../core/events.mjs';
 // Enumeration launches the virtual-camera client DLLs, so it is only ever reached from the two
 // explicit /cameras routes — never from `status()`, which the pane polls at 1 Hz.
 import { list as listCameras, rescan as rescanCameras, configuredSource } from './camera-list.mjs';
@@ -142,6 +142,27 @@ const CLIENTS_TTL_MS = 10 * 60 * 1000;
  * not on the page's cooperation, is what makes the six-per-origin budget self-healing.
  */
 const CLIENT_REAP_MS = 180_000;
+/**
+ * A registered client whose `lastAckAt` has not moved for this long is a document that no longer
+ * exists: at the page's 500 ms cadence this is 120 missed acks, six times `PAGE_FRESH_MS` and a
+ * third of `CLIENT_REAP_MS`. Long enough that a throttled timer or a GC pause cannot trip it;
+ * short enough that a duplicate removed from OBS hours ago stops being counted as a client and
+ * stops holding a reader slot. The census flags `frozen-ack` at this same line, and it is the only
+ * line the registry prunes on: hidden is not a prune reason (a non-composited source still acks)
+ * and neither is a beat, so `page-mute` stays diagnosable for this window and then goes.
+ */
+const CLIENT_ACK_GONE_MS = 60_000;
+/**
+ * The long-lived responses one document may declare: its one bus response (`/events`) and at most
+ * one camera stream (`main.js` opens the stream only when the camera is wanted). More than this
+ * under one `clientId` is a leaked predecessor, and the census names it.
+ */
+const LONG_LIVED_PER_CLIENT = 2;
+/**
+ * CEF's per-origin socket cap: six. At six, a page has no slot left for its ack POST or its beat
+ * `<img>`, so the census names that state instead of letting it read as a starved page.
+ */
+const SOCKET_BUDGET = 6;
 /**
  * The worker's own clock. `workerTicks` counts ticks posted from the page's ack worker, a thread
  * the render loop cannot occupy; `workerTickAt` is when the last one landed. Kept as a counter
@@ -363,14 +384,12 @@ function build(ctx) {
   // Body-tracking status: updated only by the overlay's /ack (a timestamp, never a frame) and by
   // the body page's own /ack. Read back on /status so the pane can say whether a mask is arriving.
   const body = { lastMaskAt: 0, pageOpen: false, lastPoseAt: 0 };
-  // The overlay's draw truth, reported on /ack: how many frames it rendered, where the anchors came
-  // from, and when the last frame landed. Counters and a name, never a frame. `loopTicks`/
-  // `lastLoopAt` are the paint clock beside /ack: they freeze when Chrome stops compositing the
-  // document, while `lastAckAt` keeps moving, which is what separates "not drawing" from "gone".
-  const draw = {
-    draws: 0, anchors: 'none', lastDrawAt: 0, lastAckAt: 0, build: '',
-    loopTicks: 0, lastLoopAt: 0, hidden: null, visibility: '',
-  };
+  // What one ack can say that no client record holds: the anchor source a page from before
+  // `clientId` existed still reaches `freshestPage` through, the last-ack stamp that fallback reads,
+  // the bundle in flight, and the tracker's last report. Everything else the page reports is per
+  // document now — it lives on the client record `touchClient` writes — so nothing here can latch a
+  // dead predecessor's maximum over a live page.
+  const draw = { anchors: 'none', lastAckAt: 0, build: '', tracker: null };
   // The page's own error reports (POST /page-event), newest first. Overlay-only and additive: the
   // page buffers its own ring too, but a page that dies cannot be asked, so the server keeps the
   // last 50 it heard. Each entry carries the reporting clientId and build.
@@ -467,6 +486,9 @@ function build(ctx) {
   const BUS_MAX_MS = Number(process.env.SHOCKBOX_STREAM_MAX_MS) || 300_000;
   const streams = new Map();
   let streamSeq = 0;
+  // The standing invariant published as `census.violations`; rebuilt on every status read by
+  // `sweepClients`. Empty is the healthy state.
+  let lastCensusViolations = [];
   // Closed responses, newest first: a cap close is the deterministic release an ack waits on, and
   // this ring is how /status shows it without anyone tailing the log.
   const streamRing = [];
@@ -544,11 +566,19 @@ function build(ctx) {
           path: '/events',
           role: roleOf(req),
           ref: refPath(req),
-          // The bus's request carries no clientId (see `attach` in the page): it is owned by role.
+          // The ack identity the document declared on its own URL (`?clientId=`), the same id it
+          // posts to `/ack`. With it, `relay.endClient`/`events.endClient` can end this response —
+          // without it the bus is `unowned` and lives only until its age cap. Absent is `null`,
+          // which is exactly the old behaviour for a page cached before the parameter existed.
           // `client=` is a human label, not the ack identity, so it is reported and never matched.
-          clientId: null,
+          clientId: clientIdOf(req),
           label: opts && typeof opts.client === 'string' ? opts.client.slice(0, 64) : null,
           remote: req.socket?.remoteAddress || '?',
+          // The socket's own two ends, so this row can be matched to a CEF-side socket in a census
+          // of `obs-browser-page`: identity on the wire is the only thing a long-lived response
+          // cannot otherwise be found by.
+          localPort: req.socket?.localPort ?? null,
+          remotePort: req.socket?.remotePort ?? null,
           born: Date.now(),
           cap: BUS_MAX_MS,
         });
@@ -574,11 +604,13 @@ function build(ctx) {
 
   /**
    * The census as /status reads it. `current` is asked of the identity the response declared: the
-   * freshest ack of its role. A response whose role already has a newer holder is a *predecessor*
-   * that was expected to be closed and was not — the row an operator needs to see. A stream with no
-   * clientId is `unowned`: `relay.endClient` can never end it.
+   * relay's live consuming reader first (`consuming` outranks ack recency, because only the reader
+   * being handed frames at 30 fps can be the one taking them), then the freshest ack of its role.
+   * A response whose role already has a newer holder is a *predecessor* that was expected to be
+   * closed and was not — the row an operator needs to see. A stream with no clientId is `unowned`:
+   * no `endClient` can match it, so only its age cap frees it.
    */
-  function streamCensus(now) {
+  function streamCensus(now, consuming) {
     const freshest = new Map();
     for (const c of clientsById.values()) {
       if (!c.role) continue;
@@ -588,11 +620,17 @@ function build(ctx) {
     const rows = [];
     for (const rec of streams.values()) {
       const holder = rec.role ? freshest.get(rec.role) || null : null;
-      const current = !holder
-        ? null
-        : rec.clientId
-          ? holder.id === rec.clientId
-          : rec.born >= (holder.firstAckAt || holder.lastAckAt || 0);
+      // Consuming outranks ack recency: the relay hands a reader 30 frames a second only to the
+      // response that is actually taking them, which a predecessor that merely acks more recently
+      // cannot claim. Recency alone labelled the live 30 fps reader a `predecessor`.
+      const streaming = Boolean(rec.path === '/api/handfx/camera/stream' && rec.clientId && consuming && consuming.has(rec.clientId));
+      const current = streaming
+        ? true
+        : !holder
+          ? null
+          : rec.clientId
+            ? holder.id === rec.clientId
+            : rec.born >= (holder.firstAckAt || holder.lastAckAt || 0);
       rows.push({
         path: rec.path,
         role: rec.role || null,
@@ -600,6 +638,16 @@ function build(ctx) {
         label: rec.label || null,
         clientId: rec.clientId || null,
         owner: rec.clientId ? (clientsById.has(rec.clientId) ? 'acked' : 'unknown') : 'unowned',
+        // Why this row cannot be reaped by `endClient`, when that is the case: no identity on the
+        // request, or one that never acked here. `owner: unowned` alone was the misleading half of
+        // the old reading — the row said who did not own it and never why.
+        ownerReason: rec.clientId
+          ? (clientsById.has(rec.clientId) ? null : 'clientId never acked on this server')
+          : 'request carried no clientId',
+        // The socket's two ends and when the response opened: the row's per-socket identity.
+        localPort: rec.localPort ?? null,
+        remotePort: rec.remotePort ?? null,
+        since: rec.born,
         current,
         predecessor: current === false,
         ageMs: Math.max(0, now - rec.born),
@@ -647,6 +695,61 @@ function build(ctx) {
    */
   function fresh(at, value) {
     return at && Date.now() - at <= PAGE_FRESH_MS ? value : null;
+  }
+
+  // A page-reported string, shortened and typed. Same rule as the numbers beside it: the payload
+  // carries a copy of what the page said, never a reference to an object of the page's choosing.
+  const pageStr = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
+
+  /**
+   * Which browser answered: the User-Agent of the request that created or touched a client, bounded
+   * like every other page-reported string. Captured from the `/ack` or `/beat` that registered the
+   * record. Acks may arrive from the page's worker, whose User-Agent is the same as the page's first
+   * HTTP request; a client that sends none leaves this `null` (not captured) rather than a guess.
+   */
+  const clientUa = (req) => pageStr(req && req.headers ? req.headers['user-agent'] : '', 200) || null;
+
+  /**
+   * The path the document is actually on, in fallback order: the page's own report (`role`, which
+   * the overlay sets to `location.pathname`), else its Referer's pathname, else the path of the
+   * request that registered it. A page that says where it is is believed over any header; the
+   * Referer covers one from before `role` existed. `validRole` is the same charset bound `role`
+   * itself uses.
+   */
+  const clientPath = (req, roleIn) =>
+    validRole(roleIn) ||
+    refPath(req) ||
+    pageStr(req && typeof req.url === 'string' ? req.url.split('?')[0] : '', 200) ||
+    null;
+
+  /**
+   * The tracker's own report, made unambiguous. The tracker runs in the page, so this server only
+   * ever repeats what the last ack said — and `reported` says whether one ever arrived, which is a
+   * different question from `available` (is it still fresh) and from `hands` (is anything in front
+   * of the camera). `null` collapsed "no page has ever reported" and "the page reported zero hands"
+   * into one value, which is why a dead tracker and an empty frame used to read the same.
+   *
+   *   reported:false  → no ack has ever carried a tracker block; nothing is known
+   *   reported:true, available:false → one did, but it is older than PAGE_FRESH_MS; `ageMs` says how
+   *   available:true  → the full report, and `hands: 0` there means "tracking, nothing in view"
+   */
+  function trackerStatus(now) {
+    if (!draw.tracker) {
+      return { origin: 'page', available: false, reported: false, reason: 'page has not reported tracker state' };
+    }
+    const ageMs = draw.lastAckAt ? Math.max(0, now - draw.lastAckAt) : null;
+    if (ageMs == null || ageMs > PAGE_FRESH_MS) {
+      return {
+        origin: 'page',
+        available: false,
+        reported: true,
+        ageMs,
+        reason: ageMs == null
+          ? 'tracker state arrived without an ack clock'
+          : `page last reported tracker state ${Math.round(ageMs / 1000)} s ago`,
+      };
+    }
+    return { origin: 'page', available: true, reported: true, ageMs, ...draw.tracker };
   }
 
   /**
@@ -739,7 +842,7 @@ function build(ctx) {
         reason: page
           ? beatFresh
             ? `page mute: ${page.lastAckAt ? `no ack for ${aged(pageAckAgeMs)}` : 'no ack ever'} but beating ${aged(pageBeatAgeMs)} ago (ticks ${page.beatTicks || 0}, draws ${page.beatDraws || 0}) — alive and drawing, not reporting`
-            : `page dead: no ack for ${aged(pageAckAgeMs)} and no beat for ${aged(pageBeatAgeMs)} — the page is gone`
+            : `page dead: ${page.lastAckAt ? `no ack for ${aged(pageAckAgeMs)}` : 'no ack ever'} and ${page.beatAt ? `no beat for ${aged(pageBeatAgeMs)}` : 'no beat ever'} — the page is gone`
           : 'page dead: no page has ever acked or beaten',
       };
     }
@@ -766,7 +869,7 @@ function build(ctx) {
         : null,
       reason: streamLive
         ? `feed live, page live on the stream: ${streamReader.sent} frames sent to reader ${streamReader.clientId}, last ${aged(streamReader.sentAgeMs)} ago, ${streamReader.buffered} B queued${pageFresh ? `; ack ${aged(pageAckAgeMs)} ago` : `; no ack for ${aged(pageAckAgeMs)} — the ack path is starved, not the page`}`
-        : loopStale
+        : loopStale === true
           ? `feed live, page live: ack ${aged(pageAckAgeMs)} ago, but its loop has not advanced for ${aged(now - (page.loopAdvAt || now))} — reporting, not drawing`
           : `feed live, page live: ack ${aged(pageAckAgeMs)} ago, reporting ${source}`,
     };
@@ -796,7 +899,11 @@ function build(ctx) {
   function candidateRank(c, now, consuming) {
     const streaming = Boolean(consuming && c.id && consuming.has(c.id));
     const ackFresh = c.lastAckAt > 0 && now - c.lastAckAt <= PAGE_FRESH_MS;
-    const drawing = streaming || (ackFresh && c.loopTicks > 0 && !clientLoopStale(c, now));
+    // A hidden document is not drawing on air, however recently it acked: an occluded OBS source
+    // gets no `requestAnimationFrame`, so it can keep acking a loop it is not running. It can still
+    // be a role's liveness answer (see `clientAlive`); it just cannot win the draw title.
+    const visible = c.hidden !== true;
+    const drawing = visible && (clientDrawing(c, now) || (ackFresh && c.loopTicks > 0 && clientLoopStale(c, now) === false));
     return [drawing ? 2 : ackFresh ? 1 : 0, Math.max(c.lastAckAt || 0, streaming ? Number.MAX_SAFE_INTEGER : 0)];
   }
 
@@ -850,16 +957,37 @@ function build(ctx) {
    * nothing, and `silentLogged` is what keeps the line off every subsequent poll.
    */
   function sweepClients(now) {
+    // The invariant is read BEFORE the reap: a response that trips a predicate is reported on the
+    // read that heals it, so the violation is observable instead of being closed out of existence
+    // in the same pass. Published as `census.violations`; empty means healthy.
+    lastCensusViolations = violationsNow(now);
     for (const [id, c] of clientsById) {
+      // No ack for a minute is a document that is gone: the page acks every 500 ms (`ACK_MS`), and
+      // nothing makes a live renderer miss 120 of them in a row. This is what stops
+      // `cameraFeed.clientCount` counting a duplicate removed from OBS an hour ago. Acks only,
+      // deliberately: `hidden` is legitimate (a non-composited source still acks) and a beat is not
+      // an ack, so a mute page stays diagnosable for this window and its row goes when the acks
+      // themselves stopped. `violationsNow` has already read the invariant above, so the pass that
+      // prunes also reports.
+      if (c.lastAckAt && now - c.lastAckAt > CLIENT_ACK_GONE_MS) {
+        const ended = relay.endClient(id);
+        const busEnded = events.endClient(id);
+        clientsById.delete(id);
+        log.info(`handfx page: pruned clientId=${id}: no ack for ${Math.round((now - c.lastAckAt) / 1000)}s, ended=${ended} stream(s), ${busEnded} bus response(s)`);
+        continue;
+      }
       // A beat is proof of life too: a mute page (acks broken, beats arriving) must not be swept
       // out from under the truth table just because its ack path is the thing that failed.
       const silentFor = now - Math.max(c.lastAckAt || 0, c.beatAt || 0);
       if (silentFor > CLIENT_REAP_MS) {
         // Silence, not cooperation: end the readers this document still holds so the next ack of a
-        // live successor can get a socket at all.
+        // live successor can get a socket at all. Both long-lived responses it owns are reaped —
+        // the camera stream and the bus response — because either one left open burns a slot out of
+        // CEF's six-per-origin budget, and the bus is the one that starves the ack POST.
         const ended = relay.endClient(id);
+        const busEnded = events.endClient(id);
         clientsById.delete(id);
-        log.info(`handfx page: reaped clientId=${id} after ${Math.round(silentFor / 1000)}s silence, ended=${ended} stream(s)`);
+        log.info(`handfx page: reaped clientId=${id} after ${Math.round(silentFor / 1000)}s silence, ended=${ended} stream(s), ${busEnded} bus response(s)`);
         continue;
       }
       if (silentFor > CLIENTS_TTL_MS) {
@@ -873,21 +1001,108 @@ function build(ctx) {
     }
   }
 
+  /**
+   * The standing invariant: every condition that makes /status untrustworthy, as short named
+   * entries, empty when healthy. Read on the same 1 Hz status pass as the reap and *before* it, so
+   * the pass that heals a condition still reports it. Assertable from a plain GET, no browser.
+   */
+  function violationsNow(now) {
+    const out = [];
+    // One read of both populations, shared by every predicate below and identical to the rows
+    // /status publishes, so the standing check and the census cannot disagree.
+    const consuming = consumingReaders(now);
+    const rows = streamCensus(now, consuming).streams;
+    // budget-exhausted: CEF allows six sockets per origin. At six there is no slot left for the
+    // ack POST or the beat `<img>` — the failure this census exists to name.
+    if (rows.length >= SOCKET_BUDGET) {
+      const oldest = rows.reduce((a, b) => (a.ageMs >= b.ageMs ? a : b));
+      out.push({ kind: 'budget-exhausted', owner: oldest.clientId, path: oldest.path, open: rows.length, budget: SOCKET_BUDGET });
+    }
+    const byOwner = new Map();
+    for (const row of rows) {
+      // unowned-stream: nothing on this row names a live document, so no `endClient` call can end
+      // it by identity. `reason` says which half is missing rather than the old bare `unowned`.
+      if (!row.clientId) {
+        out.push({ kind: 'unowned-stream', path: row.path, role: row.role, localPort: row.localPort, remotePort: row.remotePort, reason: 'request carried no clientId' });
+      } else {
+        const list = byOwner.get(row.clientId);
+        if (list) list.push(row);
+        else byOwner.set(row.clientId, [row]);
+        if (!clientsById.has(row.clientId)) {
+          out.push({ kind: 'unowned-stream', clientId: row.clientId, path: row.path, role: row.role, localPort: row.localPort, remotePort: row.remotePort, reason: 'clientId never acked on this server' });
+        }
+      }
+      // half-closed-unreaped: an open response nobody is speaking for. A row with an owner record
+      // is judged by that owner's silence (ack or beat, so a mute-but-beating page is not swept); a
+      // row with no owner can only be judged by its own age. This is the predicate that catches a
+      // `FinWait1` pair held for ten minutes while the peer still reads it ESTABLISHED.
+      const c = row.clientId ? clientsById.get(row.clientId) || null : null;
+      const silentFor = c ? now - Math.max(c.lastAckAt || 0, c.beatAt || 0) : row.ageMs;
+      if (silentFor <= CLIENT_REAP_MS) continue;
+      out.push({ kind: 'half-closed-unreaped', owner: row.clientId, path: row.path, silentMs: Math.round(silentFor) });
+    }
+    for (const [clientId, list] of byOwner) {
+      // owner-over-budget: one document may declare its bus response and at most one camera
+      // stream. A third row under one clientId is a leaked predecessor, and it is what starves
+      // this page's own ack POST out of the six-socket pool.
+      if (list.length > LONG_LIVED_PER_CLIENT) {
+        out.push({ kind: 'owner-over-budget', clientId, open: list.length, allowed: LONG_LIVED_PER_CLIENT, paths: list.map((r) => r.path) });
+      }
+    }
+    // misattributed: the draw title resolved to a document that is not painting, or the census and
+    // the relay disagree about which response is taking frames.
+    const page = freshestPage(now, consuming);
+    const drawPage = page && Number.isFinite(page.drawCount) ? page : null;
+    if (drawPage && drawPage.hidden === true) {
+      out.push({ kind: 'misattributed', owner: drawPage.id, path: drawPage.pagePath || null, why: 'drawClientId is a hidden document' });
+    }
+    for (const row of rows) {
+      if (row.path !== '/api/handfx/camera/stream') continue;
+      const streaming = Boolean(row.clientId && consuming.has(row.clientId));
+      if (row.current === true && !streaming) {
+        out.push({ kind: 'misattributed', owner: row.clientId, path: row.path, why: 'current response is not in the relay consuming set' });
+      }
+      if (streaming && row.current !== true) {
+        out.push({ kind: 'misattributed', owner: row.clientId, path: row.path, why: 'consuming stream is not current' });
+      }
+    }
+    const streamClients = relay.status().clients;
+    for (const c of clientsById.values()) {
+      const ackAgeMs = c.lastAckAt ? Math.max(0, now - c.lastAckAt) : null;
+      // frozen-ack: a registered client whose `lastAckAt` has stopped moving. Not hidden-dependent:
+      // a non-composited source still acks, so a frozen one is gone, not merely dark.
+      if (ackAgeMs != null && ackAgeMs > CLIENT_ACK_GONE_MS) {
+        out.push({ kind: 'frozen-ack', clientId: c.id, role: c.role || null, ackAgeMs, hidden: c.hidden === true });
+      } else if (streamClients === 0 && !(ackAgeMs != null && ackAgeMs <= PAGE_FRESH_MS)) {
+        // client-not-live: counted in `clientList` while the relay has no reader and this client
+        // has no fresh ack. The population and the verdict disagree, which is how a dead duplicate
+        // read as a client while `cameraFeed.clientCount` stayed 2.
+        out.push({ kind: 'client-not-live', clientId: c.id, role: c.role || null, state: ackAgeMs == null ? 'never-acked' : 'stale', ackAgeMs });
+      }
+    }
+    return out;
+  }
+
   /** One /ack from one page. Registered on the first ack; the first-ack line is once per id. */
-  function touchClient(id, bodyIn, roleIn = null) {
+  function touchClient(id, bodyIn, roleIn = null, req = null) {
     const now = Date.now();
     touchClientCalls += 1;
     if (!clientsById.has(id)) ackNewClient += 1;
     let c = clientsById.get(id);
     if (!c) {
       const source = ['camera', 'synthetic', 'none'].includes(bodyIn.anchors) ? bodyIn.anchors : 'none';
-      c = { id, role: roleIn, firstAckAt: now, lastAckAt: now, lastDrawAt: 0, loopTicks: 0, hidden: null, build: null, source, drawCount: 0, phases: [], silentLogged: false, wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0, beatPhase: '', loopAdvAt: now };
+      c = { id, role: roleIn, userAgent: clientUa(req), pagePath: clientPath(req, roleIn), firstAckAt: now, lastAckAt: now, lastDrawAt: 0, loopTicks: 0, lastLoopAt: 0, hidden: null, visibility: '', effect: null, build: null, source, drawCount: 0, drawSeenCount: -1, drawSeenAt: 0, phases: [], silentLogged: false, wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0, beatPhase: '', loopAdvAt: now };
       clientsById.set(id, c);
       log.info(`handfx page: first ack clientId=${id} role=${roleIn || '-'} build=${typeof bodyIn.build === 'string' ? bodyIn.build : ''} source=${source}`);
     }
     // The document's identity, not its ephemeral clientId: a reload makes a new clientId but keeps
     // the same role, which is what /status groups on.
     if (roleIn) c.role = roleIn;
+    // Identity, captured from whichever request first carried it and never overwritten: a later ack
+    // from the worker may arrive without a User-Agent, and filling only when empty keeps that from
+    // erasing the first capture.
+    if (!c.userAgent) c.userAgent = clientUa(req);
+    if (!c.pagePath) c.pagePath = clientPath(req, roleIn);
     c.lastAckAt = now;
     c.silentLogged = false;
     if (Number.isFinite(bodyIn.draws)) c.drawCount = Math.max(c.drawCount, Math.max(0, bodyIn.draws | 0));
@@ -901,6 +1116,16 @@ function build(ctx) {
       c.loopTicks = Math.max(c.loopTicks, ticks);
     }
     if (typeof bodyIn.hidden === 'boolean') c.hidden = bodyIn.hidden;
+    // The effect this document believes is current, as the page computes it every frame from its
+    // *applied* list (`state.effect`, null when that list is empty). It is the page's own answer to
+    // "is there anything visible to draw": a failed boot status read applies no effects, so every
+    // `fx.trigger` refuses and this reads null while the render loop keeps ticking. Used by
+    // `drawing` only — never by the pass counters, which stay a liveness signal.
+    c.effect = typeof bodyIn.effect === 'string' && bodyIn.effect ? bodyIn.effect.slice(0, 64) : null;
+    // The paint clock's own wall-clock stamp and the document's visibility, per page: a page whose
+    // loop stopped and a hidden one are the two states that look identical from the headline count.
+    if (Number.isFinite(bodyIn.lastLoopAt) && bodyIn.lastLoopAt > c.lastLoopAt) c.lastLoopAt = Math.min(now, bodyIn.lastLoopAt);
+    if (typeof bodyIn.visibility === 'string' && bodyIn.visibility.length <= 16) c.visibility = bodyIn.visibility;
     if (typeof bodyIn.build === 'string' && bodyIn.build) c.build = bodyIn.build.slice(0, 64);
     // The page's build self-heal, reported on its own beat. `reloads` is monotonic per server
     // build, `staleSince` is the first mismatch this document saw (0 while it matches). Clamped,
@@ -926,13 +1151,15 @@ function build(ctx) {
    * whose ack path is broken still proves it is running), and stamps the counters the node
    * otherwise only learns from an ack, so `clientList` stops lying when acks go mute.
    */
-  function touchBeat(id, q, now) {
+  function touchBeat(id, q, now, req = null) {
     let c = clientsById.get(id);
     if (!c) {
-      c = { id, firstAckAt: 0, lastAckAt: 0, lastDrawAt: 0, loopTicks: 0, hidden: null, build: null, source: 'none', drawCount: 0, phases: [], silentLogged: false, wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0, beatPhase: '', loopAdvAt: now };
+      c = { id, userAgent: clientUa(req), pagePath: clientPath(req, null), firstAckAt: 0, lastAckAt: 0, lastDrawAt: 0, loopTicks: 0, lastLoopAt: 0, hidden: null, visibility: '', effect: null, build: null, source: 'none', drawCount: 0, drawSeenCount: -1, drawSeenAt: 0, phases: [], silentLogged: false, wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0, beatPhase: '', loopAdvAt: now };
       clientsById.set(id, c);
       log.info(`handfx page: first beat clientId=${id} (no ack yet)`);
     }
+    if (!c.userAgent) c.userAgent = clientUa(req);
+    if (!c.pagePath) c.pagePath = clientPath(req, null);
     c.beatAt = now;
     const ticks = Number(q.get('t'));
     if (Number.isFinite(ticks)) {
@@ -955,11 +1182,35 @@ function build(ctx) {
    * Is this client's paint clock frozen *while it is still acking*? Read-only reporting: a page
    * that acks forever and never advances `loopTicks` is alive and not drawing, and this is asked
    * of one client so a second page cannot answer for it.
+   *
+   * A silent client cannot testify about its loop: when its ack is older than `PAGE_FRESH_MS` there
+   * is no current answer, so `null` (unknown) is returned rather than `false`. `false` here reads as
+   * "the loop is fine", which is the opposite of what a missing input licenses.
    */
   function clientLoopStale(c, now) {
-    if (!c) return false;
-    if (now - c.lastAckAt > PAGE_FRESH_MS) return false; // stale acks are mute/dead, not a loop fault
+    if (!c || !(c.lastAckAt > 0) || now - c.lastAckAt > PAGE_FRESH_MS) return null;
     return now - (c.loopAdvAt || c.firstAckAt || now) > LOOP_STALE_MS;
+  }
+
+  /**
+   * Is this client painting frames? The page's own draw progress is the only positive evidence: its
+   * paint clock (`lastDrawAt`) inside `LOOP_STALE_MS`, or an advance in its own `draws` counter since
+   * the previous status read. `c.streaming` proves only that the socket layer accepted bytes — a
+   * page can be handed every frame with an empty send queue while drawing nothing — and a fresh ack
+   * proves the page is talking, not painting. The counter baseline is per client (`drawSeenCount`),
+   * so a reload starts from zero and a second document cannot answer for this one.
+   */
+  function clientDrawing(c, now) {
+    if (!c || c.hidden === true) return false;
+    if (c.lastDrawAt > 0 && now - c.lastDrawAt <= LOOP_STALE_MS) return true;
+    const draws = Number.isFinite(c.drawCount) ? c.drawCount : 0;
+    const seen = Number.isFinite(c.drawSeenCount) ? c.drawSeenCount : -1;
+    if (seen < 0) c.drawSeenCount = draws; // the first read is a baseline, not evidence
+    else if (draws > seen) {
+      c.drawSeenCount = draws;
+      c.drawSeenAt = now;
+    }
+    return c.drawSeenAt > 0 && now - c.drawSeenAt <= LOOP_STALE_MS;
   }
 
   /**
@@ -1016,10 +1267,14 @@ function build(ctx) {
       ackAgeMs,
       beatAgeMs,
       candidate: Boolean(c.role) && alive,
-      // A page acking forever with a frozen loop is alive and not drawing; a page drawing has an
-      // advancing `loopTicks` and no stale loop. A consuming camera stream is drawing by
-      // construction: the frames are arriving and being taken.
-      drawing: streaming ? true : ackFresh ? c.loopTicks > 0 && !loopStale : null,
+      // Three independent questions, three independent sources. `drawing` is "are frames being
+      // painted": the page's own draw progress, never a consuming stream (bytes accepted by the
+      // socket layer are not output) and never an ack (talking is not painting). `null` when the page
+      // is not acking at all: nothing is known about a loop that is not reporting. `loopStale` is
+      // "is the loop at fault" and is `null` for the same reason. `payloadFresh` on /status answers
+      // "is the page talking". A live, ticking loop over an empty effect list paints a transparent
+      // canvas, but it still paints: `drawing` reports paint, not visibility of an effect.
+      drawing: c.lastAckAt > 0 && now - c.lastAckAt <= PAGE_FRESH_MS ? clientDrawing(c, now) : null,
       loopStale,
     };
   }
@@ -1048,8 +1303,8 @@ function build(ctx) {
         build: best ? best.build || null : null,
         ackAgeMs: verdict ? verdict.ackAgeMs : null,
         beatAgeMs: verdict ? verdict.beatAgeMs : null,
-        drawing: verdict ? verdict.drawing : false,
-        loopStale: verdict ? verdict.loopStale : false,
+        drawing: verdict ? verdict.drawing : null,
+        loopStale: verdict ? verdict.loopStale : null,
         clientId: best ? best.id : null,
         documents: list.length,
       });
@@ -1069,6 +1324,12 @@ function build(ctx) {
       // Which document this is, independent of the ephemeral clientId: two entries with the same
       // role are one page's predecessor and successor, and /status can say so.
       role: c.role || null,
+      // What the browser said it is, and the path it is actually on. Together these tell an OBS
+      // browser source from a Brave tab that both reach this port from the same host, which no
+      // other field here can. Always present; null when the registering request carried no
+      // User-Agent, never a guess.
+      userAgent: c.userAgent || null,
+      pagePath: c.pagePath || null,
       ...clientVerdict(c, now, consuming),
       firstAckAt: c.firstAckAt,
       lastAckAt: c.lastAckAt,
@@ -1173,14 +1434,24 @@ function build(ctx) {
     // reads as `page on stale build …` instead of `feed idle`.
     const buildStale = Boolean(pageBuild && pageBuild !== BUILD);
     const staleForMs = stale ? Math.round(truth.pageAckAgeMs) : 0;
-    // The paint clock, read as its own state. `ackFresh` is the difference that matters: an acking
-    // page whose loop is silent is alive and not painting (an occluded OBS source — Chrome sends a
-    // document it does not composite no `requestAnimationFrame` at all), which is a real fault on
-    // air and must not read as `stale`. `unknown` is the honest answer when no page ever reported,
-    // or when the page stopped reporting altogether: then nothing is known about its loop.
-    const loopIdleMs = draw.lastLoopAt > 0 ? Math.max(0, now - draw.lastLoopAt) : null;
-    const ackFresh = draw.lastAckAt > 0 && now - draw.lastAckAt <= PAGE_STALE_MS;
-    const renderLoop = !ackFresh || draw.lastLoopAt === 0 ? 'unknown' : loopIdleMs > LOOP_STALE_MS ? 'stopped' : 'running';
+    // The paint clock, read as its own state, from the page that answers this payload. `ackFresh`
+    // is the difference that matters: an acking page whose loop is silent is alive and not painting
+    // (an occluded OBS source — Chrome sends a document it does not composite no
+    // `requestAnimationFrame` at all), which is a real fault on air and must not read as `stale`.
+    // `unknown` is the honest answer when no page ever reported, or when the page stopped reporting
+    // altogether: then nothing is known about its loop. Read per page, never latched module-wide: a
+    // second document acking cannot say anything about this one's loop.
+    const loopAt = page && Number.isFinite(page.lastLoopAt) ? page.lastLoopAt : 0;
+    const ackAt = page ? page.lastAckAt : 0;
+    const loopIdleMs = loopAt > 0 ? Math.max(0, now - loopAt) : null;
+    const ackFresh = ackAt > 0 && now - ackAt <= PAGE_STALE_MS;
+    const renderLoop = !ackFresh || loopAt === 0 ? 'unknown' : loopIdleMs > LOOP_STALE_MS ? 'stopped' : 'running';
+    // Draw truth per document. `page` carries its own record (written by `touchClient`), so a
+    // reloaded page reports its own counters from zero and never inherits a predecessor's. A page
+    // from before `clientId` existed answers through `freshestPage` as a stub with no record: its
+    // counters are unattributable, so they read null rather than borrowing anyone else's.
+    const drawPage = page && Number.isFinite(page.drawCount) ? page : null;
+    const drawFrom = (key) => (drawPage ? (drawPage[key] ?? null) : null);
     return {
       cmds: CMDS,
       effects: EFFECTS,
@@ -1228,7 +1499,7 @@ function build(ctx) {
       beatDraws: (page && Number.isFinite(page.beatDraws) && page.beatDraws) || 0,
       beatPhase: (page && page.beatPhase) || '',
       // Read-only: the freshest page is acking but its loop counter has stopped advancing.
-      loopStale: truth.loopStale === true,
+      loopStale: truth.loopStale ?? null,
       // What the page is running vs what this server serves. `null` before the first ack.
       build: BUILD,
       clientBuild: pageBuild || null,
@@ -1238,19 +1509,28 @@ function build(ctx) {
       buildStale,
       // Whether the overlay is drawing at all, and on what: `none` means the page is open but no
       // loop has rendered (or no page is open), which is the state that looks like a dead source.
-      draws: draw.draws,
-      anchors: draw.anchors,
-      lastDrawAt: draw.lastDrawAt,
+      // `drawClientId` is whose numbers these are — a reader can no longer be handed one document's
+      // counters while believing they describe another. It, and every field below it, is null when
+      // no page is live, instead of repeating a predecessor's last maximum.
+      drawClientId: drawPage ? drawPage.id : null,
+      draws: drawFrom('drawCount'),
+      anchors: page ? (page.source ?? null) : null,
+      lastDrawAt: drawFrom('lastDrawAt'),
+      // The tracker's last report, on the same ack clock as every other payload-derived value but
+      // never `null`: see `trackerStatus` for why "never reported" and "reported, nothing in view"
+      // must not both read as absent.
+      tracker: trackerStatus(now),
       // The page's own beat: fresh here with `draws` frozen is a page that cannot paint. `renderLoop`
       // is that reading done properly — `running` | `stopped` | `unknown` — with `loopIdleMs` and
-      // `hidden` saying how long and whether Chrome has marked the document as not composited.
-      lastAckAt: draw.lastAckAt,
+      // `hidden` saying how long and whether Chrome has marked the document as not composited. All
+      // of it belongs to `drawClientId`'s document, not to whichever page acked last.
+      lastAckAt: page ? page.lastAckAt : null,
       renderLoop,
       loopIdleMs,
-      loopTicks: draw.loopTicks,
-      lastLoopAt: draw.lastLoopAt,
-      hidden: draw.hidden,
-      visibility: draw.visibility || null,
+      loopTicks: drawFrom('loopTicks'),
+      lastLoopAt: drawFrom('lastLoopAt'),
+      hidden: drawFrom('hidden'),
+      visibility: drawFrom('visibility') || null,
       // The overlay's camera answer: why it did not open (object or null) and what it did open.
       // A feed that is not live carries neither: a stale document must not hand the pane a
       // live-looking device name, or an ffmpeg error from an hour ago that reads as today's.
@@ -1297,7 +1577,12 @@ function build(ctx) {
       // Every long-lived response this process is holding, and the identity that owns it. The
       // inventory a socket table cannot give: path, role, clientId, age, cap, and whether the
       // declared identity is still the current one. See `streamCensus`.
-      sockets: streamCensus(now),
+      sockets: streamCensus(now, consuming),
+      // The standing check: the predicates that keep the six-socket budget healthy, one entry per
+      // violation, each naming the offending owner and path. Empty means healthy. Computed by the
+      // same 1 Hz pass that reaps (`sweepClients`), so a violation is visible exactly as long as it
+      // exists and never needs a browser to assert.
+      census: { violations: lastCensusViolations },
       // The page's own error reports, newest first, capped at 50. Empty until a page reports.
       pageEvents: pageEvents.slice(),
       // Block testimony from the watchdog worker, newest first. A page whose main thread is blocked
@@ -1349,7 +1634,7 @@ function build(ctx) {
         handler: (req, res, url) => {
           const q = url && url.searchParams ? url.searchParams : new URLSearchParams();
           const id = String(q.get('c') || '').slice(0, 64);
-          if (id) touchBeat(id, q, Date.now());
+          if (id) touchBeat(id, q, Date.now(), req);
           // 204 and no body: the page sends this with `new Image()`, and nothing is waiting to read
           // it. No-store so a proxy can never replay a beat and make a dead page look alive.
           res.writeHead(204, { 'cache-control': 'no-store' });
@@ -1485,6 +1770,11 @@ function build(ctx) {
             ref: refPath(req),
             clientId: streamClientId,
             remote,
+            // Same per-socket correlation the bus row carries: without these two ports a row here
+            // cannot be matched to a CEF socket, which is exactly how a reader sat in FinWait1
+            // while every reading said it was fine.
+            localPort: req.socket?.localPort ?? null,
+            remotePort: req.socket?.remotePort ?? null,
             born,
             cap: CAMERA_MAX_MS,
           });
@@ -1642,7 +1932,7 @@ function build(ctx) {
           bodyIn = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
           // The pane's live preview is a viewer, not a source: it says `preview: true` and the
           // server drops the whole report. Without this a preview's own draws would make a dead
-          // OBS source look healthy (Math.max across clients below).
+          // OBS source look healthy (its draws land on no client record).
           if (bodyIn.preview === true) return send(res, 200, { ok: true, preview: true });
           if (bodyIn.source === 'body') {
             // The body page's beat: it is open and its camera is running. Timestamp only.
@@ -1660,40 +1950,51 @@ function build(ctx) {
           }
           ackViaAt = Date.now();
           // Per-page identity, optional by design: a document cached before `clientId` existed still
-          // acks, and those acks keep counting through `draw` (see `freshestPage`).
+          // acks, and its `lastAckAt` and `anchors` are the only facts `freshestPage` can still read
+          // from one (its draw counters are unattributable and report null).
           if (typeof bodyIn.clientId === 'string' && bodyIn.clientId && bodyIn.clientId.length <= 64) {
             // Which document this ack belongs to, recorded so /status can show one entry per role
-            // rather than one per ephemeral clientId (which changes on every reload). Declared in
-            // the body; a page from before this existed is classified from its own User-Agent
-            // through `roleOf` (its URL carries no role). Read-only bookkeeping: superseding is
-            // done where a long-lived response attaches, never here — an ack cannot tell a
-            // successor's own pre-ack stream from its predecessor's, and guessing would drop the
-            // live page's feed.
-            touchClient(bodyIn.clientId, bodyIn, validRole(bodyIn.role) || roleOf(req));
+            // rather than one per ephemeral clientId (which changes on every reload). `roleIn` is
+            // the body's `role` when the page declares it, else the `?role=` on the ack URL through
+            // `roleOf`; a page that declares neither gets a null role, never a guess. Read-only
+            // bookkeeping: superseding is done where a long-lived response attaches, never here —
+            // an ack cannot tell a successor's own pre-ack stream from its predecessor's, and
+            // guessing would drop the live page's feed.
+            touchClient(bodyIn.clientId, bodyIn, validRole(bodyIn.role) || roleOf(req), req);
             applyFeedDemand();
           }
           if (Number.isFinite(bodyIn.maskAt) && bodyIn.maskAt > body.lastMaskAt) body.lastMaskAt = Math.min(Date.now(), bodyIn.maskAt);
-          // The page's draw truth: monotonic counter, the anchor source, the last draw stamp.
-          if (Number.isFinite(bodyIn.draws)) draw.draws = Math.max(draw.draws, Math.max(0, bodyIn.draws | 0));
+          // The tracker's own counters, rebuilt into the fixed shape /status serves: numbers and one
+          // epoch stamp, so a page cannot plant an arbitrary object in the status response.
+          if (bodyIn.tracker && typeof bodyIn.tracker === 'object') {
+            const t = bodyIn.tracker;
+            // Every field `snapshot()` sends, not just the counters: `state`/`feed`/`source`/`model`
+            // are what say *why* hands is 0, and `detects`/`empties` are the only pair that separate
+            // "no hand in view" from "nothing came back". A field the server drops is a question the
+            // status route cannot answer.
+            draw.tracker = {
+              state: pageStr(t.state, 32),
+              feed: pageStr(t.feed, 16),
+              source: pageStr(t.source, 16),
+              model: pageStr(t.model, 64),
+              hands: Number.isFinite(t.hands) ? Math.max(0, Math.min(4, t.hands | 0)) : 0,
+              landmarks: Number.isFinite(t.landmarks) ? Math.max(0, t.landmarks | 0) : 0,
+              detects: Number.isFinite(t.detects) ? Math.max(0, t.detects | 0) : 0,
+              empties: Number.isFinite(t.empties) ? Math.max(0, t.empties | 0) : 0,
+              lastDetectAt: Number.isFinite(t.lastDetectAt) ? Math.min(Date.now(), t.lastDetectAt) : null,
+              lastFrameAgeMs: Number.isFinite(t.lastFrameAgeMs) ? Math.max(0, t.lastFrameAgeMs | 0) : null,
+              fps: Number.isFinite(t.fps) ? Math.max(0, t.fps | 0) : 0,
+              frames: Number.isFinite(t.frames) ? Math.max(0, t.frames | 0) : 0,
+              hangCount: Number.isFinite(t.hangCount) ? Math.max(0, t.hangCount | 0) : 0,
+            };
+          }
           if (['camera', 'synthetic', 'none'].includes(bodyIn.anchors)) draw.anchors = bodyIn.anchors;
-          if (Number.isFinite(bodyIn.lastDrawAt) && bodyIn.lastDrawAt > draw.lastDrawAt) {
-            draw.lastDrawAt = Math.min(Date.now(), bodyIn.lastDrawAt);
-          }
-          // The paint clock: monotonic ticks and their last wall-clock stamp. A page reports these
-          // whether or not it is painting, which is the whole point — a frozen pair here next to a
-          // fresh `lastAckAt` is a document Chrome is not compositing, not a dead page.
-          if (Number.isFinite(bodyIn.loopTicks)) draw.loopTicks = Math.max(draw.loopTicks, Math.max(0, bodyIn.loopTicks | 0));
-          if (Number.isFinite(bodyIn.lastLoopAt) && bodyIn.lastLoopAt > draw.lastLoopAt) {
-            draw.lastLoopAt = Math.min(Date.now(), bodyIn.lastLoopAt);
-          }
-          if (typeof bodyIn.hidden === 'boolean') draw.hidden = bodyIn.hidden;
-          if (typeof bodyIn.visibility === 'string' && bodyIn.visibility.length <= 16) draw.visibility = bodyIn.visibility;
           // The bundle this document was loaded from (`?v=`), so a page left running across a
           // deploy is visible as a mismatch instead of looking healthy. Bounded: it is status.
           if (typeof bodyIn.build === 'string' && bodyIn.build) draw.build = bodyIn.build.slice(0, 64);
           // When the page last spoke at all. It is the page's own timer (`main.js` heartbeat), not
           // its render loop, so this stamp keeps moving in a document Chrome refuses to composite;
-          // `draws`/`loopTicks` are what stay frozen there.
+          // the page's own `draws`/`loopTicks` are what stay frozen there.
           draw.lastAckAt = Date.now();
           // Per-frame publish cost, as the page measured it: readback, conversion, upload and the
           // round trip. Clamped numbers only, so /status cannot carry a page's stray strings.
@@ -1730,6 +2031,14 @@ function build(ctx) {
           if (['relay', 'device', 'synthetic', 'none'].includes(bodyIn.cameraSource)) camera.source = bodyIn.cameraSource;
           if (bodyIn.relayError === null) camera.relayError = null;
           else if (typeof bodyIn.relayError === 'string' && bodyIn.relayError) camera.relayError = bodyIn.relayError.slice(0, 240);
+          // Whose numbers these are: the document this ack came from, looked up in the records
+          // `touchClient` writes, never a module-wide maximum. A page from before `clientId` existed
+          // has no record, and then its counters are unknown — null, not a predecessor's. (`pane.js`
+          // reads only effect/hands/gesture/tracking/error from this payload; the counters are for
+          // diagnostics, and /status answers them with `drawClientId` beside them.)
+          const ackClient = typeof bodyIn.clientId === 'string' && bodyIn.clientId
+            ? clientsById.get(bodyIn.clientId) || null
+            : null;
           events.emit('handfx', 'page', {
             effect: typeof bodyIn.effect === 'string' ? bodyIn.effect : null,
             tracking: bodyIn.tracking === true,
@@ -1738,9 +2047,9 @@ function build(ctx) {
             gesture: typeof bodyIn.gesture === 'string' ? bodyIn.gesture.slice(0, 40) : null,
             body: bodyIn.body === true,
             error: typeof bodyIn.error === 'string' ? bodyIn.error.slice(0, 240) : null,
-            draws: draw.draws,
-            anchors: draw.anchors,
-            lastDrawAt: draw.lastDrawAt,
+            draws: ackClient ? ackClient.drawCount : null,
+            anchors: ackClient ? ackClient.source : null,
+            lastDrawAt: ackClient ? ackClient.lastDrawAt : null,
             at: Date.now(),
           });
           send(res, 200, { ok: true, ratio: effectiveRatio() });
