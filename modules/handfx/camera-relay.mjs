@@ -919,7 +919,10 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     for (const client of [...clients]) {
       clients.delete(client);
       try {
-        client.res.end();
+        // Forced termination (camera disabled, module disposed), never a normal completion:
+        // `destroy()` frees the socket now instead of leaving it in FinWait1 behind a peer that
+        // still holds it ESTABLISHED.
+        client.res.destroy();
       } catch {
         /* already gone */
       }
@@ -1085,7 +1088,11 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
         old.res.reaped = true;
         clients.delete(old);
         try {
-          old.res.end();
+          // `destroy()`, not `end()`: this is the reaper, not a normal completion. `end()` sends
+          // FIN and leaves the server in FinWait1 for as long as a peer that still holds the
+          // socket ESTABLISHED keeps reading — measured at ten minutes, one of CEF's six slots
+          // held the whole time. RST frees the slot now, and the stream is reopened on demand.
+          old.res.destroy();
         } catch {
           /* already gone */
         }
@@ -1114,7 +1121,9 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
             old.res.superseded = true;
             clients.delete(old);
             try {
-              old.res.end();
+              // Supersede is a forced termination: the successor already owns the slot, so the
+              // predecessor must not linger in FinWait1 while the peer holds it ESTABLISHED.
+              old.res.destroy();
             } catch {
               /* already gone */
             }

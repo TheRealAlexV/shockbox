@@ -31,6 +31,21 @@ export function validRole(value) {
   return typeof value === 'string' && /^[A-Za-z0-9._/-]{1,64}$/.test(value) ? value : null;
 }
 
+/**
+ * The ack identity a request declares on its own URL (`?clientId=`), or null. This is the same id
+ * the page posts to `/ack`, so a long-lived response can be attributed to the document that holds
+ * it instead of to a role label. Bounded and character-restricted because it arrives from the
+ * network and is echoed back in `/status`.
+ */
+export function clientIdOf(req) {
+  try {
+    const raw = new URL(req.url, 'http://localhost').searchParams.get('clientId');
+    return typeof raw === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The identity a request declares on its own URL (`?role=`), or null. */
 export function roleOf(req) {
   try {
@@ -126,7 +141,13 @@ export function createEvents({ log }) {
     if (c.ageTimer) clearTimeout(c.ageTimer);
     clients.delete(c.id);
     try {
-      c.res.end();
+      // `destroy()`, not `end()`: every caller here is a forced termination (supersede, max age,
+      // backpressure, a write that threw, the request's own close). `end()` sends FIN and leaves
+      // the server in FinWait1 for as long as the peer keeps the socket ESTABLISHED without
+      // acknowledging — ten minutes, measured, while it holds one of CEF's six per-origin slots.
+      // `destroy()` sends RST, which frees the slot immediately. There is no normal completion
+      // path for an SSE response, so nothing legitimate is ever truncated by this.
+      c.res.destroy();
     } catch {
       /* ignore */
     }
@@ -277,6 +298,9 @@ export function createEvents({ log }) {
       view,
       role: roleOf(req),
       ref: refPath(req),
+      // The document's own ack identity, when it sent one. `null` for a page cached before the
+      // parameter existed: it stays owned by role, exactly as before.
+      clientId: clientIdOf(req),
       remote: client || req.socket?.remoteAddress || '?',
       born: Date.now(),
       ageTimer: null,
@@ -370,6 +394,21 @@ export function createEvents({ log }) {
     },
     get clientCount() {
       return clients.size;
+    },
+    /**
+     * Close the bus responses one document owns, so a silent page cannot keep a slot out of CEF's
+     * six-per-origin budget with a stream nobody reads. Matched on the ack identity, never on role:
+     * a newer document of the same role must not be closed for its predecessor's silence.
+     */
+    endClient(clientId) {
+      if (!clientId) return 0;
+      let ended = 0;
+      for (const c of [...clients.values()]) {
+        if (c.clientId !== clientId) continue;
+        drop(c, 'owner silent');
+        ended += 1;
+      }
+      return ended;
     },
     clientsByChannel() {
       const out = {};

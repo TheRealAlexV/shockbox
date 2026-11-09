@@ -90,14 +90,45 @@ function createBus() {
     }
   }
 
+  /** This document's SSE identity (`?clientId=`), minted once and kept in `sessionStorage` so a
+   *  reload reuses it: the server ends the row that carried the same id (`core/events.mjs`
+   *  `attach`), so a reload supersedes its own predecessor instead of stranding a socket. Keyed
+   *  per document, because a preview iframe shares this tab's storage. */
+  function eventClientId() {
+    const key = 'shockbox.clientId.shell';
+    let id = '';
+    try {
+      id = sessionStorage.getItem(key) || '';
+      if (/^[A-Za-z0-9._:-]{1,64}$/.test(id)) return id;
+    } catch {
+      /* storage blocked: fall through to a per-load id */
+    }
+    try {
+      if (self.crypto && typeof self.crypto.randomUUID === 'function') id = self.crypto.randomUUID();
+    } catch {
+      /* fall through to the Math.random id */
+    }
+    if (!id) {
+      id = '';
+      for (let i = 0; i < 32; i += 1) id += Math.floor(Math.random() * 16).toString(16);
+    }
+    try {
+      sessionStorage.setItem(key, id);
+    } catch {
+      /* a per-load id is still valid for this document */
+    }
+    return id;
+  }
+
   function connect() {
     if (es) es.close();
     // `?role=` names this document to the server (`core/events.mjs` `attach`), so a reload ends
     // its own predecessor's response instead of leaving it in the browser's six-socket pool. The
     // shell is served at both `/` and `/control`; both are one document identity, so the role is
     // fixed and not the pathname (two live shell tabs would then both be `/control` and the newer
-    // would correct the older, which is what the rule is for).
-    es = new EventSource('/events?role=shell');
+    // would correct the older, which is what the rule is for). `clientId` is the reload-stable
+    // identity the supersede rule matches on; `role` stays as the human-facing label.
+    es = new EventSource(`/events?role=shell&clientId=${encodeURIComponent(eventClientId())}`);
     es.onopen = () => {
       retry = 0;
       statusCb?.('open');

@@ -274,11 +274,41 @@ function drawPointer(p) {
 
 /* ---------------------------------------------------------------- wiring */
 
+/** This document's SSE identity (`?clientId=`), minted once and kept in `sessionStorage` so a
+ *  reload reuses it: the server ends the row that carried the same id (`core/events.mjs`
+ *  `attach`), so a reload supersedes its own predecessor instead of stranding a socket. */
+function eventClientId() {
+  const key = 'shockbox.clientId.dialogs';
+  let id = '';
+  try {
+    id = sessionStorage.getItem(key) || '';
+    if (/^[A-Za-z0-9._:-]{1,64}$/.test(id)) return id;
+  } catch {
+    /* storage blocked: fall through to a per-load id */
+  }
+  try {
+    if (self.crypto && typeof self.crypto.randomUUID === 'function') id = self.crypto.randomUUID();
+  } catch {
+    /* fall through to the Math.random id */
+  }
+  if (!id) {
+    id = '';
+    for (let i = 0; i < 32; i += 1) id += Math.floor(Math.random() * 16).toString(16);
+  }
+  try {
+    sessionStorage.setItem(key, id);
+  } catch {
+    /* a per-load id is still valid for this document */
+  }
+  return id;
+}
+
 function connect() {
   // `role=` is this document's identity for the server's supersede rule (`core/events.mjs`):
   // a reload ends its own predecessor's bus response instead of leaving it in the browser's
   // six-per-origin pool. The page's path, as `/shockfx` uses; `client=` stays a human label.
-  const es = new EventSource('/events?channels=dialogs,pointer&client=alerts-overlay&role=/dialogs');
+  // `clientId` is the reload-stable identity that rule matches on.
+  const es = new EventSource(`/events?channels=dialogs,pointer&client=alerts-overlay&role=/dialogs&clientId=${encodeURIComponent(eventClientId())}`);
   es.addEventListener('reset', () => {
     fetch('/api/dialogs/live')
       .then((r) => r.json())

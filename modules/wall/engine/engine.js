@@ -2892,6 +2892,30 @@
     this.pushState();
   };
 
+  /**
+   * This document's SSE identity (`?clientId=`), minted once and kept in `sessionStorage` under
+   * `key` so a reload reuses it: the server ends the row that carried the same id
+   * (`core/events.mjs` `attach`), so a reload supersedes its own predecessor instead of
+   * stranding a socket. `sessionStorage` throws in a locked-down context; a per-load id is
+   * still valid then, it just cannot supersede.
+   */
+  function eventClientId(key) {
+    var id = '';
+    try {
+      id = sessionStorage.getItem(key) || '';
+      if (/^[A-Za-z0-9._:-]{1,64}$/.test(id)) return id;
+    } catch (e) { /* storage blocked: fall through to a per-load id */ }
+    try {
+      if (crypto && typeof crypto.randomUUID === 'function') id = crypto.randomUUID();
+    } catch (e2) { id = ''; }
+    if (!id) {
+      id = '';
+      for (var i = 0; i < 32; i += 1) id += Math.floor(Math.random() * 16).toString(16);
+    }
+    try { sessionStorage.setItem(key, id); } catch (e3) { /* per-load id still valid */ }
+    return id;
+  }
+
   AgentClient.prototype._connect = function () {
     var self = this;
     if (this.closed) return;
@@ -2914,7 +2938,13 @@
         if (/^\/wall\/[A-Za-z0-9._-]+\/?$/.test(path)) role = path.replace(/\/+$/, '');
       }
     } catch (e) { role = ''; }
+    // The clientId key is per wall document (role, else path): two wall documents inside one
+    // tab share this storage, so a shared key would make one supersede the other. A preview
+    // iframe declares no role (see above) and keys on its pathname instead.
+    var cidPath = '';
+    try { cidPath = (typeof location !== 'undefined' && location.pathname) || ''; } catch (e4) { cidPath = ''; }
     var url = this.base + '/events?channels=wall&view=' + encodeURIComponent(this.inst.view)
+      + '&clientId=' + encodeURIComponent(eventClientId('shockbox.clientId.wall:' + (role || cidPath || '?')))
       + (role ? '&role=' + encodeURIComponent(role) : '');
     var es;
     try {
