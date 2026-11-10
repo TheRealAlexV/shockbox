@@ -101,6 +101,9 @@ export async function render(container, ctx) {
 
   async function refresh() {
     s.status = await api.get('/api/handfx/status');
+    // Any fresh read settles an optimistic press: the buttons follow /status again, so a source
+    // that is still unknown (or dead) leaves the pressed one unpressed, never latched on a click.
+    pendingTracking = null;
     s.settings = Object.fromEntries(Object.entries(s.status.settings || {}).map(([k, d]) => [k, d.value]));
     s.underlay = s.settings.underlay === true;
     // A poll just replaced the document: put the queued edits back on top of it, so the pane
@@ -796,6 +799,13 @@ export async function render(container, ctx) {
   }
 
   /**
+   * The mode this pane pressed and has not yet heard back on, or null. Set by a click, cleared by
+   * the next refresh(): it only ever feeds the button's pressed look and the `now:` line, never a
+   * claim about what the OBS source did.
+   */
+  let pendingTracking = null;
+
+  /**
    * What the OBS source's tracker is doing, from /status. `tracker` is the overlay's own report
    * (`state` + `source`), `cameraSource` the pipe carrying frames. `available: false` reads as
    * "unknown" — the page has not reported, or has gone quiet — never as "off", so no control can
@@ -820,15 +830,29 @@ export async function render(container, ctx) {
    * inert, opens no bus, and is a viewer by construction. Which button reads as pressed comes from
    * /status, not from the last click.
    */
-  function trackingActions(now) {
+  function trackingActions(now, nowNote) {
     const box = el('div', { class: 'hfx-track-actions' });
     const mk = (label, mode, title) => {
       const on = now.mode === mode;
-      const b = el('button', { type: 'button', class: `btn btn-sm${on ? '' : ' btn-quiet'}`, text: label, title });
-      b.setAttribute('aria-pressed', on ? 'true' : 'false');
-      if (on) b.dataset.active = 'true';
+      // A pending press is this pane's own memory of the click, cleared by the next refresh(): it is
+      // feedback, never a claim that the source accepted the command.
+      const pending = pendingTracking === mode;
+      const pressed = on || pending;
+      const b = el('button', { type: 'button', class: `btn btn-sm${pressed ? '' : ' btn-quiet'}`, text: label, title });
+      b.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+      if (pressed) b.dataset.active = 'true';
       b.disabled = on; // the state the page reports: pressing it again would only restart it
       b.addEventListener('click', async () => {
+        // Paint the press now, in place, without a re-render (which would drop focus): when the OBS
+        // source is dead nothing moves for a whole turn, so the click itself is the only evidence
+        // the operator gets. The `now:` line says "sent, waiting", not "done".
+        if (!signal.aborted) {
+          pendingTracking = mode;
+          b.dataset.active = 'true';
+          b.setAttribute('aria-pressed', 'true');
+          b.classList.remove('btn-quiet');
+          if (nowNote) nowNote.textContent = `now: ${now.text} — sent ${label.toLowerCase()}, waiting for the source to report`;
+        }
         try {
           const out = await bus('tracking.set', { mode });
           if (signal.aborted) return;
@@ -841,6 +865,7 @@ export async function render(container, ctx) {
           queued ? 'warn' : 'ok');
           scheduleRefresh();
         } catch (err) {
+          pendingTracking = null; // the command did not leave: nothing is pending
           push(`tracking.set ${mode}: ${err.message}`, 'bad');
           render();
         }
@@ -865,10 +890,13 @@ export async function render(container, ctx) {
       el('span', { class: 'hfx-pill', 'data-tone': src.tone, text: src.text }),
     ));
     const body = el('div', { class: 'panel-body hfx-fields' });
+    // Handed to the controls below so an optimistic press can say "sent, waiting" in words here
+    // instead of adding a status channel of its own.
+    const nowNote = el('div', { class: 'hfx-note', text: `now: ${now.text}` });
     body.append(
       row('effects enabled', switchControl('enabled', s.settings.enabled !== false, async (v) => { await patch('enabled', v); if (v) await bus('tracking.toggle').catch(() => {}); })),
-      row('tracking', trackingActions(now)),
-      el('div', { class: 'hfx-note', text: `now: ${now.text}` }),
+      row('tracking', trackingActions(now, nowNote)),
+      nowNote,
       // The persisted hand source. The pill above shows what it resolved to right now, so `auto`
       // that fell back to the rig is visible without reading the camera error.
       row('hand source', selectControl('trackingSource', s.settings.trackingSource || 'auto', (s.status?.settings?.trackingSource?.values) || ['auto', 'camera', 'synthetic'], (v) => patch('trackingSource', v))),

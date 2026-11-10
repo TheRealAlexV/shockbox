@@ -969,6 +969,12 @@ function cameraFailureReason() {
  */
 function scheduleCameraRetry(reason) {
   if (userStopped) return;
+  // A document that cannot acquire at all — a plain preview: no relay, no camera — has no attempt
+  // to repeat. Arming the ladder there only re-entered startTracking every 31 s to tear a claim
+  // down (`relay stop ... why=tracking-torn-down`), which is the noise, not a recovery: nothing in
+  // this page's arming path can ever make it acquire. A camera preview and the OBS source both
+  // have canAcquire true, so their ladder is untouched.
+  if (!canAcquire) return;
   const delay = Math.min(CAM_RETRY_BASE * 2 ** Math.max(0, autoCam.attempts - 1), CAM_RETRY_MAX);
   if (autoCam.timer) clearTimeout(autoCam.timer);
   autoCam.nextAt = Date.now() + delay;
@@ -1034,7 +1040,16 @@ async function startRelay(opts) {
   // before it had been heard once left the ack queued behind it for the full camera cap and looked
   // dead the whole time. The boot's ack is now first, so this is only ever a deferral: the retry
   // path re-enters in 2 s, and `camAttempted` stays false because nothing was attempted.
-  if (!state.ackOkAt) {
+  // A camera-enabled preview is exempt from the ack proof, and only it. It never acks by three
+  // gates (`ack()` returns for PREVIEW, the worker is not created, the interval is not started), so
+  // `ackOkAt` stays 0 for that document's whole life and this gate would hold the stream forever:
+  // `wanted` never turns true and the pane's underlay toggle does nothing. The trade is one
+  // camera-stream socket spent without an ack proving the budget; that is acceptable here because
+  // it is a single document the operator opened deliberately, and it stays out of the ack ledger,
+  // so `freshestPage()` can never report this preview as the page while the real source is down.
+  // The OBS source has CAMERA_PREVIEW false by construction, so its path is unchanged: no ack, no
+  // stream.
+  if (!state.ackOkAt && !CAMERA_PREVIEW) {
     state.relayError = 'relay: no ack yet — holding the stream for the socket';
     return false;
   }
@@ -1103,7 +1118,13 @@ async function startTracking({ fromBus = false, synthetic = false, explicit = fa
   // A running camera owns the view; a running synthetic rig gives way to a real camera (the
   // overlay starts on synthetic when no camera arrives, so the Start button must still work).
   if (trackingClaimLive()) return;
-  if (state.tracking) stopTracking({ manual: false, keepView: true });  userStopped = false;
+  // Tearing the old claim down is only for a document that can take a new one. A plain preview
+  // cannot acquire at all (canAcquire false): `stopTracking` would emit a `relay stop ...
+  // why=tracking-torn-down` for a stream it never opened, once per retry, and then start again
+  // from nothing. Neither the camera preview nor the OBS source is affected: both have
+  // canAcquire true.
+  if (state.tracking && canAcquire) stopTracking({ manual: false, keepView: true });
+  userStopped = false;
   // An explicit mode wins over the persisted setting: `camera` starts the camera whatever the page
   // was last left on, and `synthetic` never opens one. Without a mode the persisted setting decides
   // — the boot path and the deck key's toggle, unchanged.
