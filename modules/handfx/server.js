@@ -25,6 +25,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createPublisher } from './publish-pipe.mjs';
 import { BOUNDARY, createCameraRelay } from './camera-relay.mjs';
+// Revives the browser source document CEF discarded while its scene was off air. See the file.
+import { createSourceWatchdog } from './source-watchdog.mjs';
 // The document identity a request declares (`?role=`) or inherits (its `Referer` path), shared with
 // the SSE hub so both long-lived responses are superseded by the same rule.
 import { roleOf, refPath, validRole, clientIdOf } from '../../core/events.mjs';
@@ -364,6 +366,12 @@ function serveVendor(res, req, rel, { immutable = false } = {}) {
   return true;
 }
 
+// The module is built twice (init, then routes), so the watchdog is a module-level singleton: the
+// build that serves replaces the snapshot provider, and the timer started by `init()` keeps running
+// against the instance that actually receives acks.
+let handfxWatchdog = null;
+let handfxWatchdogSnapshot = () => ({ lastAckAt: 0 });
+
 function build(ctx) {
   const { events, log } = ctx;
   const settings = ctx.settings;
@@ -476,6 +484,13 @@ function build(ctx) {
    * still heartbeat on a timer. One entry per id means liveness is asked of a *particular* page.
    */
   const clientsById = new Map();
+  // What the watchdog needs to answer "is the document dead": the newest ack across every client
+  // record, with `draw.lastAckAt` as the pre-clientId fallback. Assigned here and replaced by the
+  // serving build, because the module is built twice.
+  handfxWatchdogSnapshot = () => ({
+    lastAckAt: Math.max(draw.lastAckAt || 0, ...[...clientsById.values()].map((c) => c.lastAckAt || 0)),
+    clients: clientsById.size,
+  });
   /**
    * The socket census: one row per long-lived response this process holds open, with the identity
    * that owns it and how long it has been open. The pane polls /status at 1 Hz, so it can read the
@@ -2281,6 +2296,16 @@ function build(ctx) {
       // The pipe is not opened here: init runs on a build that routes() then replaces, so a
       // listener owned by it would accept the Frame Server and never send a frame. `status()`
       // syncs the mode on the instance that actually serves.
+      // The watchdog is different: it is a single timer that reads through `handfxWatchdogSnapshot`,
+      // which the serving build replaces. Starting it once here keeps it alive across that rebuild.
+      if (!handfxWatchdog) {
+        handfxWatchdog = createSourceWatchdog({
+          obs: ctx.obs,
+          getSnapshot: () => handfxWatchdogSnapshot(),
+          log: log.scope ? log.scope('watchdog') : log,
+        });
+        handfxWatchdog.start();
+      }
     },
 
     dispose() {
@@ -2288,6 +2313,10 @@ function build(ctx) {
       relay.dispose();
       pipe.dispose();
       settings.flush();
+      if (handfxWatchdog) {
+        handfxWatchdog.stop();
+        handfxWatchdog = null;
+      }
     },
   };
   return api;
