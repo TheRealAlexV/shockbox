@@ -117,6 +117,9 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
   let latest = null; // newest undecoded JPEG
   let decoding = false;
   let error = null;
+  // Set only by the benign 503: no frame yet, or the relay is off. It is a reason for `/status`,
+  // never an error state — `error` is what turns the page's own view red.
+  let waiting = null;
   let frames = 0;
   let dropped = 0;
   let firstWaiter = null;
@@ -314,6 +317,7 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
         if (conn === gen && !live) {
           live = true;
           error = null;
+          waiting = null;
           liveSince = Date.now();
           // A frame arrived: the next drop (including the server's max-age close) reopens at once.
           retryDelay = 0;
@@ -403,6 +407,21 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       });
       // Headers are in; the first-frame wait owns the rest of the bound from here.
       clearTimeout(acquireTimer);
+      // 503 is the server's own "nothing to serve yet", not a fault: `no camera frame yet` while
+      // ffmpeg warms up, and `camera relay is off` when the producer is not armed. Both are states
+      // the overlay covers by drawing synthetic, so they are reported as a quiet wait and retried on
+      // the ordinary backoff — surfacing them as `error` turned a normal boot into a red banner and
+      // tore down a view that was working fine without the camera.
+      if (res.status === 503) {
+        if (ctrl === ac) close();
+        live = false;
+        waiting = 'relay 503: no camera frame yet (or the relay is off)';
+        error = null;
+        note('waiting', `${waiting} — drawing synthetic, retrying`);
+        emit('idle');
+        if (wanted) wantReopen();
+        return false;
+      }
       if (!res.ok) throw new Error(`stream answered ${res.status}`);
       if (!res.body) throw new Error('stream carried no body');
       const type = res.headers.get('content-type') || '';
@@ -500,8 +519,8 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
     stop,
     /** Frames are flowing and `onFrame` is being called. */
     isLive: () => Boolean(ctrl) && live && Boolean(current),
-    /** Why the stream is not live (string), null while it is. */
-    reason: () => error,
+    /** Why the stream is not live (string), null while it is. `waiting` covers the benign 503. */
+    reason: () => error || waiting,
     stats: () => ({ frames, dropped, live }),
   };
 }

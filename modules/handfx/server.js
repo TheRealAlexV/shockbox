@@ -29,6 +29,7 @@ import { BOUNDARY, createCameraRelay } from './camera-relay.mjs';
 import { createSourceWatchdog } from './source-watchdog.mjs';
 // Which page clients are provably on a stale build. Pure, so the rule is testable without a server.
 import { staleClients, normalizeBuild } from './stale-clients.mjs';
+import { createBeatHealer, BEAT_HEAL_DEFAULTS } from './beat-reload.mjs';
 // The document identity a request declares (`?role=`) or inherits (its `Referer` path), shared with
 // the SSE hub so both long-lived responses are superseded by the same rule.
 import { roleOf, refPath, validRole, clientIdOf } from '../../core/events.mjs';
@@ -383,6 +384,11 @@ function serveVendor(res, req, rel, { immutable = false } = {}) {
 // against the instance that actually receives acks.
 let handfxWatchdog = null;
 let handfxWatchdogSnapshot = () => ({ lastAckAt: 0 });
+// Same shape for the beat self-heal: the client rows belong to the serving build, so `init()` owns
+// the one timer and calls through this provider, which the serving build replaces.
+let handfxHealTimer = null;
+let handfxHealProbe = () => [];
+let handfxHealReload = () => {};
 
 function build(ctx) {
   const { events, log } = ctx;
@@ -503,6 +509,10 @@ function build(ctx) {
    * still heartbeat on a timer. One entry per id means liveness is asked of a *particular* page.
    */
   const clientsById = new Map();
+  // What the beat self-heal reads: every row, previews included — it filters by role and by
+  // `preview` itself, because a preview's death is not worth a reload and a role it does not own
+  // must never be touched.
+  handfxHealProbe = () => [...clientsById.values()];
   // What the watchdog needs to answer "is the document dead": the newest ack across every client
   // record, with `draw.lastAckAt` as the pre-clientId fallback. Assigned here and replaced by the
   // serving build, because the module is built twice.
@@ -1631,6 +1641,14 @@ function build(ctx) {
     return rec;
   }
 
+  // The self-heal's effect. It rides the `handfx` bus, which only ShockFX documents listen to, so
+  // the LED wall pages can never be reloaded by it. One line per reload, with the reason and the
+  // attempt count, because a heal that repeats is a bug worth seeing in the log.
+  handfxHealReload = (id, reason) => {
+    log.warn(`handfx heal: reload clientId=${id} — ${reason}`);
+    publish('reload', { reason: `heal: ${reason}`, clientId: id });
+  };
+
   function status() {
     // The module is built twice (once for init, once for routes), so a pipe opened in init would
     // belong to an instance nobody serves from. Sync here instead: the pane and the overlay both
@@ -2584,6 +2602,25 @@ function build(ctx) {
         });
         handfxWatchdog.start();
       }
+      // The beat self-heal: one timer, started once across both builds, reading the serving build's
+      // rows. 5 s is a third of its 15 s threshold, so a stale beat is noticed within 5 s of going
+      // stale and the gap between two reloads of one client is honoured to within that interval.
+      if (!handfxHealTimer) {
+        const healer = createBeatHealer({
+          reload: (id, reason) => handfxHealReload(id, reason),
+          log: log.scope ? log.scope('heal') : log,
+        });
+        handfxHealTimer = setInterval(() => {
+          try {
+            healer.sweep(handfxHealProbe(), Date.now());
+          } catch (err) {
+            // A sweep that throws must not take the interval with it: the next one is the heal.
+            log.warn(`handfx heal: sweep failed: ${err && err.message}`);
+          }
+        }, 5000);
+        handfxHealTimer.unref?.();
+        log.info(`handfx heal: beat self-heal armed (stale ${BEAT_HEAL_DEFAULTS.staleMs} ms, gap ${BEAT_HEAL_DEFAULTS.gapMs} ms, max ${BEAT_HEAL_DEFAULTS.max})`);
+      }
     },
 
     dispose() {
@@ -2594,6 +2631,10 @@ function build(ctx) {
       if (handfxWatchdog) {
         handfxWatchdog.stop();
         handfxWatchdog = null;
+      }
+      if (handfxHealTimer) {
+        clearInterval(handfxHealTimer);
+        handfxHealTimer = null;
       }
     },
   };

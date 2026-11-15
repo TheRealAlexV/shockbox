@@ -896,16 +896,22 @@ let booted = false;
 setInterval(() => {
   if (PREVIEW) return;
   if (document.visibilityState === 'hidden') return;
-  // Not gated on `booted`: a boot that hangs on `loadStatus` (a server that is gone, a fetch that
-  // never resolves) would otherwise freeze the page before its own recovery could start.
-  void watchdog.tick();
-  // A latch nobody is serving is reported and released before it can look like a dead network.
-  checkAckGate(Date.now());
-  // /ack keeps running on its own timer while the loop is dead, so the connection watchdog would
-  // report a page that is "alive" and doing nothing. This is the check for that state.
-  checkWedge(Date.now());
-  // The build this document runs is fixed at boot; this is the only way a deploy reaches it.
-  if (booted) void pollBuild(Date.now());
+  // One failing tick must not take the beat with it. Nothing here is awaited, so a throw from any
+  // of the four used to escape the interval body and kill this document's only recovery clock.
+  try {
+    // Not gated on `booted`: a boot that hangs on `loadStatus` (a server that is gone, a fetch that
+    // never resolves) would otherwise freeze the page before its own recovery could start.
+    void watchdog.tick();
+    // A latch nobody is serving is reported and released before it can look like a dead network.
+    checkAckGate(Date.now());
+    // /ack keeps running on its own timer while the loop is dead, so the connection watchdog would
+    // report a page that is "alive" and doing nothing. This is the check for that state.
+    checkWedge(Date.now());
+    // The build this document runs is fixed at boot; this is the only way a deploy reaches it.
+    if (booted) void pollBuild(Date.now());
+  } catch (err) {
+    camLog(`witness tick failed: ${err && err.name}: ${err && err.message}`);
+  }
 }, 1000);
 
 /* ---------------------------------------------------------------- camera + tracking */
@@ -988,6 +994,20 @@ function camLog(msg) {
   console.log(`handfx cam: ${msg}`);
 }
 
+/**
+ * Where a fire-and-forget start reports its rejection. `void startTracking(...)` with no `.catch`
+ * left the reason nowhere: the page looked idle while nothing was running and no `cameraError`
+ * existed to say why. Same record the camera's own failures use, so `/status` and the pane's
+ * diagnostics show it, and one line in the log names the stage.
+ */
+function noteStartFailed(what) {
+  return (err) => {
+    if (!err) return;
+    setCameraError('track', err.name || 'Error', `${what}: ${err.message || String(err)}`);
+    camLog(`${what} failed: ${err.name || 'Error'}: ${err.message || err}`);
+  };
+}
+
 function clearCameraRetry() {
   if (autoCam.timer) clearTimeout(autoCam.timer);
   autoCam.timer = 0;
@@ -1038,7 +1058,7 @@ function scheduleCameraRetry(reason) {
   camLog(`retry in ${delay}ms reason="${reason}"`);
   autoCam.timer = setTimeout(() => {
     autoCam.timer = 0;
-    void autoCamera();
+    void autoCamera().catch(noteStartFailed('autoCamera retry'));
   }, delay);
 }
 
@@ -1148,7 +1168,7 @@ function applyTrackingMode(mode) {
   if (mode === 'synthetic') {
     if (!syntheticNow) {
       if (state.tracking) stopTracking({ manual: false, keepView: true });
-      void startTracking({ fromBus: true, synthetic: true, explicit: true });
+      void startTracking({ fromBus: true, synthetic: true, explicit: true }).catch(noteStartFailed('synthetic start'));
     }
     return true;
   }
@@ -1158,13 +1178,13 @@ function applyTrackingMode(mode) {
     // gesture window a press on this page would. A deck key has no such click and stays gated.
     noteStartClick();
     if (state.tracking) stopTracking({ manual: false, keepView: true });
-    void startTracking({ fromBus: true, explicit: true });
+    void startTracking({ fromBus: true, explicit: true }).catch(noteStartFailed('camera start'));
     return true;
   }
   if (mode === 'toggle') {
     // The deck key, unchanged: a live camera stops, anything else starts what the setting asks for.
     if (state.tracking && !state.synthetic) stopTracking();
-    else startTracking({ fromBus: true });
+    else void startTracking({ fromBus: true }).catch(noteStartFailed('toggle start'));
     return true;
   }
   return false;
