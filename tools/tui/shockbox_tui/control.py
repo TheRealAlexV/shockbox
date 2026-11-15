@@ -95,7 +95,43 @@ class Control:
         self.node = node
         self.client = client or ApiClient(self.port, timeout=2.5)
         self.settings_obj = Settings(self.client, cfg_path)
+        self._client_injected = client is not None
+        self._port_in_use = self.port
         self._follow_offset: int | None = None
+
+    # ---- the port the service is really on -----------------------------------------------
+    def _published_port(self) -> int | None:
+        """The port the *running* supervisor bound, as it published it in ``status.json``.
+
+        ``self.port`` is what a fresh supervisor would be given (``config.json`` or
+        ``DEFAULT_PORT``); it is not evidence about a supervisor that is already up. One
+        launched with a stray ``--port 8974`` publishes 8974, so a client built from config
+        probed 8972: ``/health`` read "server unreachable" and every module "—" while node
+        served fine (2026-11-15, a supervisor left on 8974 by a staged install). The supervisor
+        writes this document about itself, so it cannot disagree with the live process.
+        """
+        if not self.supervisor_responding():
+            return None
+        try:
+            port = int(self._read_status().get("port") or 0)
+        except (TypeError, ValueError):
+            return None
+        return port or None
+
+    def _sync_client(self) -> None:
+        """Point the API client at the live supervisor's port; rebuild only when it moves.
+
+        A fresh spawn still gets ``self.port`` (see ``supervisor_argv``), so stopping a stray
+        supervisor and starting from here binds the port config.json asks for.
+        """
+        if self._client_injected:
+            return
+        active = self._published_port() or self.port
+        if active == self._port_in_use:
+            return
+        self._port_in_use = active
+        self.client = ApiClient(active, timeout=2.5)
+        self.settings_obj = Settings(self.client, self.paths.config_json)
 
     # ---- supervisor lifecycle ----------------------------------------------------
     def supervisor_argv(self) -> list[str]:
@@ -107,9 +143,14 @@ class Control:
             str(self.paths.app_dir),
             "--port",
             str(self.port),
-            "--runtime-dir",
-            str(self.paths.runtime_dir),
         ]
+        # Only pin --runtime-dir when it is a deliberate override (a TUI --runtime-dir, the
+        # env var, tests). Passing the resolved default on every launch pinpoints the child
+        # to whatever this build resolved, so an old %LOCALAPPDATA% default became an
+        # explicit argument the child could not re-derive: the two conventions split into
+        # two runtime dirs and a duplicate supervisor on 2026-11-05.
+        if self.paths.runtime_dir != Paths.resolve(self.paths.app_dir).runtime_dir:
+            argv += ["--runtime-dir", str(self.paths.runtime_dir)]
         if self.node:
             argv += ["--node", self.node]
         return argv
@@ -318,15 +359,14 @@ class Control:
         because "the supervisor wedged 3 minutes ago with node running" is more useful than
         nothing. ``age_s`` is the heartbeat age.
         """
+        self._sync_client()
         data = self._read_status()
         if not data:
             return {"state": NO_SUPERVISOR, "port": self.port, "app_dir": str(self.paths.app_dir)}
         out = dict(data)
         age = self._status_age()
-        age = None if age is None else round(age, 1)
-        status = self._read_status()
-        out = dict(status) if status else {}
-        out["age_s"] = age
+        out["age_s"] = None if age is None else round(age, 1)
+        age = out["age_s"]
         if age is None or age > STATUS_STALE_S:
             out["stale"] = True
             if out.get("state") != "stopped":
@@ -478,6 +518,7 @@ class Control:
 
     def health(self) -> dict | None:
         """``/health`` as the server answered it, or None when it is not answering."""
+        self._sync_client()
         try:
             return self.client.health()
         except (ApiError, ApiUnreachable):
@@ -486,6 +527,7 @@ class Control:
     # ---- settings ------------------------------------------------------------------
     def settings(self) -> dict:
         """Server settings (core + modules) and the masked local config."""
+        self._sync_client()
         return self.settings_obj.describe()
 
     def patch(self, changes: dict, module: str | None = None) -> dict:
@@ -496,7 +538,8 @@ class Control:
         return read_config(self.paths.config_json, reveal=reveal)
 
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}/"
+        self._sync_client()
+        return f"http://127.0.0.1:{self._port_in_use}/"
 
     # ---- module routes --------------------------------------------------------------
     # Thin pass-throughs for the screens. They do NOT swallow errors: a failed PATCH must read

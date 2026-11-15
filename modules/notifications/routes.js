@@ -1,8 +1,69 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
 import { HttpError } from '../../core/id.mjs';
 import { createNotifyState } from './state.mjs';
 import { createSounds } from './audio.mjs';
 import { audioListRoute, checkTone } from './audio-routes.mjs';
 import { DEFAULT_NOTIFY_TONE } from './sound.mjs';
+
+// ---------------------------------------------------------------------------
+// The bundle id the three non-handfx documents poll.
+// ---------------------------------------------------------------------------
+// The shell and the two popup overlays each load once and then run for days. `/api/<module>/build`
+// names what the server is serving *now*; a document that hears an id it did not load replaces
+// itself (public/src/build-check.js). The id is a hash of every file those documents execute, so a
+// stylesheet deploy counts, not only a JS one — handfx learned that lesson on its own bundle.
+//
+// It covers the shell and both popups together on purpose: they share `sound.mjs` and one person
+// deploys them as one presentation bundle, so one id is one honest answer to "is this document
+// current". DIALOGS re-exports this value for its own endpoint rather than hashing a second time.
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const BUNDLE_INPUTS = [
+  'public/index.html',
+  'public/src',
+  'modules/notifications/overlay',
+  'modules/dialogs/overlay',
+];
+
+function hashPath(h, rel) {
+  const abs = path.join(REPO, rel);
+  let st;
+  try {
+    st = fs.statSync(abs);
+  } catch {
+    return; // a missing input is not a deploy: hash what exists
+  }
+  if (st.isFile()) {
+    try {
+      h.update(rel).update('\0').update(fs.readFileSync(abs));
+    } catch {
+      /* unreadable mid-deploy: the next process start hashes it */
+    }
+    return;
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(abs, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) hashPath(h, `${rel}/${entry.name}`);
+}
+
+/** Computed once at load, like the handfx page build: a deploy restarts the server. */
+export const OVERLAY_BUILD = (() => {
+  try {
+    const h = createHash('sha256');
+    for (const rel of BUNDLE_INPUTS) hashPath(h, rel);
+    return h.digest('hex').slice(0, 12);
+  } catch {
+    return 'unknown';
+  }
+})();
 
 // Notifications module — the toast side of the popup feature.
 //
@@ -140,6 +201,15 @@ export default {
     const S = () => mod.settings;
     return [
       audioListRoute(mod),
+      {
+        method: 'GET',
+        path: '/build',
+        // What the deployed documents poll. No state, no log line per poll: it is asked every
+        // 25 s by three windows, and a log line there is noise, not evidence.
+        handler() {
+          return { build: OVERLAY_BUILD };
+        },
+      },
       {
         method: 'GET',
         path: '/live',

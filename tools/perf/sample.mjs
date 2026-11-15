@@ -30,9 +30,11 @@ const SHOCKBOX_PORT = 8972;
 const CLK_TCK = 100; // Linux x86_64 USER_HZ; change if /proc/stat ever disagrees
 
 // The shipping rig runs on the Windows host, so its pids are invisible to WSL /proc.
-// Windows side of the runtime dir (Paths.resolve: %LOCALAPPDATA%\ShockBox\runtime).
+// Windows side of the runtime dir (Paths.resolve: %PROGRAMDATA%\ShockBox\runtime).
+// Not %LOCALAPPDATA%: that per-account path split the runtime dir in two and left an orphan
+// status.json frozen at "stopped" under a live supervisor on 2026-11-05.
 const WIN_RUNTIME = process.env.SHOCKBOX_WIN_RUNTIME
-  || `/mnt/c/Users/${userInfo().username}/AppData/Local/ShockBox/runtime`;
+  || "/mnt/c/ProgramData/ShockBox/runtime";
 const WIN_STATUS = join(WIN_RUNTIME, "status.json");
 const WIN_PROBE = process.env.SHOCKBOX_WIN_PROBE !== "0" && existsSync(WIN_RUNTIME);
 

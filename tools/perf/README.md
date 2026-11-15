@@ -25,8 +25,8 @@ The shipping rig runs on the **Windows host** (`C:\OBS\ShockBox`), so its pids d
 WSL `/proc`. The sampler therefore resolves them from the Windows runtime dir first:
 
 ```
-%LOCALAPPDATA%\ShockBox\runtime\status.json   -> node_pid, supervisor_pid, updated, adopted
-C:\Users\<user>\AppData\Local\ShockBox\runtime\supervisor.pid
+%PROGRAMDATA%\ShockBox\runtime\status.json   -> node_pid, supervisor_pid, updated, adopted
+C:\ProgramData\ShockBox\runtime\supervisor.pid
 ```
 
 `status.json` is re-read every row (so a supervisor restart or a new node pid is picked up with
@@ -42,8 +42,12 @@ the pid in `~/.local/state/shockbox/supervisor.pid` (verified against its cmdlin
 
 | path | contents now | writer |
 |---|---|---|
-| `%LOCALAPPDATA%\ShockBox\runtime\` | `supervisor.pid` = **33276**, live, heartbeat fresh | the Windows supervisor |
+| `%PROGRAMDATA%\ShockBox\runtime\` | the one machine-wide dir: `supervisor.pid`, `status.json`, heartbeat | the Windows supervisor |
 | `~/.local/state/shockbox/` (WSL) | `supervisor.pid` = **168254**, dead since 2026-10-30 | an old WSL run; nothing reaps it |
+
+`%LOCALAPPDATA%\ShockBox\runtime` was a second Windows dir, retired to `runtime.orphan-20261106`
+on 2026-11-06: its frozen `status.json` read `stopped` while the supervisor ran, and a sampler
+that preferred it reported a live supervisor as dead.
 
 A detector that trusts the WSL pid file without checking the process would report a supervisor
 that does not exist. This sampler checks, so it reports empty rather than a stale number - but

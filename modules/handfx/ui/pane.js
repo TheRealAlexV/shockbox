@@ -86,7 +86,18 @@ export async function render(container, ctx) {
   const pendingPatch = Object.create(null);
   const pendingCmds = []; // { name, args } for /api/handfx/cmd, or { name, restart: true }
   let applying = false;
-  let applyBtn = null; // the header's Apply button; rebuilt with the header
+  // What the last settings write to the server actually did: `changed` is the server's own list of
+  // keys it moved, `error` its refusal. It is what the gate's status line reports, so "sent" is
+  // never a guess.
+  let lastSend = null;
+  // The gate is built once and re-parented into every header render. It used to be rebuilt with
+  // the header, and the pane redraws on every page ack (500 ms), so a press on Apply or Auto Apply
+  // landed on a node the next redraw had already thrown away: the click never fired and the gate
+  // read as dead. Built once, its listeners survive every render.
+  let applyBtn = null;
+  let autoBox = null;
+  let queuedLine = null;
+  let gateEl = null;
   // The underlay checkbox, built once in the preview header and re-synced by every refresh, so it
   // can never keep showing a value the server (or the queue) no longer has.
   let underlayInput = null;
@@ -113,15 +124,27 @@ export async function render(container, ctx) {
     // checkbox and the preview's URL have to follow the value the pane is now showing. This also
     // covers applyPending, which ends in refresh() after the queue has been sent.
     syncUnderlay();
+    // The preview shows the document the pane is showing (server values, plus a held draft). It
+    // has no bus of its own, so this is the only thing that keeps it honest across a poll.
+    pushPreview();
     return s.status;
   }
 
   /** One settings object through PATCH (which also broadcasts). The pane's whole settings view is
    *  replaced by the server's answer, so a control can never disagree with the document. */
   async function sendPatch(patchObj) {
-    const res = await api.patch('/api/handfx/settings', patchObj);
-    s.settings = Object.fromEntries(Object.entries(res.settings || {}).map(([k, d]) => [k, d.value]));
-    return res;
+    const keys = Object.keys(patchObj);
+    try {
+      const res = await api.patch('/api/handfx/settings', patchObj);
+      s.settings = Object.fromEntries(Object.entries(res.settings || {}).map(([k, d]) => [k, d.value]));
+      lastSend = { at: Date.now(), keys, changed: Array.isArray(res.changed) ? res.changed : [], error: null };
+      pushPreview();
+      paintPending();
+      return res;
+    } catch (err) {
+      lastSend = { at: Date.now(), keys, changed: [], error: err.message };
+      throw err;
+    }
   }
 
   /** One settings key. With Auto Apply off and no {force}, it is collected instead of sent. */
@@ -161,11 +184,64 @@ export async function render(container, ctx) {
     return Object.keys(pendingPatch).length + pendingCmds.length;
   }
 
+  /** What Apply will send, settings first, then page commands — the order it drains in. */
+  function pendingNames() {
+    return [...Object.keys(pendingPatch), ...pendingCmds.map((c) => c.name)];
+  }
+
+  /**
+   * What the gate is actually doing, from state a person can check: the queue, the server's own
+   * answer to the last write, and the overlay's last report. Nothing here is optimistic — the
+   * pane cannot prove the OBS source drew a value, so it never says it did.
+   */
+  function gateStatus() {
+    if (applying) {
+      const n = pendingCount();
+      return { tone: 'warn', text: `sending ${n} change${n === 1 ? '' : 's'} to the OBS source…` };
+    }
+    if (lastSend && lastSend.error) return { tone: 'bad', text: `not sent: ${lastSend.error}` };
+    const n = pendingCount();
+    // A held draft outranks an older send: it is what the operator is looking at right now.
+    if (!autoApply && n) {
+      return {
+        tone: 'warn',
+        text: `held, preview only: ${pendingNames().join(', ')} — the OBS source still has the old values. Press Apply to send.`,
+      };
+    }
+    if (lastSend) {
+      const sent = lastSend.keys;
+      const missed = sent.filter((k) => !lastSend.changed.includes(k));
+      if (missed.length) return { tone: 'warn', text: `sent, but the server did not change ${missed.join(', ')}` };
+      const age = s.page && s.page.at ? Date.now() - s.page.at : null;
+      const source =
+        age === null
+          ? 'the overlay has not reported yet'
+          : age < 4000
+            ? `overlay reported ${(age / 1000).toFixed(1)} s ago`
+            : `no report from the overlay since (last ${Math.round(age / 1000)} s ago)`;
+      return { tone: 'ok', text: `sent to OBS: ${lastSend.keys.join(', ')} · server holds them · ${source}` };
+    }
+    if (!autoApply) return { tone: 'idle', text: 'auto apply off — changes stay in this preview until Apply' };
+    return { tone: 'idle', text: '' };
+  }
+
   function paintPending() {
+    if (autoBox) autoBox.checked = autoApply;
     if (!applyBtn) return;
     const n = pendingCount();
     applyBtn.textContent = n ? `Apply (${n})` : 'Apply';
     applyBtn.disabled = autoApply || applying;
+    applyBtn.title = autoApply
+      ? 'Auto Apply is on: every change already reaches the OBS source at once.'
+      : `Send the ${n || 'held'} change(s) to the OBS overlay source, then re-read the status. The preview already shows them.`;
+    // A held write with no visible trace reads as a dead control, and a "sent" the source never
+    // confirmed reads as a lie: say which of held / sent / failed is true, from real state.
+    if (queuedLine) {
+      const st = gateStatus();
+      queuedLine.className = `hfx-note ${st.tone}`;
+      queuedLine.textContent = st.text;
+      queuedLine.hidden = !st.text;
+    }
   }
 
   /** Show collected edits on the pane the way a server answer would, so nothing snaps back. */
@@ -186,6 +262,10 @@ export async function render(container, ctx) {
     Object.assign(pendingPatch, patchObj);
     mirrorQueuedPatch(patchObj);
     render(); // redraws the Apply count and the controls from the queued values
+    // Auto Apply off: the draft goes to the pane's own preview and nowhere else. This is the
+    // whole point of the gate — a held change the preview does not show is indistinguishable
+    // from a broken control.
+    pushPreview();
     return { before, res: { ok: true, queued: true, settings: null } };
   }
 
@@ -416,28 +496,35 @@ export async function render(container, ctx) {
     renderLog();
   }
 
-  /** The gate beside the title, built with the header: the wall's markup and words, wired to this
-   *  pane's queue. */
+  /** The gate beside the title: the wall's markup and words, wired to this pane's queue.
+   *  Built once and handed back on every render, so the header can be redrawn under the
+   *  operator's pointer without ever replacing the checkbox or the button being pressed. */
   function applyGate() {
-    const box = el('input', { type: 'checkbox', id: 'handfx-auto-apply' });
-    box.checked = autoApply;
-    box.addEventListener('change', () => {
-      setAutoApply(box.checked);
+    if (gateEl) {
+      paintPending();
+      return gateEl;
+    }
+    autoBox = el('input', { type: 'checkbox', id: 'handfx-auto-apply' });
+    autoBox.checked = autoApply;
+    autoBox.addEventListener('change', () => {
+      setAutoApply(autoBox.checked);
       // turning the gate back on must not strand what was collected while it was off
-      if (box.checked) void applyPending();
+      if (autoBox.checked) void applyPending();
     });
-    const n = pendingCount();
     applyBtn = el('button', {
-      type: 'button', class: 'btn btn-sm', text: n ? `Apply (${n})` : 'Apply',
+      type: 'button', class: 'btn btn-sm', text: 'Apply',
       title: 'Send the held settings and commands to the OBS overlay, then re-read the status',
     });
-    applyBtn.disabled = autoApply || applying;
     applyBtn.addEventListener('click', () => { void applyPending(); });
-    return el('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
+    queuedLine = el('span', { class: 'hfx-note', hidden: true });
+    gateEl = el('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
       el('label', { class: 'switch-inline', for: 'handfx-auto-apply', title: 'Controls the OBS overlay source, not the preview: on, every change reaches the source at once; off, changes are held and reach it with Apply. The preview is always live.' },
-        box, el('span', { text: 'Auto Apply to OBS' })),
+        autoBox, el('span', { text: 'Auto Apply to OBS' })),
       applyBtn,
+      queuedLine,
     );
+    paintPending();
+    return gateEl;
   }
 
   function header(status, reg, page, enabled) {
@@ -499,6 +586,41 @@ export async function render(container, ctx) {
     pv?.setSrc(previewSrc());
   }
 
+  /**
+   * The document the pane is showing: the server's last status payload with every settings value
+   * the pane holds laid over it (so a held draft wins, exactly as the pane's own controls show it).
+   * Ratio's derived `effective` survives because the describe object is spread, not rebuilt.
+   */
+  function previewDoc() {
+    const base = s.status || {};
+    const settings = {};
+    for (const [k, d] of Object.entries(base.settings || {})) {
+      settings[k] = { ...d, value: k in s.settings ? s.settings[k] : d.value };
+    }
+    for (const [k, v] of Object.entries(s.settings)) if (!(k in settings)) settings[k] = { value: v };
+    return { ...base, settings };
+  }
+
+  /**
+   * Push the pane's document into its own preview. The preview is the same overlay page mounted
+   * with `?preview=1`: it opens no bus and reads `/status` once at boot, so nothing published on
+   * the server reaches it. Its documented settings entry point (`window.__handfx.applySettings`,
+   * the hook its tests use) is therefore the only way to show it a draft — and the safest one:
+   * the call mutates that one preview document's memory. Nothing is written to the server and
+   * nothing is published, so a draft held with Auto Apply off cannot reach the OBS source.
+   */
+  function pushPreview() {
+    const win = pv && pv.iframe && pv.iframe.contentWindow;
+    const hook = win && win.__handfx;
+    if (!hook || typeof hook.applySettings !== 'function') return false;
+    try {
+      hook.applySettings(previewDoc());
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function previewCard() {
     if (!pv) {
       pv = mountPreview(previewHost, {
@@ -514,6 +636,10 @@ export async function render(container, ctx) {
         fence: { x: 0.3418, w: 0.3164 },
       });
       pv.el.querySelector('.pv-headright')?.append(underlayToggle());
+      // The preview reloads when the underlay toggle changes its URL, and a reloaded document
+      // boots from `/status` — which knows nothing about a held draft. Re-push the pane's own
+      // document on every load so the draft survives a reload.
+      pv.iframe?.addEventListener('load', () => pushPreview());
     }
     return pv.el;
   }
@@ -1170,25 +1296,34 @@ export async function render(container, ctx) {
 
   /* -------------------------------------------------------------- wiring */
 
+  /** The page facts the pane draws. The page acks every 500 ms and repeats them; a redraw is only
+   *  owed when one of them moves. */
+  function pageSignature(d) {
+    if (!d) return '';
+    return [d.tracking ? 1 : 0, d.hands ?? '', d.gesture ?? '', d.effect ?? '', d.error ?? ''].join('|');
+  }
+
   const unsub = events.subscribe('handfx', (msg) => {
     if (!msg) return;
     // The overlay's honest status line is `events.emit('handfx', 'page', {...})`, which reaches
     // the bus as `{event: 'page', channel: 'handfx', data}` (a command frame carries `cmd`).
     if (msg.event === 'page') {
       const data = msg.data || {};
+      const drawn = pageSignature(s.page);
       s.page = data;
       if (data.effect) {
         if (!s.live.has(data.effect)) s.live.set(data.effect, { startedAt: Date.now(), hands: data.hands, gesture: data.gesture });
       }
-      render();
+      // A redraw replaces every control in the pane. Doing that on a 500 ms ack put a new Apply
+      // button, Auto Apply checkbox and switch under the pointer twice a second, and a press
+      // whose mouseup landed on the replacement never fired: the pane read as dead. Redraw only
+      // when a fact drawn here moved; "reported 4s ago" ages on the 3 s status poll.
+      if (pageSignature(data) !== drawn) render();
       return;
     }
     // Any command can have changed the document (mirror.toggle writes it), and the pane's own
     // controls rendered from the old values would then lie: re-read rather than guess.
     if (msg.cmd) scheduleRefresh();
-    // The body page's beat arrives as its own /ack; the mask timestamp lives on /status, so a
-    // page event is a reason to re-read the status too (throttled like everything else).
-    if (msg.event === 'page') scheduleRefresh();
   });
 
   let refreshTimer = 0;

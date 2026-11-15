@@ -62,7 +62,7 @@ ctl.shutdown()                   # stop node and the supervisor
 | `shockbox_tui/control.py` | what the UI calls; no Textual, no threads |
 | `shockbox_tui/app.py` | the Textual screen |
 | `shockbox_tui/settings.py`, `apiclient.py`, `paths.py`, `logtail.py` | settings, HTTP, paths, log file |
-| `%LOCALAPPDATA%\ShockBox\runtime\` (`~/.local/state/shockbox/` on POSIX) | lock, `status.json`, `heartbeat`, `cmd.json`, `supervisor.pid`, `supervisor.log` (`shockbox_tui/paths.py:101-135`) |
+| `%PROGRAMDATA%\ShockBox\runtime\` (`~/.local/state/shockbox/` on POSIX) | lock, `status.json`, `heartbeat`, `cmd.json`, `supervisor.pid`, `supervisor.log` (`shockbox_tui/paths.py:101-135`) |
 | `<app>\logs\shockbox-YYYY-MM-DD.log` | node's stdout+stderr and the supervisor's `launcher:` lines — same file and rotation as `core/log.mjs` (`shockbox_tui/logtail.py:1-17`) |
 | `<app>\state\` | the app's state, as before (`shockbox_tui/paths.py:92-94`) |
 

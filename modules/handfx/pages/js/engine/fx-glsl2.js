@@ -77,17 +77,19 @@ vec2 field() {           // 0..1 uv, x scaled by aspect so circles stay round
  * u_aspect). Each bone is a curve: the straight line is pushed sideways by 1-D fbm that runs along
  * the bone AND in time, so the filament wanders instead of snapping frame to frame. A brightness
  * packet runs along every bone at a per-bone speed. Bones touching a landmark at (0,0) - the
- * tracker's "not seen" sentinel - are skipped. `u_count` is how many bone pairs to draw (0..22);
+ * tracker's "not seen" sentinel - are skipped. The bone table is not written here: `u_bone_a` /
+ * `u_bone_b` carry the pairs from the engine's GESTURE_BONES, and `u_count` says how many of them
+ * to draw - one list, so the shader can never fall out of step with the skeleton it draws.
  * `u_energy` widens and brightens; `u_fade` is the overall level.
  */
 export const WIRES = `${PRELUDE}
 uniform vec2 u_p[21];
+const int BONE_MAX = 24;   // >= GESTURE_BONES.length; slots past u_count are never read
+uniform int u_bone_a[BONE_MAX];
+uniform int u_bone_b[BONE_MAX];
 uniform int u_count;
 uniform float u_energy;
 uniform float u_fade;
-
-const int BONE_A[22] = int[22](0, 1, 2, 3, 0, 5, 6, 7, 5, 9, 10, 11, 9, 13, 14, 15, 13, 17, 18, 19, 0, 0);
-const int BONE_B[22] = int[22](1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 9, 13);
 
 float filament(float d, float w) {
   float core = smoothstep(w, 0.0, d);
@@ -100,10 +102,10 @@ void main() {
   vec3 acc = vec3(0.0);
   float a = 0.0;
   float amp = 0.006 + 0.010 * u_energy;
-  for (int i = 0; i < 22; i++) {
+  for (int i = 0; i < BONE_MAX; i++) {
     if (i >= u_count) break;
-    vec2 A = u_p[BONE_A[i]];
-    vec2 B = u_p[BONE_B[i]];
+    vec2 A = u_p[u_bone_a[i]];
+    vec2 B = u_p[u_bone_b[i]];
     if (dot(A, A) < 1e-8 || dot(B, B) < 1e-8) continue;
     vec2 ab = B - A;
     float len = max(length(ab), 1e-5);

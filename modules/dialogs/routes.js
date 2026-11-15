@@ -2,6 +2,10 @@ import { HttpError } from '../../core/id.mjs';
 import { createDialogState } from './state.mjs';
 import { checkTone } from '../notifications/audio-routes.mjs';
 import { DEFAULT_DIALOG_TONE, DEFAULT_TONES } from '../notifications/sound.mjs';
+// One build id for the whole presentation bundle, hashed once in the notifications module. The
+// dialogs page asks its own module (its endpoint should not die with a module it does not own),
+// but the answer must be the same value: both popups are deployed together and share `sound.mjs`.
+import { OVERLAY_BUILD } from '../notifications/routes.js';
 
 // Alerts module — the dialog side of the popup feature.
 //
@@ -133,6 +137,15 @@ export default {
             };
           }
           return { ...audio.listRoute(), key: 'tone' };
+        },
+      },
+      {
+        method: 'GET',
+        path: '/build',
+        // The dialogs document polls this; the value is the shared presentation bundle id, so a
+        // deploy of either popup (or the shell) reaches this page on the same answer.
+        handler() {
+          return { build: OVERLAY_BUILD };
         },
       },
       {

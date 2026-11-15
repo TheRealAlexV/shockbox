@@ -7,7 +7,7 @@ the one-time retirement of the old `LedWallAgent` / `ErrorPopups-Server` tasks.
 Related:
 
 - [`docs/TUI.md`](../docs/TUI.md) — the Textual controller and the detached supervisor, plus every
-  file in `%LOCALAPPDATA%\ShockBox\runtime`.
+  file in `%PROGRAMDATA%\ShockBox\runtime`.
 - [`docs/WIRING.md`](../docs/WIRING.md) — the machine topology, WSL loopback, and which base URL
   goes where.
 - [`docs/DECK.md`](../docs/DECK.md) — the Stream Deck keys and the exact HTTP bodies they post.

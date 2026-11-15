@@ -30,6 +30,9 @@ import { makeHand, OPEN_PALM } from './pose.js';
 const MODEL_CACHE = 'handfx:models-v1';
 const MODEL_KEY_LOCAL = '/handfx/model/hand_landmarker.task?from=local';
 const MODEL_KEY_CDN = '/handfx/model/hand_landmarker.task?from=cdn';
+/** A model fetch can land mid-deploy (a 500, a reset socket). Two retries, then the page settles. */
+const MODEL_ATTEMPTS = 3;
+const MODEL_RETRY_MS = 800;
 
 /** How long a detect may stay unanswered before the detector thread is presumed dead. */
 export const DETECT_TIMEOUT = 3000;
@@ -52,6 +55,22 @@ export function wasmFileset(base = '/api/handfx/vendor') {
     assetLoaderPath: undefined,
     assetBinaryPath: undefined,
   };
+}
+
+/**
+ * Which copy of the model a page should use, from the `/status` document it managed to read.
+ *
+ * The local route (`/api/handfx/model`) is a constant of this server, so it is the default: only a
+ * status document that answers with a remote URL can send a page elsewhere. A read that failed, or
+ * one that names neither a local copy nor a URL, used to leave both `modelLocal` false and no URL —
+ * which threw "no model source" and latched the synthetic rig for the life of the document.
+ * An explicit `model.local: true` still means local, and an answered URL is still honoured.
+ */
+export function modelSourceFor(status) {
+  const model = status && status.model;
+  const url = model && model.url ? model.url : undefined;
+  const local = Boolean(model && model.local) || !url;
+  return { modelLocal: local, modelUrl: local ? undefined : url };
 }
 
 /**
@@ -100,9 +119,11 @@ function clamp(n, lo, hi) {
 }
 
 export class Tracker {
-  constructor({ onFrame, onState, worker, clock, task } = {}) {
+  constructor({ onFrame, onState, worker, clock, task, log } = {}) {
     this.onFrame = onFrame || (() => {});
     this.onState = onState || (() => {});
+    // Where a retry is reported. The page hands in its event stream; a bare harness gets silence.
+    this.log = log || (() => {});
     // The worker's graph. The overlay drives hands; a page that needs another graph starts its own
     // worker with that task rather than changing this one's shape.
     this.task = task || 'hand';
@@ -313,11 +334,22 @@ export class Tracker {
     this._setState({ model: 'loading' });
     try {
       let model;
-      try {
-        model = await fetchModel({ local: opts.modelLocal, url: opts.modelUrl, signal: AbortSignal.timeout(45000) });
-      } catch (err) {
-        this._setState({ model: 'failed' });
-        throw new MediaError('model', `Hand model unavailable: ${err.message}`);
+      // A transient source failure costs a retry, never the detector: the page used to latch the
+      // synthetic rig for the life of the document over one 500. Bounded, and only while a start
+      // is in flight — with a landmarker already loaded this method returns above.
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          model = await fetchModel({ local: opts.modelLocal, url: opts.modelUrl, signal: AbortSignal.timeout(45000) });
+          if (attempt > 1) this.log(`hand model loaded on attempt ${attempt}/${MODEL_ATTEMPTS} from ${model.from}`);
+          break;
+        } catch (err) {
+          if (attempt >= MODEL_ATTEMPTS) {
+            this._setState({ model: 'failed' });
+            throw new MediaError('model', `Hand model unavailable: ${err.message}`);
+          }
+          this.log(`hand model load failed (attempt ${attempt}/${MODEL_ATTEMPTS}): ${err.message} — retrying in ${MODEL_RETRY_MS} ms`);
+          await new Promise((resolve) => setTimeout(resolve, MODEL_RETRY_MS));
+        }
       }
       const conf = confidenceFor(opts.sensitivity);
       // The bytes stay here: a worker that hangs is terminated and rebuilt, and downloading the

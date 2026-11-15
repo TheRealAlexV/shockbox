@@ -96,7 +96,18 @@ function connect(wsUrl) {
 /* ------------------------------------------------------------------ the run */
 
 const srv = await startServer({ root: ROOT, statePrefix: 'sb-merged-' });
-const chrome = await launchChrome({ size: [1440, 900], profilePrefix: 'sb-chrome-merged-', extraArgs: ['--disable-gpu'] });
+const chrome = await launchChrome({
+  size: [1440, 900],
+  profilePrefix: 'sb-chrome-merged-',
+  // The strip's wall layer is the real `/wall/portrait` engine, and the engine needs a WebGL2
+  // context (test/wall-browser.mjs says the same). `--disable-gpu` tells Chrome not to bother with
+  // one, so a headless runner with no device falls back to the engine's canvas branch, which blocks
+  // the page's main thread for seconds at a time: measured here at 3890 ms for a `setTimeout(0)`,
+  // and a raised alert took >15 s to paint against this gate's 5 s budget. Ask for SwiftShader
+  // explicitly instead — the same pair handfx-visual and wall-browser use — and the same alert
+  // paints in ~90 ms.
+  extraArgs: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
+});
 const c = connect(chrome.wsUrl);
 const errors = [];
 let exitCode = 0;

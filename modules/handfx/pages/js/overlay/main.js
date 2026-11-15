@@ -17,13 +17,30 @@
 // No camera, no blank page: the synthetic rig draws until a real track runs, and comes back when
 // that track fails or ends.
 
-import { Tracker, syntheticHands } from '../engine/tracker.js';
+import { Tracker, modelSourceFor, syntheticHands } from '../engine/tracker.js';
 import { createPublisher } from './publish.js';
 import { createRelay } from './relay.js';
 import { cameraWanted, rearmCamera } from './rearm.js';
 import { createWatchdog } from './watchdog.js';
 import { createBuildCheck } from './build-check.js';
-import { classify, Motion, GestureGate } from '../engine/gestures.js';
+import {
+  classify,
+  dedupeHands,
+  Motion,
+  GestureGate,
+  palmFacing,
+  palmFacingSigned,
+  facingCorrected,
+  palmNormal,
+  palmArea,
+  aimVector,
+  Thrust,
+  THRUST_RATE,
+  THRUST_FRAMES,
+  THRUST_WINDOW,
+  THRUST_COOLDOWN_MS,
+  THRUST_FACING_MIN,
+} from '../engine/gestures.js';
 import { FxRenderer, EFFECTS, anchorsFrom, fenceRectFor } from '../engine/fx.js';
 
 /**
@@ -174,7 +191,13 @@ const state = {
 };
 
 const fx = new FxRenderer(canvas, { onError: (msg) => setBanner(`Effects unavailable: ${msg}`, 'bad') });
-const tracker = new Tracker({ onFrame: onFrame, onState: onTrackerState });
+const tracker = new Tracker({
+  onFrame: onFrame,
+  onState: onTrackerState,
+  // Model load retries belong in the page-event stream, not only in the console: the page that
+  // recovered from a deploy-time 500 is otherwise indistinguishable from one that never failed.
+  log: (msg) => reportRelayEvent('model', msg),
+});
 // The relayed camera: the server's ffmpeg feed of the WebcamSwitcher virtual camera. The page
 // cannot open that device itself (WebcamSwitcher holds it), so it reads the MJPEG stream instead
 // and feeds each decoded frame to the tracker's own detect path.
@@ -300,6 +323,32 @@ const publisher = createPublisher({
 });
 const motion = new Motion();
 const gate = new GestureGate();
+
+// A beat effect lives exactly as long as the gesture that fired it. Hands leaving is unambiguous
+// (the classifier cannot re-fire a gesture while they are gone), so release at once; a gesture
+// *change* with a hand still present waits `BEAT_LINGER_MS`, so one misclassified frame does not
+// blink the effect off. `started` is every effect a beat has spawned, so a hand loss retires all
+// of them, not only the newest.
+const BEAT_LINGER_MS = 200;
+const beatFx = { id: null, gesture: null, until: 0, started: new Set() };
+
+// Ambience differs from a beat: `wires` is armed by presence alone, so losing the hand only has to
+// outlast a detection dropout. The 121 s capture had 15 single-sample dropouts (7 pure misses, 8
+// isolated one-frame glimpses), each long enough to start a half-second fade that the next frame
+// could not cancel. Release deadline: 0 means "no release pending".
+const WIRES_GRACE_MS = 200;
+let wiresGoneAt = 0;
+
+function releaseBeat(id) {
+  if (!id) return;
+  if (fx.live.has(id)) fx.release(id);
+  beatFx.started.delete(id);
+  if (beatFx.id === id) {
+    beatFx.id = null;
+    beatFx.gesture = null;
+    beatFx.until = 0;
+  }
+}
 
 let debugCtx = null;
 let debugCanvas = null;
@@ -481,7 +530,9 @@ function paintUnderlay(surface) {
     camCanvas.height = h;
   }
   camCtx.save();
-  if (state.settings?.mirror !== false) {
+  // `paintUnderlay` only runs when this page paints the camera, so this is `mirrorRule().on`:
+  // the camera draw and the landmarks are mirrored by the same answer.
+  if (mirrorRule().on) {
     camCtx.translate(w, 0);
     camCtx.scale(-1, 1);
   }
@@ -508,7 +559,13 @@ function applyBusCommand(msg) {
     if (state.seenIds.size > 200) state.seenIds = new Set([...state.seenIds].slice(-100));
   }
   const cmd = msg.cmd;
-  if (cmd === 'effect.next' || cmd === 'effect.prev') {
+  if (cmd === 'diag.start') {
+    // A capture arms the overlay it is measuring. No reload: the source keeps drawing the same
+    // picture while the samples flow.
+    diagStart(msg.args && msg.args.seconds);
+  } else if (cmd === 'diag.stop') {
+    diagStop('cmd');
+  } else if (cmd === 'effect.next' || cmd === 'effect.prev') {
     const id = stepEffect(cmd === 'effect.next' ? 1 : -1);
     ensureSyntheticAnchors(); // no camera: draw on the synthetic rig instead of nothing
     fx.trigger(id, {});
@@ -1139,12 +1196,13 @@ async function startTracking({ fromBus = false, synthetic = false, explicit = fa
   renderState();
   const status = await loadStatus().catch(() => null);
   const s = state.settings || {};
+  // The model source is not a fact /status owns: see `modelSourceFor` — a failed read must leave
+  // the page on the local route, never with no source at all.
   const opts = {
     resolution: s.resolution || '720p',
     deviceId: s.deviceId || '',
     sensitivity: s.sensitivity ?? 1,
-    modelLocal: Boolean(status && status.model && status.model.local),
-    modelUrl: status && status.model ? status.model.url : undefined,
+    ...modelSourceFor(status),
   };
   syncSyntheticMode();
   if (wantSynthetic) {
@@ -1265,16 +1323,69 @@ function onTrackerState(snap) {
   renderState();
 }
 
+/**
+ * The one mirror rule, stated once so the sampler and the draw cannot drift apart. Landmarks are
+ * mirrored only when this page also paints the camera it mirrors: in the pane preview
+ * (`?camera=1`) `paintUnderlay` draws the camera through the same setting, so the picture and the
+ * landmarks agree. In the OBS source the page draws no camera pixels — the operator sees OBS's own
+ * camera, which the page never touched — so flipping the landmarks there would put every effect
+ * on the mirror image of the hand. The inputs are returned with the answer so a capture can
+ * explain itself without reading this code.
+ */
+function mirrorRule(settings = state.settings, underlay = state.underlay) {
+  const setting = !settings || settings.mirror !== false; // no document means mirrored
+  const paintsCamera = underlay === true; // only then is there a page-drawn camera to match
+  return { on: paintsCamera && setting, underlay: paintsCamera, setting };
+}
+
+// One launch detector per hand: the EMA must never mix two hands' distances. Fed on every frame,
+// not on every diag sample — a 3-frame rise would fall entirely between two 10 Hz samples.
+const thrusts = new Map();
+const thrustNow = new Map(); // this frame's decision per hand, for the sampler to report
+
+/**
+ * Advance the thrust detector once per hand per frame. Bookkeeping only: nothing in the page acts
+ * on a fire yet, it is published so a capture can show the timeline a launch would have used.
+ */
+function thrustStep(hands, now) {
+  thrustNow.clear();
+  if (!hands.length) {
+    for (const t of thrusts.values()) t.reset(); // a stale average is not a baseline
+    return;
+  }
+  for (const hh of hands) {
+    const key = hh.handedness || 'unknown';
+    let t = thrusts.get(key);
+    if (!t) {
+      t = new Thrust();
+      thrusts.set(key, t);
+    }
+    const lm = hh.landmarks;
+    // The gate needs the *signed* depth: `palmFacing`'s absolute value passes for a palm shown
+    // backwards. Handedness is the only chirality cue, so the sign is corrected for it here.
+    thrustNow.set(
+      key,
+      lm && lm.length
+        ? t.push(palmArea(lm), now, facingCorrected(lm, hh.handedness))
+        : t.push(0, now, 0),
+    );
+  }
+}
+
 function onFrame(frame) {
   // A frame is the only proof that a tracking claim is real. The relay reports `running/camera`
   // before its first frame, so the stall guard in autoCamera reads this stamp.
   state.lastFrameAt = performance.now();
-  // Mirroring happens here, once: the classifier and the effects both work in page space.
-  const mirror = state.settings?.mirror !== false;
-  const hands = (frame.hands || []).map((h) => ({
+  // Mirroring happens here, once: `mirrorRule` is the one statement of the rule, shared with the
+  // diagnostic sampler so what a capture reports is what this line actually did.
+  const mirror = mirrorRule().on;
+  // Deduped once, here: every consumer downstream (classify, anchors, view.palms, diagnostics)
+  // then works from the same corrected set.
+  const hands = dedupeHands((frame.hands || []).map((h) => ({
     handedness: h.handedness,
+    score: h.score,
     landmarks: mirror ? h.landmarks.map((p) => ({ x: 1 - p.x, y: p.y, z: p.z })) : h.landmarks,
-  }));
+  })));
   const centre = hands.length ? { x: hands[0].landmarks[9].x, y: hands[0].landmarks[9].y } : null;
   const swipe = motion.push(centre, frame.at);
   const result = classify(hands, { swipe });
@@ -1282,6 +1393,8 @@ function onFrame(frame) {
   state.gesture = result.gesture || 'none';
 
   const now = frame.at;
+  // Stage one of the projectile: record what the maths computes and act on nothing.
+  thrustStep(hands, now);
   gate.tick(now);
   const fired = gate.update(result.gesture, now);
   if (fired.fire) {
@@ -1299,10 +1412,47 @@ function onFrame(frame) {
   const anchors = anchorsFrom(result.hands);
   if (swipe && swipe.speed > 0.5 && anchors.anchor) anchors.swipe = { ...anchors.anchor, radius: 0.18 };
   fx.view = anchors;
+  // Diagnostics read this frame; when off it is one compare, and it never touches the draw.
+  diagMaybe(frame, hands, result, anchors, frame.at);
   // `camera` only while a camera track is actually live; every other frame is the synthetic rig.
   state.anchors = frame.source === 'camera' && tracker.state === 'running' && tracker.source === 'camera' ? 'camera' : 'synthetic';
-  if (hands.length && effectiveEffects().includes('embers') && !fx.live.has('embers') && result.gesture) {
+  // Ambience: embers rise with any hand in frame, wires trace the skeleton itself. Both are
+  // `gesture: 'any'` effects — a label the classifier never returns — so they are armed here from
+  // the presence of hands instead of a beat. wires cannot fire without hands: this is its only
+  // trigger, and the gate needs `hands.length`.
+  if (hands.length && effectiveEffects().includes('embers') && !fx.live.has('embers') && result.gesture !== 'none') {
     fx.trigger('embers', {});
+  }
+  // Re-arm on inactivity, not on absence. A released effect stays in `live` while its fade ramps
+  // down (fx.js deletes it only at fade < 0.01, most of a second), so `!live.has` ignored every hand
+  // seen during that ramp: 23 spans in the capture, every one starting with a single dropped
+  // sample. An entry that is present but inactive is as re-triggerable as a missing one. Losing the
+  // hand waits `WIRES_GRACE_MS` so one dropped sample never starts the fade at all, and a hand that
+  // returns clears the deadline. A real removal still reads as immediate: the capture's 6 s and
+  // 7.2 s gaps showed a 1.2 s overstay was unnoticeable, so 200 ms is inside the noise.
+  const wires = fx.live.get('wires');
+  if (hands.length) {
+    wiresGoneAt = 0;
+    if (effectiveEffects().includes('wires') && (!wires || !wires.active)) fx.trigger('wires', {});
+  } else if (wires && wires.active) {
+    if (!wiresGoneAt) wiresGoneAt = now + WIRES_GRACE_MS;
+    else if (now >= wiresGoneAt) {
+      fx.release('wires');
+      wiresGoneAt = 0;
+    }
+  }
+  // A beat effect is alive exactly as long as its gesture. No hands is unambiguous — the
+  // classifier cannot re-fire a gesture it cannot see — so every beat effect goes at once. A
+  // gesture *change* with a hand still in frame is only a claim until it holds: wait the grace
+  // beat before retiring the effect, so a single misclassified frame does not blink it off. A
+  // gesture that comes back cancels the pending release; `beat` below may also take the slot in
+  // this same frame, which retires the effect it replaces.
+  if (!hands.length) {
+    for (const id of [...beatFx.started]) releaseBeat(id);
+  } else if (beatFx.id) {
+    if (result.gesture === beatFx.gesture) beatFx.until = 0;
+    else if (!beatFx.until) beatFx.until = now + BEAT_LINGER_MS;
+    else if (now >= beatFx.until) releaseBeat(beatFx.id);
   }
   // A gesture beats one effect. The cursor's effect wins when the gesture owns it (that is how the
   // operator keeps a whole list reachable with eight gestures); otherwise the first enabled effect
@@ -1317,8 +1467,14 @@ function onFrame(frame) {
         : own.find((x) => effectiveEffects().includes(x))
       : null;
   if (beat) {
+    // A new beat takes over: whatever beat effect was alive belongs to the previous gesture.
+    if (beatFx.id && beatFx.id !== beat) releaseBeat(beatFx.id);
     if (beat === 'shoot') spawnShoot(anchors);
     else fx.trigger(beat, {});
+    beatFx.id = beat;
+    beatFx.gesture = fired.fire;
+    beatFx.until = 0;
+    beatFx.started.add(beat);
   }
   if (debugCtx) drawDebug(frame, hands, now);
   if (fx.settings.debugOverlay && tracker.video && now - (onFrame._texAt || 0) > 60) {
@@ -1711,7 +1867,264 @@ function drawDebug(frame, hands, now) {
   debugCtx.fillText(`${hands.length} hand${hands.length === 1 ? '' : 's'} · ${state.gesture}${frame.source === 'synthetic' ? ' · synthetic' : ''}`, 10, h - 10);
 }
 
-/* ---------------------------------------------------------------- frame loop */
+/* ---------------------------------------------------------------- frame diagnostics (?diag=1) */
+
+// `?diag=1` — or a `diag.start` command, which is how a capture arms an already-running source
+// without reloading it — turns on a per-frame record of what this page computed and drew. Off is
+// the normal case and costs one numeric compare per frame: `diagUntil` is 0, so nothing is
+// sampled, nothing allocated and no timer runs. On, it only *reads*: the geometry, the anchors and
+// the effect centres are the ones the frame already produced. No draw path is changed by it.
+const DIAG_ON = new URLSearchParams(location.search).get('diag') === '1';
+const DIAG_RATE_MS = 100; // ~10 Hz: a fifth of the render rate, and enough to see drift
+const DIAG_FULL_EVERY = 5; // every 5th sample carries all 21 landmarks; the rest carry three
+const DIAG_BATCH = 10; // samples per POST, about one second at 10 Hz
+const DIAG_MAX_QUEUE = 400; // a server that never answers must not grow the page's memory
+const DIAG_URL = '/api/handfx/diag';
+const DIAG_PICK = [0, 9, 8]; // wrist, middle MCP, index tip: the three the mapping is judged on
+
+let diagUntil = 0; // Date.now() deadline; 0 means off
+let diagNextAt = 0;
+let diagCount = 0;
+let diagQueue = [];
+let diagPosting = false;
+let diagTimer = 0;
+let diagSent = 0;
+let diagDropped = 0;
+
+const d4 = (v) => (Number.isFinite(v) ? Math.round(v * 10000) / 10000 : null);
+const d2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : null);
+
+/** Page space (0..1, y down) to canvas device pixels — the shaders' own scale, read backwards. */
+function diagPx(p, w, h) {
+  if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) || !w || !h) return null;
+  return { x: Math.round(p.x * w), y: Math.round(p.y * h) };
+}
+function diagPick(lm, full) {
+  if (!Array.isArray(lm)) return null;
+  const one = (i) => (lm[i] ? { x: d4(lm[i].x), y: d4(lm[i].y), z: d4(lm[i].z) } : null);
+  return full ? lm.map((p) => ({ x: d4(p.x), y: d4(p.y), z: d4(p.z) })) : DIAG_PICK.map(one);
+}
+function diagAnchor(p) {
+  return p && Number.isFinite(p.x) ? { x: d4(p.x), y: d4(p.y), r: d4(p.radius) } : null;
+}
+
+/**
+ * One sample of what this frame computed. `hands` are the mirrored page-space readings the
+ * classifier and the renderer both used; `view` is `fx.view` exactly as the effect layer got it.
+ */
+function diagSample(frame, hands, result, view, now) {
+  diagCount += 1;
+  const g = result && result.hands ? result.hands[0] : null;
+  // This frame's thrust decision for the hand the sample describes. A launch frame is forced
+  // full: the aim has to be auditable landmark by landmark on the frame it fired.
+  const thrust = g ? thrustNow.get(g.handedness || 'unknown') || null : null;
+  const full = diagCount % DIAG_FULL_EVERY === 1 || Boolean(thrust && thrust.fire);
+  const m = mirrorRule(); // the same rule `onFrame` applied this frame, not a copy of it
+  const w = fx.w || 0;
+  const h = fx.h || 0;
+  const video = tracker.video || null;
+  const fence = fenceRectFor(fx.settings.ratio, w, h);
+  const sample = {
+    n: diagCount,
+    ts: d2(now),
+    wallAt: Date.now(),
+    full,
+    source: frame.source || null,
+    mirror: {
+      // What the overlay really did this frame, with both inputs that decided it, so a capture
+      // explains itself: mirroring applies only when this page paints the camera it mirrors.
+      on: m.on,
+      underlay: m.underlay,
+      setting: m.setting,
+      applied:
+        'onFrame: x = 1 - x, once, before classify and before fx.view — only when state.underlay is true (the pane preview, ?camera=1); the OBS source never mirrors',
+    },
+    geometry: {
+      // What the relay sent, what the tracker read, what the canvas is, and what the CSS says:
+      // a mismatch between these is the first thing a landmark offset shows up as.
+      frame: { w: frame.width || null, h: frame.height || null },
+      video: { w: video ? video.videoWidth || null : null, h: video ? video.videoHeight || null : null },
+      canvas: {
+        w,
+        h,
+        cssW: canvas.clientWidth,
+        cssH: canvas.clientHeight,
+        dpr: w && canvas.clientWidth ? d2(w / canvas.clientWidth) : null,
+      },
+      ratio: fx.settings.ratio ?? null,
+      fence: fence ? { x: d4(fence.x), y: d4(fence.y), w: d4(fence.w), h: d4(fence.h) } : null,
+      crop: null, // the drawing code applies no crop: page space is the whole frame
+      mapping: 'page (0..1, y down) * canvas pixels; shader uv = (x * aspect, 1 - y)',
+    },
+    // The detector's own normalised space, unmirrored, as the worker reported it.
+    landmarks: (frame.hands || []).map((hh) => ({
+      handedness: hh.handedness || null,
+      lm: diagPick(hh.landmarks, full),
+    })),
+    // The same three after every mapping this page applies, in canvas pixels.
+    mapped: (hands || []).map((hh) => ({
+      handedness: hh.handedness || null,
+      wrist: diagPx(hh.landmarks && hh.landmarks[0], w, h),
+      middleMcp: diagPx(hh.landmarks && hh.landmarks[9], w, h),
+      indexTip: diagPx(hh.landmarks && hh.landmarks[8], w, h),
+    })),
+    anchors: view
+      ? {
+          anchor: diagAnchor(view.anchor),
+          anchorPx: diagPx(view.anchor, w, h),
+          front: diagAnchor(view.front),
+          swipe: diagAnchor(view.swipe),
+          palms: (view.palms || []).map((p) => ({ x: d4(p.x), y: d4(p.y), r: d4(p.radius) })),
+          // `view.hands` as the effect layer receives it; all 21 landmarks only on a full sample.
+          hands: (view.hands || []).map((hh) => ({
+            handedness: hh.handedness || null,
+            palm: hh.palm ? { x: d4(hh.palm.x), y: d4(hh.palm.y), r: d4(hh.palm.radius) } : null,
+            ...(full ? { landmarks: (hh.landmarks || []).map((p) => ({ x: d4(p.x), y: d4(p.y) })) } : {}),
+          })),
+        }
+      : null,
+    effects: [...fx.live.values()].map((l) => ({
+      id: l.id ?? null,
+      active: l.active !== false,
+      age: d2(l.age),
+      fade: d4(l.fade),
+      radius: d4(l.radius),
+      // The page-space centre this effect's shader was last handed, and the same in canvas pixels.
+      at: l.drawnAt ? { x: d4(l.drawnAt.x), y: d4(l.drawnAt.y) } : null,
+      px: diagPx(l.drawnAt, w, h),
+    })),
+    settingsEffects: Array.isArray(fx.settings.effects) ? fx.settings.effects.slice(0, 32) : [],
+    gesture: result
+      ? {
+          gesture: result.gesture || 'none',
+          palmUp: g ? !!g.palmUp : null,
+          palmFront: g ? !!g.palmFront : null,
+          point: g ? !!g.point : null,
+          fist: g ? !!g.fist : null,
+          open: g ? d4(g.open) : null,
+          count: g ? g.count ?? null : null,
+          palmFacing: g && Array.isArray(g.landmarks) ? d4(palmFacing(g.landmarks)) : null,
+          centre: g && g.centre ? { x: d4(g.centre.x), y: d4(g.centre.y) } : null,
+          scale: g ? d4(g.scale) : null,
+        }
+      : null,
+    // Stage one of the projectile, published on every sample: where the palm points (raw normal and
+    // the mapped aim) and what the launch detector saw. `fire` is a one-shot — true on the frame it
+    // fires, false otherwise — so a capture reads as a timeline rather than a latched flag.
+    // `hand` rides along because the aim's depth sign is a property of the hand MediaPipe reports.
+    aim:
+      g && Array.isArray(g.landmarks) && g.landmarks.length >= 18
+        ? (() => {
+            const n = palmNormal(g.landmarks);
+            const a = aimVector(g.landmarks, w, h);
+            return {
+              hand: g.handedness || null,
+              nx: d4(n.x),
+              ny: d4(n.y),
+              nz: d4(n.z),
+              unit: 'page (0..1, y down) → x * aspect, 1 − y; z: +1 toward the camera, −1 away',
+              norm: { x: d4(a.x), y: d4(a.y), z: d4(a.z) },
+              // The two inputs the mapping consumed, so an aim can be recomputed from the sample.
+              aspect: w && h ? d2(w / h) : null,
+              // `facing` is the absolute depth the old gate used; `zSigned` is the real signed
+              // component in the aim's Left-positive convention, so the direction is auditable
+              // instead of collapsed into a magnitude. The thrust gate consumes
+              // `facingCorrected` (this negated for a Right hand); `hand` says which applied.
+              facing: d4(palmFacing(g.landmarks)),
+              zSigned: d4(palmFacingSigned(g.landmarks)),
+            };
+          })()
+        : null,
+    thrust: thrust
+      ? {
+          fire: thrust.fire,
+          rate: d4(thrust.rate),
+          ema: d4(thrust.ema),
+          m: d4(thrust.m),
+          // Why a frame that looked fireable did not fire: the rise count the window held, and
+          // the first gate that refused ('rate', 'window', 'facing', 'cooldown'); null on a fire.
+          rises: thrust.rises,
+          gate: thrust.gate,
+          ...(full
+            ? {
+                thresholds: {
+                  rate: THRUST_RATE,
+                  frames: THRUST_FRAMES,
+                  window: THRUST_WINDOW,
+                  cooldownMs: THRUST_COOLDOWN_MS,
+                  facingMin: THRUST_FACING_MIN,
+                },
+              }
+            : {}),
+        }
+      : null,
+  };
+  diagQueue.push(sample);
+  if (diagQueue.length > DIAG_MAX_QUEUE) {
+    diagDropped += diagQueue.length - DIAG_MAX_QUEUE;
+    diagQueue.splice(0, diagQueue.length - DIAG_MAX_QUEUE);
+  }
+}
+
+/** POST the queued samples. A missing endpoint or a refused request is swallowed: never a throw. */
+function diagFlush() {
+  try {
+    if (diagUntil && Date.now() > diagUntil) diagStop('expired');
+    if (diagPosting || !diagQueue.length) return;
+    const batch = diagQueue.slice(0, DIAG_BATCH);
+    diagQueue = diagQueue.slice(batch.length);
+    diagPosting = true;
+    fetch(DIAG_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ diag: true, clientId: CLIENT_ID, build: BUILD, samples: batch }),
+    })
+      .then((r) => { if (r && r.ok) diagSent += batch.length; })
+      .catch(() => {})
+      .finally(() => { diagPosting = false; });
+  } catch {
+    diagPosting = false;
+  }
+}
+
+function diagStart(seconds) {
+  const s = Math.max(1, Math.min(3600, Number(seconds) || 600));
+  diagUntil = Date.now() + s * 1000;
+  if (!diagTimer) diagTimer = setInterval(diagFlush, 1000);
+  camLog(`diag: armed for ${s}s`);
+}
+
+function diagStop(why) {
+  const was = Boolean(diagUntil || diagTimer);
+  diagUntil = 0;
+  if (diagTimer) clearInterval(diagTimer);
+  diagTimer = 0;
+  if (!was) return;
+  camLog(`diag: stopped (${why}), ${diagSent} sent, ${diagDropped} dropped`);
+  diagFlush(); // the tail, once, without rearming
+}
+
+/** The one call the frame handler makes. Off, it is a single compare. */
+function diagMaybe(frame, hands, result, view, now) {
+  if (!diagUntil) return;
+  if (Date.now() > diagUntil) { diagStop('expired'); return; }
+  if (now < diagNextAt) return;
+  diagNextAt = now + DIAG_RATE_MS;
+  try {
+    diagSample(frame, hands, result, view, now);
+  } catch (err) {
+    // Observation must never be the reason a frame is lost.
+    state.diagFails += 1;
+  }
+}
+
+// `?diag=1` is the page's own switch: armed from load, for an hour, so a source that was pointed
+// at the diagnostic URL samples without anyone posting a command. A command can still stop it.
+if (DIAG_ON) {
+  diagUntil = Date.now() + 3600 * 1000;
+  diagTimer = setInterval(diagFlush, 1000);
+}
+
 
 let bodyTickAt = 0;
 /** The diagnostic readout's element: written on every loop tick, so it is as live as the paint. */

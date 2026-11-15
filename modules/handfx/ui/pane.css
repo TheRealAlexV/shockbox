@@ -98,6 +98,8 @@
 .hfx-note.ok { color: var(--ok); }
 .hfx-note.bad { color: var(--bad); }
 .hfx-note.warn { color: var(--warn); }
+/* The gate's status line (`.hfx-note` + a tone class): "held, preview only" / "sent to OBS" /
+   "not sent" — the operator's only way to tell a queued write from a dead control. */
 
 /* ------------------------------------------------------------------ side cards */
 

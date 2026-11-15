@@ -27,6 +27,8 @@ import { createPublisher } from './publish-pipe.mjs';
 import { BOUNDARY, createCameraRelay } from './camera-relay.mjs';
 // Revives the browser source document CEF discarded while its scene was off air. See the file.
 import { createSourceWatchdog } from './source-watchdog.mjs';
+// Which page clients are provably on a stale build. Pure, so the rule is testable without a server.
+import { staleClients, normalizeBuild } from './stale-clients.mjs';
 // The document identity a request declares (`?role=`) or inherits (its `Referer` path), shared with
 // the SSE hub so both long-lived responses are superseded by the same rule.
 import { roleOf, refPath, validRole, clientIdOf } from '../../core/events.mjs';
@@ -126,6 +128,11 @@ const STREAM_BUFFER_MAX = 1024 * 1024;
  * roles are reported beside it and can never answer in its place.
  */
 const HEADLINE_ROLE = '/shockfx';
+// The pane's preview is the overlay document itself (`/shockfx` in an iframe, `?camera=1`), so it
+// declares the *source's* role. Server-derived, never taken from the request: a preview row that
+// shared HEADLINE_ROLE would be picked by `freshestPage` as "the page" and could hide a dead source.
+// No long-lived stream ever declares this role, so it cannot collide in the socket census either.
+const PREVIEW_ROLE = '/shockfx/preview';
 /**
  * A client that has neither acked nor beaten for this long is not a candidate for its role's
  * verdict, however recent a single ack looked. The page acks every 500 ms (`ACK_MS` in
@@ -217,6 +224,11 @@ export const CMDS = [
   'mirror.toggle',
   'projectile.fire',
   'edit.clear',
+  // Diagnostics: arm/stop the overlay's per-frame sampler without reloading the source. The page
+  // records {frame, mapped, anchors, effects, gesture} at ~10 Hz and POSTs the batch to /diag;
+  // `seconds` bounds the run so an operator who walks away does not leave it on.
+  'diag.start',
+  'diag.stop',
   'reload',
 ];
 
@@ -406,6 +418,13 @@ function build(ctx) {
   // page buffers its own ring too, but a page that dies cannot be asked, so the server keeps the
   // last 50 it heard. Each entry carries the reporting clientId and build.
   const pageEvents = [];
+  // Per-frame page diagnostics (POST /diag, ?diag=1 on the overlay). A separate ring from
+  // `pageEvents` on purpose: this is 10 Hz of geometry, and mixing it with the error ledger would
+  // evict every real error within five seconds. The capture tool drains it with GET /diag?since=.
+  // Accepted only when the POST carries `diag: true`, which the page sends only when it is
+  // sampling; a source that was never armed can therefore not fill it.
+  const diagRing = [];
+  const diagState = { seq: 0, received: 0, dropped: 0, refused: 0, lastAt: 0, clients: new Set() };
   /**
    * Block testimony from the overlay's watchdog *worker* (GET /page-blame), one entry per client.
    *
@@ -487,10 +506,15 @@ function build(ctx) {
   // What the watchdog needs to answer "is the document dead": the newest ack across every client
   // record, with `draw.lastAckAt` as the pre-clientId fallback. Assigned here and replaced by the
   // serving build, because the module is built twice.
-  handfxWatchdogSnapshot = () => ({
-    lastAckAt: Math.max(draw.lastAckAt || 0, ...[...clientsById.values()].map((c) => c.lastAckAt || 0)),
-    clients: clientsById.size,
-  });
+  handfxWatchdogSnapshot = () => {
+    // Previews excluded on purpose: a live pane preview must not keep the watchdog from reviving a
+    // dead OBS source, and its ack is not evidence about the document on air.
+    const pages = [...clientsById.values()].filter((c) => c.preview !== true);
+    return {
+      lastAckAt: Math.max(draw.lastAckAt || 0, ...pages.map((c) => c.lastAckAt || 0)),
+      clients: pages.length,
+    };
+  };
   /**
    * The socket census: one row per long-lived response this process holds open, with the identity
    * that owns it and how long it has been open. The pane polls /status at 1 Hz, so it can read the
@@ -644,7 +668,9 @@ function build(ctx) {
   function streamCensus(now, consuming) {
     const freshest = new Map();
     for (const c of clientsById.values()) {
-      if (!c.role) continue;
+      // A preview is a viewer, not a page: it never answers which client is *current* for a role,
+      // or a lone preview would outrank its own source in the socket census.
+      if (!c.role || c.preview === true) continue;
       const prev = freshest.get(c.role);
       if (!prev || (c.lastAckAt || 0) > (prev.lastAckAt || 0)) freshest.set(c.role, c);
     }
@@ -951,6 +977,9 @@ function build(ctx) {
     let best = null;
     let bestRank = null;
     for (const c of clientsById.values()) {
+      // Preview rows are viewers, never pages: they must not be returned as a role's page, or a
+      // lone preview iframe would answer `freshestPage()` while the source is down.
+      if (c.preview === true) continue;
       if (!match(c) || !clientAlive(c, now, consuming)) continue;
       const r = candidateRank(c, now, consuming);
       if (!best || r[0] > bestRank[0] || (r[0] === bestRank[0] && r[1] > bestRank[1])) {
@@ -981,7 +1010,9 @@ function build(ctx) {
     if (headline) return headline;
     const other = bestClient(now, (c) => Boolean(c.role), consuming);
     if (other) return other;
-    if ([...clientsById.values()].some((c) => c.role)) return null; // roles exist, none reporting
+    // "Roles exist, none reporting" — a preview row is not a reporting role: with only a preview
+    // left, the legacy no-clientId fallback below must still answer for the cached document.
+    if ([...clientsById.values()].some((c) => c.role && c.preview !== true)) return null;
     const legacy = bestClient(now, () => true, consuming);
     if (legacy) return legacy;
     // A document cached before `clientId` existed still acks, and calling it dead because it has no
@@ -1122,6 +1153,9 @@ function build(ctx) {
     }
     const streamClients = relay.status().clients;
     for (const c of clientsById.values()) {
+      // A preview's silence is not a page death: a viewer that stopped acking is not a source that
+      // stopped drawing, and naming it `client-not-live` would blame the overlay.
+      if (c.preview === true) continue;
       const ackAgeMs = c.lastAckAt ? Math.max(0, now - c.lastAckAt) : null;
       const ackFresh = ackAgeMs != null && ackAgeMs <= PAGE_FRESH_MS;
       if (ackFresh) continue;
@@ -1178,7 +1212,7 @@ function build(ctx) {
     let c = clientsById.get(id);
     if (!c) {
       const source = ['camera', 'synthetic', 'none'].includes(bodyIn.anchors) ? bodyIn.anchors : 'none';
-      c = { id, role: roleIn, userAgent: clientUa(req), pagePath: clientPath(req, roleIn), firstAckAt: now, lastAckAt: now, lastDrawAt: 0, loopTicks: 0, lastLoopAt: 0, hidden: null, visibility: '', effect: null, build: null, source, drawCount: 0, drawSeenCount: -1, drawSeenAt: 0, phases: [], silentLogged: false, wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0, beatPhase: '', loopAdvAt: now };
+      c = newClientRow(id, roleIn, req, now, source);
       clientsById.set(id, c);
       log.info(`handfx page: first ack clientId=${id} role=${roleIn || '-'} build=${typeof bodyIn.build === 'string' ? bodyIn.build : ''} source=${source}`);
     }
@@ -1231,6 +1265,98 @@ function build(ctx) {
     // Does this page need camera frames? Overwritten on every ack, never latched: the ack that
     // stops saying it (or stops arriving) is the release.
     c.wantsFeed = bodyIn.wantsFeed === true;
+  }
+
+  /** A ledger row, in the one shape every writer (ack, preview) must produce. */
+  function newClientRow(id, role, req, now, source = 'none') {
+    return {
+      id, role, userAgent: clientUa(req), pagePath: clientPath(req, role), firstAckAt: now, lastAckAt: now,
+      lastDrawAt: 0, loopTicks: 0, lastLoopAt: 0, hidden: null, visibility: '', effect: null, build: null,
+      source, drawCount: 0, drawSeenCount: -1, drawSeenAt: 0, phases: [], silentLogged: false,
+      wantsFeed: false, reloads: 0, lastReloadAt: 0, staleSince: 0, beatAt: 0, beatTicks: 0, beatDraws: 0,
+      beatPhase: '', loopAdvAt: now, preview: false,
+    };
+  }
+
+  /**
+   * A `preview: true` ack: the pane's iframe. It is registered so the build rule can *see* it — a
+   * stale preview is exactly the leftover the operator asked to hunt — and marked so every liveness
+   * path ignores it, which is why it used to be dropped on the floor instead.
+   *
+   * `preview: true` is set from the ack body, the role is always `PREVIEW_ROLE`, `wantsFeed` is
+   * never taken (a preview must not arm the camera's demand), and no draw/beat counters are read:
+   * the row exists to be identified and ended, not to answer "is the page alive".
+   */
+  function registerPreview(bodyIn, req) {
+    const id = typeof bodyIn.clientId === 'string' ? bodyIn.clientId.trim().slice(0, 64) : '';
+    if (!id) return null;
+    const now = Date.now();
+    let c = clientsById.get(id);
+    if (!c) {
+      c = newClientRow(id, PREVIEW_ROLE, req, now);
+      clientsById.set(id, c);
+      log.info(`handfx preview: first ack clientId=${id} build=${normalizeBuild(bodyIn.build) || 'unknown'} path=${c.pagePath || '-'}`);
+    }
+    c.preview = true;
+    c.role = PREVIEW_ROLE;
+    if (!c.userAgent) c.userAgent = clientUa(req);
+    if (!c.pagePath) c.pagePath = clientPath(req, PREVIEW_ROLE);
+    if (!c.firstAckAt) c.firstAckAt = now;
+    c.lastAckAt = now;
+    c.silentLogged = false;
+    // Identity only: a preview never contributes drawing, source, feed demand or beat evidence.
+    c.wantsFeed = false;
+    if (typeof bodyIn.build === 'string' && bodyIn.build) c.build = bodyIn.build.slice(0, 64);
+    return c;
+  }
+
+  /**
+   * End one ledger row everywhere it can still be holding the server: its camera-stream readers and
+   * its `/events` bus responses, then the row itself. One line, always, naming the victim, its
+   * build and the reason — silent client death is how a stale document stayed invisible for
+   * sixteen hours. Idempotent: a row that is already gone returns `{ alreadyGone: true }` and logs
+   * nothing, so a manual kill racing the sweep is a no-op rather than an error.
+   */
+  function endClientEverywhere(id, why, actor) {
+    const row = clientsById.get(id);
+    // The readers are freed even when the ledger has no row for them: a page that answered
+    // `preview: true` never registers an ack row, yet it still opens a camera stream under its
+    // clientId, and that is exactly a consumer slot a human is trying to reclaim.
+    const streams = relay.endClient(id);
+    const bus = events.endClient(id);
+    if (row) clientsById.delete(id);
+    // Idempotent: nothing to end and no row to forget is a no-op that logs nothing.
+    if (!row && !streams && !bus) return { alreadyGone: true, streams: 0, bus: 0 };
+    const victimBuild = row ? normalizeBuild(row.build) || 'unknown' : 'unknown';
+    log.info(`handfx page: ended clientId=${id} role=${(row && row.role) || '-'} build=${victimBuild} — ${why}; actor=${actor || '-'}; ended=${streams} stream(s), ${bus} bus response(s)`);
+    return { alreadyGone: false, streams, bus };
+  }
+
+  /**
+   * The automatic rule, run from `/ack`: a page that reports the current build proves every other
+   * client of the same role on a different, non-empty build is a document that failed to reload.
+   * It is still holding an SSE and possibly a camera reader, which is what this frees.
+   *
+   * Reference gate: only a client on `BUILD` with a fresh ack can vouch for a role, so a stale
+   * document that keeps acking can never evict a current one (no ping-pong), and a half-broken new
+   * page cannot kill a working predecessor. `actingClientId` is excluded by construction: an ack
+   * never ends the client whose request it is. The decision itself is `staleClients` (pure).
+   */
+  function reapStaleClients(actingClientId) {
+    const now = Date.now();
+    const verdicts = staleClients([...clientsById.values()], now, {
+      freshMs: PAGE_FRESH_MS,
+      currentBuild: BUILD,
+      actingClientId,
+    });
+    for (const v of verdicts) {
+      endClientEverywhere(
+        v.id,
+        `stale build ${v.build} != ${v.referenceBuild}, superseded by clientId=${v.referenceId}`,
+        `ack from clientId=${actingClientId}`,
+      );
+    }
+    return verdicts.length;
   }
 
   /**
@@ -1318,6 +1444,9 @@ function build(ctx) {
     const now = Date.now();
     let holder = null;
     for (const c of clientsById.values()) {
+      // A preview must not arm the camera: it is a viewer of the source, and its `?camera=1` iframe
+      // is the pane's toggle, not evidence the overlay wants frames.
+      if (c.preview === true) continue;
       if (c.wantsFeed !== true) continue;
       const heardAt = c.beatAt || c.lastAckAt || 0;
       if (!heardAt || now - heardAt > PAGE_FRESH_MS) continue;
@@ -1384,6 +1513,9 @@ function build(ctx) {
   function rolesView(now, consuming) {
     const groups = new Map();
     for (const c of clientsById.values()) {
+      // A preview is not a role: it would add a `/shockfx/preview` row to /status.roles with no
+      // page behind it. It is reported on its own as `previewClients` and in /clients.
+      if (c.preview === true) continue;
       const key = c.role || null;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(c);
@@ -1415,7 +1547,9 @@ function build(ctx) {
   /** The public shape: the barest facts, no internal bookkeeping (`silentLogged` stays here). */
   function clientList(consuming) {
     const now = Date.now();
-    return [...clientsById.values()].map((c) => ({
+    // Previews are not pages: they are reported in /clients (with `preview: true`) and counted as
+    // `previewClients`, never mixed into the page list a reader takes for the overlay's clients.
+    return [...clientsById.values()].filter((c) => c.preview !== true).map((c) => ({
       id: c.id,
       // Which document this is, independent of the ephemeral clientId: two entries with the same
       // role are one page's predecessor and successor, and /status can say so.
@@ -1643,7 +1777,7 @@ function build(ctx) {
       // `stale: true`. The rest of the relay's report is carried through untouched, and `clients`
       // stays the number of stream readers it has always been; `clientCount`/`clientList` are the
       // acking pages, which is a different population.
-      cameraFeed: { ...feed, state: truth.state, live: truth.live, reason: truth.reason, clientCount: clientsById.size, clientList: clientList(consuming) },
+      cameraFeed: { ...feed, state: truth.state, live: truth.live, reason: truth.reason, clientCount: [...clientsById.values()].filter((c) => c.preview !== true).length, previewClients: [...clientsById.values()].filter((c) => c.preview === true).length, clientList: clientList(consuming) },
       // Two independent clocks for bracketing a freeze: the worker's tick count and the provenance
       // of the last ack. A page frozen mid-draw while these advance is a thread-level stall; these
       // stopping with it is a wedged renderer process.
@@ -1709,6 +1843,62 @@ function build(ctx) {
       // Everything the pane and the page need in one read: the settings document, the effect
       // registry, the bus contract and whether the vendored runtime is on disk.
       { path: '/status', method: 'GET', handler: (req, res) => send(res, 200, status()) },
+      // The client table: every document the ledger knows, with the facts needed to judge it, and
+      // a `stale` verdict computed against the server's own build. Read-only; the pane's 1 Hz
+      // /status poll does not need it, and enumerating readers is cheap here.
+      {
+        path: '/clients',
+        method: 'GET',
+        handler: (req, res) => {
+          const now = Date.now();
+          const consuming = consumingReaders(now);
+          const reapable = new Set(staleClients([...clientsById.values()], now, {
+            freshMs: PAGE_FRESH_MS,
+            currentBuild: BUILD,
+          }).map((v) => v.id));
+          return send(res, 200, {
+            ok: true,
+            now,
+            serverBuild: BUILD,
+            clients: [...clientsById.values()].map((c) => {
+              const v = clientVerdict(c, now, consuming);
+              const build = normalizeBuild(c.build);
+              return {
+                clientId: c.id,
+                role: c.role || null,
+                pagePath: c.pagePath || null,
+                build,
+                // A viewer, not a page: it is listed and reapable, never counted as a page.
+                preview: c.preview === true,
+                ackAgeMs: v.ackAgeMs,
+                beatAgeMs: v.beatAgeMs,
+                drawing: v.drawing,
+                // Is the relay handing this client camera frames right now — a consumer slot held.
+                streaming: consuming.has(c.id),
+                // Definitional: this document is not on the build the server is serving.
+                stale: Boolean(build) && build !== BUILD,
+                // Would the automatic rule end it on a successor's next ack? False for a stale row
+                // with no healthy current-build peer, which is the case a human must judge.
+                reapable: reapable.has(c.id),
+              };
+            }),
+          });
+        },
+      },
+      // Manual termination by id: the operator's "terminate them if they are useless". Ends the
+      // camera readers, then the bus responses, then the row. Idempotent — an id that is already
+      // gone is a 200 with `alreadyGone`, not an error, so a kill racing the sweep is harmless.
+      {
+        path: '/clients/end',
+        method: 'POST',
+        handler: async (req, res, url, bodyIn) => {
+          bodyIn = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
+          const id = typeof bodyIn.clientId === 'string' ? bodyIn.clientId.trim() : '';
+          if (!id) return send(res, 400, { ok: false, error: 'clientId required' });
+          const out = endClientEverywhere(id, 'explicit command POST /api/handfx/clients/end', 'operator request');
+          return send(res, 200, { ok: true, clientId: id, ...out });
+        },
+      },
       // The build the page must load with (`?v=`) and report on /ack. Kept out of /status on
       // purpose: a page that read its build from /status would always match the server, even when
       // the document itself is a day old — the value has to come from the URL the page loaded.
@@ -1938,16 +2128,18 @@ function build(ctx) {
             const before = settings.get('publish');
             const changed = settings.patch(patch);
             const now = settings.get('publish');
-            // Opening or closing the pipe follows the setting, and the page has to learn the new
-            // mode before it starts (or stops) sending pictures: the bus is the only channel the
-            // page listens on, and it re-reads the status document on `settings.patch`.
-            if (now !== before) {
-              pipe.setMode(now);
-              publish('settings.patch', { key: 'publish', value: now });
+            // Opening or closing the pipe follows the setting.
+            if (now !== before) pipe.setMode(now);
+            // Every changed key is announced, not just `publish` and `ratio`. The overlay page has
+            // no settings poll: the bus is the only channel it listens on, and `settings.patch` is
+            // the only frame that makes it re-read the status document. Announcing two keys left
+            // every other one (effects, intensity, enabled, mirror, debugOverlay, …) written on the
+            // server and invisible to the OBS source until its next reload — the pane's control
+            // moved and the picture did not, which reads as a dead control. A burst of frames is
+            // free: the page debounces them into one status read (`scheduleRefresh`).
+            for (const key of Array.isArray(changed) ? changed : []) {
+              publish('settings.patch', { key, value: key === 'ratio' ? effectiveRatio() : settings.get(key) });
             }
-            // A ratio write changes where the wall sits, and the overlay re-derives its fence from
-            // the status document: without this frame it would keep the old wall until a reload.
-            if (changed.includes('ratio')) publish('settings.patch', { key: 'ratio', value: effectiveRatio() });
             return send(res, 200, { ok: true, changed, settings: settingsPayload(), publish: pipe.status() });
           } catch (err) {
             return send(res, err.status || 400, { ok: false, error: err.message });
@@ -2026,10 +2218,16 @@ function build(ctx) {
         method: 'POST',
         handler: async (req, res, url, bodyIn) => {
           bodyIn = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
-          // The pane's live preview is a viewer, not a source: it says `preview: true` and the
-          // server drops the whole report. Without this a preview's own draws would make a dead
-          // OBS source look healthy (its draws land on no client record).
-          if (bodyIn.preview === true) return send(res, 200, { ok: true, preview: true });
+          // The pane's live preview is a viewer, not a source: it says `preview: true` and nothing it
+          // reports may reach a liveness answer — a preview's own draws would make a dead OBS source
+          // look healthy. It is still *registered*, because a preview left on an old build is a
+          // leaked document holding a camera reader, and it is invisible to the build rule without a
+          // row. `registerPreview` marks the row so every liveness path skips it.
+          if (bodyIn.preview === true) {
+            registerPreview(bodyIn, req);
+            reapStaleClients(bodyIn.clientId);
+            return send(res, 200, { ok: true, preview: true });
+          }
           if (bodyIn.source === 'body') {
             // The body page's beat: it is open and its camera is running. Timestamp only.
             body.pageOpen = bodyIn.open === true;
@@ -2052,12 +2250,16 @@ function build(ctx) {
             // Which document this ack belongs to, recorded so /status can show one entry per role
             // rather than one per ephemeral clientId (which changes on every reload). `roleIn` is
             // the body's `role` when the page declares it, else the `?role=` on the ack URL through
-            // `roleOf`; a page that declares neither gets a null role, never a guess. Read-only
-            // bookkeeping: superseding is done where a long-lived response attaches, never here —
-            // an ack cannot tell a successor's own pre-ack stream from its predecessor's, and
-            // guessing would drop the live page's feed.
+            // `roleOf`; a page that declares neither gets a null role, never a guess. Superseding a
+            // *predecessor stream* is still done where the response attaches, never here — an ack
+            // cannot tell a successor's own pre-ack stream from its predecessor's. A build
+            // mismatch is a different question, and the one ack is uniquely able to answer: see
+            // `reapStaleClients`.
             touchClient(bodyIn.clientId, bodyIn, validRole(bodyIn.role) || roleOf(req), req);
             applyFeedDemand();
+            // An ack on the current build is proof that any same-role document on an older build
+            // failed to reload. Never the acking client itself, never an unknown-build row.
+            reapStaleClients(bodyIn.clientId);
           }
           if (Number.isFinite(bodyIn.maskAt) && bodyIn.maskAt > body.lastMaskAt) body.lastMaskAt = Math.min(Date.now(), bodyIn.maskAt);
           // The tracker's own counters, rebuilt into the fixed shape /status serves: numbers and one
@@ -2195,6 +2397,82 @@ function build(ctx) {
             // contract — the page must never retry or care.
           }
           return send(res, 200, { ok: true });
+        },
+      },
+
+      // Per-frame page diagnostics from an armed overlay: `?diag=1` or a `diag.start` command.
+      // A batch of samples per POST, kept in a bounded ring and drained with GET /diag?since=.
+      // Refused silently (204) unless the body is stamped `diag: true`, which this page sends only
+      // while it is sampling — a source that was never armed cannot fill this buffer.
+      {
+        path: '/diag',
+        method: 'POST',
+        handler: (req, res, url, bodyIn) => {
+          try {
+            const body = bodyIn && typeof bodyIn === 'object' ? bodyIn : {};
+            if (body.diag !== true) {
+              diagState.refused += 1;
+              res.writeHead(204, { 'cache-control': 'no-store' });
+              res.end();
+              return;
+            }
+            const list = Array.isArray(body.samples) ? body.samples.slice(0, 40) : [];
+            const clientId = typeof body.clientId === 'string' ? body.clientId.slice(0, 64) : '';
+            const build = typeof body.build === 'string' ? body.build.slice(0, 64) : '';
+            for (const raw of list) {
+              if (!raw || typeof raw !== 'object') continue;
+              let json;
+              try {
+                json = JSON.stringify(raw);
+              } catch {
+                continue;
+              }
+              // A light sample is ~1 kB, a full one ~6 kB. Anything past 24 kB is not a sample this
+              // page wrote; it is dropped rather than allowed to sit in memory.
+              if (json.length > 24_000) {
+                diagState.dropped += 1;
+                continue;
+              }
+              diagState.seq += 1;
+              diagState.received += 1;
+              diagRing.push({ seq: diagState.seq, clientId, build, ...raw });
+              if (diagRing.length > 6000) diagRing.splice(0, diagRing.length - 6000);
+            }
+            diagState.lastAt = Date.now();
+            if (clientId) diagState.clients.add(clientId);
+            return send(res, 200, { ok: true, seq: diagState.seq });
+          } catch {
+            // A diagnostic channel that can fail is worse than none.
+            return send(res, 200, { ok: true, seq: diagState.seq });
+          }
+        },
+      },
+      {
+        // The capture tool's read side: one cursor, ascending, ring order. `enabled` means a live
+        // page is posting right now; `dropped` counts samples the ring or the size cap discarded.
+        path: '/diag',
+        method: 'GET',
+        handler: (req, res, url) => {
+          const q = url && url.searchParams ? url.searchParams : new URLSearchParams();
+          const since = Math.max(0, Number(q.get('since')) || 0);
+          const limit = Math.min(1000, Math.max(1, Number(q.get('limit')) || 500));
+          const samples = [];
+          for (const s of diagRing) {
+            if (s.seq <= since) continue;
+            samples.push(s);
+            if (samples.length >= limit) break;
+          }
+          return send(res, 200, {
+            ok: true,
+            seq: diagState.seq,
+            total: diagState.received,
+            dropped: diagState.dropped,
+            refused: diagState.refused,
+            clients: diagState.clients.size,
+            enabled: diagState.lastAt > 0 && Date.now() - diagState.lastAt < 15_000,
+            since,
+            samples,
+          });
         },
       },
 

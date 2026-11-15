@@ -80,6 +80,26 @@ def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _replace_with_retry(tmp: str, path: Path, attempts: int = 12, pause: float = 0.02) -> None:
+    """``os.replace`` retried across a transient Windows sharing violation.
+
+    A process that opened ``status.json`` through plain ``open()`` holds it for the
+    microseconds it takes to read 700 bytes, without FILE_SHARE_DELETE, so the replace fails
+    with WinError 5 "Access is denied". The TUI polls that file once a second, so this fired
+    207 times in two days on the rig, and each failure costs a whole heartbeat (status.json and
+    heartbeat are written as a pair): the panel read "(stale)" while node served fine. The
+    window is microseconds, so a few short retries land, and a permanent failure still raises.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
@@ -89,7 +109,7 @@ def _atomic_write_json(path: Path, data: Any) -> None:
             # No fsync: readers are protected by the atomic replace below, not by durability
             # across a power cut (a runtime dir is rebuilt on the next start anyway), and the
             # fsync of a 700-byte heartbeat was 3.6 ms/s of the idle supervisor on the rig.
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)

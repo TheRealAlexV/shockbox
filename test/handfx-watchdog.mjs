@@ -12,6 +12,7 @@
 // Exits non-zero on the first failed check.
 
 import { createWatchdog } from '../modules/handfx/pages/js/overlay/watchdog.js';
+import { createBuildCheck } from '../modules/handfx/pages/js/overlay/build-check.js';
 import { cameraWanted, rearmCamera } from '../modules/handfx/pages/js/overlay/rearm.js';
 
 let failures = 0;
@@ -296,6 +297,52 @@ const armed5 = await rearmCamera({
 });
 check('a relay that never delivers keeps the page on synthetic', armed5 === false || st5.cameraSource !== 'relay', `cameraSource ${st5.cameraSource}`);
 check('a stopped page is not re-armed', (await rearmCamera({ state: st5, relay: relay5, tracker: makeTracker(st5), autoCamera: makeAutoCamera(st5, relay5), userStopped: true, visible: true })) === false);
+
+/* ---------------------------------------------------------------- build self-heal */
+
+// A reload is a new document, so the budget has to survive it. A Map stands in for sessionStorage.
+console.log('scenario 5: a stale bundle reloads itself, then backs off');
+
+const store = new Map();
+const fakeStorage = {
+  getItem: (k) => (store.has(k) ? store.get(k) : null),
+  setItem: (k, v) => store.set(k, String(v)),
+};
+let bclock = 1_000_000;
+let reloads = 0;
+const openPage = (ownBuild) =>
+  createBuildCheck({ ownBuild, storage: fakeStorage, now: () => bclock, reload: () => { reloads += 1; } });
+
+const stale1 = openPage('df0ffdf89fae');
+check('a mismatched build asks for a reload', stale1.observe('bb9f873f9b96') === 'reload' && reloads === 1);
+check('the mismatch is stamped, not silent', stale1.state().stale === true && stale1.state().staleSince === bclock && stale1.state().reloads === 1);
+check('a second poll in the same document does not reload again', (bclock += 25000, stale1.observe('bb9f873f9b96')) === 'reloading' && reloads === 1, `reloads ${reloads}`);
+
+// Two more documents: the second and third reload, and the budget is restored from storage.
+bclock += 1000;
+const stale2 = openPage('df0ffdf89fae');
+const v2 = stale2.observe('bb9f873f9b96');
+bclock += 1000;
+const stale3 = openPage('df0ffdf89fae');
+const v3 = stale3.observe('bb9f873f9b96');
+check('a reloaded document restores the spent budget and reloads twice more', v2 === 'reload' && v3 === 'reload' && reloads === 3, `reloads ${reloads}`);
+
+// The fourth document must not reload: stop and report instead.
+bclock += 1000;
+const stale4 = openPage('df0ffdf89fae');
+const v4 = stale4.observe('bb9f873f9b96');
+const s4b = stale4.state();
+check('the fourth document stops instead of reloading forever', v4 === 'stop' && reloads === 3, `verdict ${v4} reloads ${reloads}`);
+check('the stopped page still reports itself stale', s4b.stale === true && s4b.stopped === true && s4b.reloads === 3 && s4b.lastReloadAt > 0);
+
+// A matched build is healthy: no reload, no stale bclock.
+reloads = 0;
+const fresh = openPage('bb9f873f9b96');
+check('a matching build does nothing', fresh.observe('bb9f873f9b96') === 'ok' && reloads === 0 && fresh.state().stale === false && fresh.state().staleSince === 0);
+check('an unreadable build is not a mismatch', fresh.observe('') === 'unknown' && reloads === 0);
+
+// A deploy that lands another build starts a fresh budget for that build.
+check('a different server build gets its own reload budget', stale4.observe('c0ffee123456') === 'reload' && stale4.state().staleSince === bclock);
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
 process.exitCode = failures ? 1 : 0;

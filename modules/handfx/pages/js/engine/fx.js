@@ -69,6 +69,19 @@ export const GESTURE_BONES = [
   [0, 9], [0, 13], [0, 17],
 ];
 
+/**
+ * GESTURE_BONES as the two index arrays the WIRES shader reads (`u_bone_a` / `u_bone_b`), so the
+ * skeleton is written down once and the shader cannot disagree with it about which bones exist.
+ * The shader's BONE_MAX is the slot count; entries past `GESTURE_BONES.length` stay 0 and are
+ * beyond `u_count`, so they are never read.
+ */
+const BONE_A = new Int32Array(24);
+const BONE_B = new Int32Array(24);
+GESTURE_BONES.forEach(([a, b], i) => {
+  BONE_A[i] = a;
+  BONE_B[i] = b;
+});
+
 const TEXTURE_UNIT_BODY = 2;
 const TEXTURE_UNIT_HISTORY = 3;
 const TEXTURE_UNIT_SNAP = 4;
@@ -1199,8 +1212,15 @@ export class FxRenderer {
     const dt = this._last ? Math.min(0.1, (now - this._last) / 1000) : 0.016;
     this._last = now;
 
+    // A live effect keeps the last place its hand actually was. The draw falls back to
+    // `live.centre` once no palm is in view, and the spawn default is `{0.5, 0.5}` — so without
+    // this the effect jumps to the middle of the frame instead of staying where it was fired.
+    const palmNow = (view.palms && view.palms[0]) || (view.hands && view.hands[0] && view.hands[0].palm) || null;
     // Age and retire live effects.
     for (const [id, live] of [...this.live]) {
+      if (palmNow && Number.isFinite(palmNow.x) && Number.isFinite(palmNow.y)) {
+        live.centre = { x: palmNow.x, y: palmNow.y };
+      }
       live.age = (now - live.t0) / 1000;
       const target = live.active ? 1 : 0;
       live.fade += (target - live.fade) * Math.min(1, dt * (live.active ? 8 : 3.5));
@@ -1376,7 +1396,12 @@ export class FxRenderer {
     };
     // Page space (0..1, y down) is what main.js gives; the shaders think in uv (y up), and the
     // fragment field scales uv.x by aspect, so a centre goes in as (x * aspect, 1 - y).
-    const toUv = (p) => toUvPoint(p, this.w / this.h);
+    const toUv = (p) => {
+      // The page-space point this effect's shader is about to draw at. Recorded so a capture can
+      // report the position the picture actually used, not one recomputed from a guess.
+      live.drawnAt = p;
+      return toUvPoint(p, this.w / this.h);
+    };
     const body = BODY_EFFECTS.has(id);
     if (body && !this.bodyMaskSeen) return false;
     // Every sampler unit is bound to its documented texture (or the neutral 1x1) before the effect
@@ -1461,6 +1486,8 @@ export class FxRenderer {
         pts[i * 2 + 1] = q ? 1 - q.y : 0;
       }
       set('u_p', (l) => gl.uniform2fv(l, pts));
+      set('u_bone_a', (l) => gl.uniform1iv(l, BONE_A));
+      set('u_bone_b', (l) => gl.uniform1iv(l, BONE_B));
       set('u_count', (l) => gl.uniform1i(l, GESTURE_BONES.length));
       energySet();
     } else if (id === 'aura' || id === 'portal' || id === 'slime' || id === 'bloomlife') {

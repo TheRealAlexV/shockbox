@@ -21,7 +21,7 @@
 //                call ctx.refresh() after a PATCH to pick up the new values.
 //     events     subscribe(channelOrNull, fn) -> unsubscribe. fn gets {event, data} for
 //                `event:`-style frames and {seq,channel,cmd,args,view} for command frames.
-//                channel null = every channel on the one shared EventSource.
+//                channel null = every frame the shell polls (pool changes today).
 //     refresh    async () -> re-fetches /api/modules and /api/modules/:id/state; resolves to
 //                {module, state} and also refreshes ctx.settings in place.
 //     ui         shared helpers from ui.js: el, text, fmtWhen, settingsForm, toast, drawIcon…
@@ -37,6 +37,7 @@ import { startDrawer } from './drawer.js';
 import { installToasts, toast } from './toast.js';
 import { renderSettingsForm } from './settings-form.js';
 import { mountMergedColumn, lookStore } from './merged-preview.js';
+import { createBuildCheck } from './build-check.js';
 
 const api = createApi('/');
 const root = document.getElementById('app');
@@ -46,7 +47,7 @@ const titleEl = document.getElementById('topbar-title');
 const subEl = document.getElementById('topbar-sub');
 const statusEl = document.getElementById('topbar-status');
 
-/** one shared EventSource for every channel; subscribers multiplex on it */
+/** one poll for every subscriber; the shell holds no socket */
 const bus = createBus();
 
 /**
@@ -76,9 +77,12 @@ const state = {
 
 function createBus() {
   const subs = new Set();
-  let es = null;
-  let retry = 0;
   let statusCb = null;
+  let primed = false; // first answer seen
+  let ok = false; // last poll reached the server
+  let lastPools = '';
+  let timer = 0;
+  let inFlight = false;
 
   function dispatch(payload) {
     for (const fn of [...subs]) {
@@ -120,56 +124,70 @@ function createBus() {
     return id;
   }
 
+  /**
+   * What the old held socket carried, and where it went:
+   *   · module frames into the panes (`ctx.events`) — every pane that subscribed already polls
+   *     itself (dialogs and notifications 5 s, wall 4 s, handfx 3 s), so push was latency, not
+   *     correctness;
+   *   · the pool count into the rail — one cheap GET, below;
+   *   · the "live / reconnecting" chip — now the last poll's outcome;
+   *   · `hello` / `reset` — boot and re-sync, now the first poll and a recovery poll.
+   *
+   * The socket itself is why this exists: on the rig it competed for the origin's six HTTP/1.1
+   * slots with the OBS documents, where a document that cannot get a slot is a reaped page.
+   */
+  async function poll() {
+    if (inFlight) return;
+    inFlight = true;
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const abort = ctl ? setTimeout(() => ctl.abort(), 4000) : 0;
+    try {
+      const res = await fetch(`/api/pools?clientId=${encodeURIComponent(eventClientId())}`, {
+        cache: 'no-store',
+        signal: ctl ? ctl.signal : undefined,
+      });
+      if (!res || !res.ok) throw new Error(`GET /api/pools ${res ? res.status : 'failed'}`);
+      const d = await res.json();
+      if (!primed) {
+        // The first answer only lights the strip. It must not re-navigate a pane boot has just
+        // rendered — the old `es.onopen` did, and it cost a second render on every load.
+        primed = true;
+        ok = true;
+      } else if (!ok) {
+        ok = true;
+        statusCb?.('open'); // recovered: re-sync the open pane
+      }
+      const sig = JSON.stringify(d.counts || {});
+      if (sig !== lastPools) {
+        lastPools = sig;
+        // The rail badge and the messages pane both subscribe to `pool`; this is the payload
+        // their handlers read. Only a change is dispatched, so a quiet rig costs no renders.
+        dispatch({
+          channel: 'pool',
+          event: 'pools',
+          data: { counts: d.counts || {}, types: d.types || [], tags: d.tags || [] },
+        });
+      }
+    } catch {
+      if (ok) {
+        ok = false;
+        statusCb?.('down');
+      }
+    } finally {
+      if (abort) clearTimeout(abort);
+      inFlight = false;
+    }
+  }
+
   function connect() {
-    if (es) es.close();
-    // `?role=` names this document to the server (`core/events.mjs` `attach`), so a reload ends
-    // its own predecessor's response instead of leaving it in the browser's six-socket pool. The
-    // shell is served at both `/` and `/control`; both are one document identity, so the role is
-    // fixed and not the pathname (two live shell tabs would then both be `/control` and the newer
-    // would correct the older, which is what the rule is for). `clientId` is the reload-stable
-    // identity the supersede rule matches on; `role` stays as the human-facing label.
-    es = new EventSource(`/events?role=shell&clientId=${encodeURIComponent(eventClientId())}`);
-    es.onopen = () => {
-      retry = 0;
-      statusCb?.('open');
-    };
-    es.onerror = () => {
-      statusCb?.('down');
-      // EventSource retries by itself; we only track the state for the status strip.
-    };
-    es.onmessage = () => {};
-    // One listener per channel: the server names the channel in `event:`, so a named listener
-    // is the only way to receive them. `hello` carries boot info; any other frame is normalised.
-    const onNamed = (name) => (ev) => {
-      let data;
-      try {
-        data = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
-      if (data && data.reset === true) {
-        dispatch({ reset: true, channel: name, data });
-        return;
-      }
-      if (data && data.channel) dispatch(data);
-      else dispatch({ event: name, channel: name, data });
-    };
-    es.addEventListener('hello', (ev) => {
-      try {
-        dispatch({ hello: true, data: JSON.parse(ev.data) });
-      } catch {
-        /* ignore */
-      }
+    if (timer) return;
+    timer = setInterval(poll, 5000);
+    poll();
+    // The poll runs whether or not the tab draws, so a hidden shell never goes deaf; the event
+    // only shortens the wait when the operator comes back.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) poll();
     });
-    // Catch-all: cannot see arbitrary named events, so the shell subscribes to the channels it
-    // knows about (core + every module channel from /api/modules) plus the one fixed channel the
-    // core publishes on. The wire names a frame after its *channel*, every time — the frame's
-    // kind (`state.snapshot`, `settings`, `sound`, …) is inside the record, so a listener per
-    // kind would receive nothing.
-    const names = new Set(['pool', 'core']);
-    for (const m of state.modules) for (const c of m.channels || []) names.add(c);
-    for (const name of names) es.addEventListener(name, onNamed(name));
-    retry++;
   }
 
   return {
@@ -182,7 +200,7 @@ function createBus() {
       statusCb = fn;
     },
     get connected() {
-      return es ? es.readyState === 1 : false;
+      return ok;
     },
   };
 }
@@ -860,6 +878,31 @@ async function boot() {
 
   window.addEventListener('hashchange', () => navigate());
   await navigate();
+  startBuildCheck();
+}
+
+// A deploy must reach this document without a human pressing Refresh in OBS — and must not reach
+// it mid-edit, where a reload would throw away the form the operator is typing into. Deferring is
+// free: the poll runs again in 25 s, and the shell had no reload path at all before this.
+function startBuildCheck() {
+  const check = createBuildCheck({
+    url: '/api/notifications/build',
+    key: 'shockbox.build.shell',
+    storage: (() => {
+      try {
+        return sessionStorage;
+      } catch {
+        return null;
+      }
+    })(),
+    canReload: () => {
+      const a = document.activeElement;
+      if (!a) return true;
+      const tag = a.tagName;
+      return !(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || a.isContentEditable);
+    },
+  });
+  check.start();
 }
 
 boot().catch((err) => {

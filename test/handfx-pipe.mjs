@@ -277,7 +277,9 @@ async function main() {
     const errored = await waitFor(
       () => {
         const st = relay.status();
-        return st.state === 'error' ? st : null;
+        // A forced pipe never exhausts to 'failed' (that is the `auto` budget): the failure shows
+        // as the first stall and then the armed restart.
+        return st.state === 'stalled' || st.state === 'restarting' ? st : null;
       },
       5000,
       'honest pipe error',

@@ -361,6 +361,26 @@ ok(
   `localPort=${strayLocalPort} remotePort=${strayRemotePort}`,
 );
 
+// The other direction: a row that never acked is still owned when the bus holds an open response
+// for its clientId. That is the wall documents' shape — they mint the id in sessionStorage and send
+// it on `/events`, and never POST /ack, because an ack would put a non-handfx document in
+// `clientsById` where `freshestPage` reads page owners. The ack ledger alone called a row the bus
+// can already end by identity "unowned"; the census must not.
+const busOwnedId = 'smoke-census-bus-only';
+const busOnly = await openBus(busOwnedId, '/wall/render');
+const busDoc = await statusDoc();
+const busLocalPort = busOnly.socket ? busOnly.socket.remotePort : null;
+const busRemotePort = busOnly.socket ? busOnly.socket.localPort : null;
+const busRow = rowsOf(busDoc).find((r) => r.localPort === busLocalPort && r.remotePort === busRemotePort);
+const busList = violationsOf(busDoc) || [];
+const busNamed = busList.filter((v) => v.kind === 'unowned-stream' && v.clientId === busOwnedId);
+ok(
+  Boolean(busRow) && busRow.owner === 'bus' && busRow.ownerReason == null && busNamed.length === 0,
+  'a /events row the bus holds by clientId is owned without an ack',
+  `row=${busRow ? where(busRow) : 'missing'} named=${JSON.stringify(busNamed)}`,
+);
+busOnly.destroy();
+
 // A navigation is a new document under the same persisted identity, so a reload is a second
 // `/events` for the same clientId and role. The total staying put proves nothing on its own — a
 // leaky attach satisfies that too — so the unit is the identity: one row per identity, and the
@@ -395,6 +415,45 @@ for (const reload of [1, 2]) {
 
 // Release this section's responses so the smoke process can exit; the server reaps the rest.
 for (const res of opened) res.destroy();
+
+// --- reap: ack silence is not death -------------------------------------
+// A page whose ack POST lost the six-per-origin slot race acks late but still beats, because the
+// beat is an `<img>` GET on its own 1 s timer and shares no `fetch` with the ack. Reaping that
+// page on ack age alone RSTs the camera stream it is still reading. So both directions here: the
+// row must survive `CLIENT_ACK_GONE_MS` (60 s) while beats arrive, and go once they stop too —
+// otherwise the assertion cannot tell a fixed reap from a disabled one.
+const beatId = `smoke-beat-${Date.now().toString(36)}`;
+const beat = () => req('GET', `/api/handfx/beat?c=${encodeURIComponent(beatId)}&t=1&d=0`);
+const beatRow = async () =>
+  ((await statusDoc()).cameraFeed?.clientList || []).find((c) => c.id === beatId) || null;
+await req('POST', '/api/handfx/ack', {
+  clientId: beatId,
+  role: '/smoke-beat',
+  build: 'smoke',
+  anchors: 'none',
+  draws: 0,
+  loopTicks: 0,
+});
+for (let i = 0; i < 62; i++) {
+  await beat();
+  await sleep(1000);
+}
+const starved = await beatRow();
+ok(
+  Boolean(starved) && starved.ackAgeMs > 60_000 && starved.beatAgeMs < 5000,
+  'a page acking late but beating on time is not reaped',
+  { clientId: beatId, ackAgeMs: starved ? starved.ackAgeMs : null, beatAgeMs: starved ? starved.beatAgeMs : null },
+);
+await sleep(7000);
+const afterBeatsStop = await beatRow();
+ok(
+  !afterBeatsStop,
+  'the same page is reaped once its beats stop too',
+  {
+    clientId: beatId,
+    found: afterBeatsStop ? { ackAgeMs: afterBeatsStop.ackAgeMs, beatAgeMs: afterBeatsStop.beatAgeMs } : null,
+  },
+);
 
 // --- cleanup ------------------------------------------------------------
 await req('DELETE', `/api/pool/all/messages/${dialogId}`);

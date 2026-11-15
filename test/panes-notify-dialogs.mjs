@@ -77,7 +77,12 @@ async function startChrome() {
   const { wsUrl, stop } = await launchChrome({
     size: [1440, 900],
     profilePrefix: 'sb-chrome-',
-    extraArgs: ['--disable-gpu'],
+    // The strip's wall layer is the real engine and needs a WebGL2 context. On a headless host with
+    // no /dev/dri, `--disable-gpu` leaves it with none, so the canvas fallback blocks the page's main
+    // thread for seconds per frame — measured on test/merged-preview.mjs at 3890 ms for a
+    // `setTimeout(0)` and >15 s to paint a raised alert, versus 1 ms / ~90 ms with SwiftShader asked
+    // for explicitly. Same pair as merged-preview and wall-browser.
+    extraArgs: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
   });
   return { wsUrl, stop };
 }

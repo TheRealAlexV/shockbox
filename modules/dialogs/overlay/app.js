@@ -8,6 +8,8 @@
 // never by an invented server offset.
 
 import { createPlayer, DEFAULT_DIALOG_TONE } from '/mod/notifications/sound.mjs';
+import { createBuildCheck } from '/src/build-check.js';
+import { createLivePoll } from '/src/live-poll.js';
 
 // Preview panes mount this page in a small inert iframe (`?preview=1`). The page then draws one
 // sample alert through the real build path and never opens a stream or talks to the server, so
@@ -243,40 +245,16 @@ function apply(snap) {
       reportSize(el, entity);
     }
   }
-}
-
-/* ---------------------------------------------------------------- stage pointer */
-
-// The show preview POSTs its pointer; the hub re-broadcasts it on `pointer` with x/y normalized
-// to the preview surface. Draw it at the same relative spot here — this page is a different
-// size, so the fraction is the only coordinate that transfers. Above the dialogs, never a click
-// target, invisible until the first frame arrives.
-const cursorEl = document.createElement('div');
-cursorEl.className = 'stage-pointer';
-cursorEl.innerHTML =
-  '<svg viewBox="0 0 20 26" width="22" height="28" aria-hidden="true">' +
-  '<path d="M0 0V22L5.8 16.6 9.6 24.9 13 23.4 9.2 15.2 17 14.9Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/>' +
-  '</svg>';
-document.body.appendChild(cursorEl);
-
-let cursorTimer = 0;
-
-function drawPointer(p) {
-  if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') return;
-  const dy = p.down ? 2 : 0;
-  cursorEl.style.transform = `translate3d(${p.x * window.innerWidth}px, ${p.y * window.innerHeight + dy}px, 0)`;
-  cursorEl.style.opacity = '1';
-  clearTimeout(cursorTimer);
-  cursorTimer = setTimeout(() => {
-    cursorEl.style.opacity = '0';
-  }, 1500);
+  // A deferred deploy reload retries the moment the last alert is gone, not up to 25 s later.
+  if (els.size === 0) buildCheck.check();
 }
 
 /* ---------------------------------------------------------------- wiring */
 
-/** This document's SSE identity (`?clientId=`), minted once and kept in `sessionStorage` so a
+/** This document's identity (`?clientId=`), minted once and kept in `sessionStorage` so a
  *  reload reuses it: the server ends the row that carried the same id (`core/events.mjs`
- *  `attach`), so a reload supersedes its own predecessor instead of stranding a socket. */
+ *  `attach`), so a reload supersedes its own predecessor instead of stranding a socket. It rides
+ *  the poll URL now that there is no socket; the census and the supersede key read the same id. */
 function eventClientId() {
   const key = 'shockbox.clientId.dialogs';
   let id = '';
@@ -303,46 +281,23 @@ function eventClientId() {
   return id;
 }
 
-function connect() {
-  // `role=` is this document's identity for the server's supersede rule (`core/events.mjs`):
-  // a reload ends its own predecessor's bus response instead of leaving it in the browser's
-  // six-per-origin pool. The page's path, as `/shockfx` uses; `client=` stays a human label.
-  // `clientId` is the reload-stable identity that rule matches on.
-  const es = new EventSource(`/events?channels=dialogs,pointer&client=alerts-overlay&role=/dialogs&clientId=${encodeURIComponent(eventClientId())}`);
-  es.addEventListener('reset', () => {
-    fetch('/api/dialogs/live')
-      .then((r) => r.json())
-      .then(apply)
-      .catch(() => {});
-  });
-  // The hub sends every frame twice (typed event + `message`) and the EventSource collapses them
-  // into `message` only. Re-read the full record once per frame, coalesced while a read is open.
-  let pending = null;
-  es.addEventListener('message', (ev) => {
-    // A `pointer` frame also arrives as `message`; it is not a state change, so do not refetch.
-    try {
-      if (JSON.parse(ev.data).channel === 'pointer') return;
-    } catch {
-      /* not our record */
-    }
-    if (pending) return;
-    pending = fetch('/api/dialogs/live')
-      .then((r) => r.json())
-      .then(apply)
-      .catch(() => {})
-      .finally(() => {
-        pending = null;
-      });
-  });
-  // The show preview's cursor. Flat payload from the hub: {x, y, down, module, t, channel, seq}.
-  es.addEventListener('pointer', (ev) => {
-    try {
-      drawPointer(JSON.parse(ev.data));
-    } catch {
-      /* malformed frame: leave the last one on screen until it fades */
-    }
-  });
-}
+/* ---------------------------------------------------------------- live poll */
+
+// A poll, not a socket. See public/src/live-poll.js: the origin has six HTTP/1.1 slots and this
+// document held one of them for days to learn about an alert every few minutes. One small GET per
+// second, closed as soon as it is read; `rev` decides whether anything is applied at all.
+//
+// `clientId` rides the poll URL: the identity the old held socket carried, kept in
+// `sessionStorage` so a reload reuses it. The supersede key and the census both read it.
+//
+// Latency, stated plainly: an alert appears at most one tick (1 s) plus one loopback round trip
+// after the server spawns it. An alert stays until it is closed, so the worst case is a second of
+// empty stage at spawn — never a lost alert, and never a repeated tone: the tone fires from
+// `apply`, only for ids the page has not built yet.
+const poller = createLivePoll({
+  url: () => `/api/dialogs/live?clientId=${encodeURIComponent(eventClientId())}&role=${encodeURIComponent('/dialogs')}`,
+  apply,
+});
 
 /* ---------------------------------------------------------------- preview sample */
 
@@ -386,6 +341,23 @@ function drawPreview(snapshot) {
   requestAnimationFrame(fitPreview);
 }
 
+// A deploy reaches this document without a human pressing Refresh in OBS. The reload waits while
+// an alert is on air: the dialog lives on the server, so a reload would not drop it — but the card
+// would vanish for the fetch and its entrance animation would restart, which is a visible blink on
+// stream. The next poll (or the moment the last alert leaves) replaces the document instead.
+const buildCheck = createBuildCheck({
+  url: '/api/dialogs/build',
+  key: 'shockbox.build.dialogs',
+  storage: (() => {
+    try {
+      return sessionStorage;
+    } catch {
+      return null;
+    }
+  })(),
+  canReload: () => els.size === 0,
+});
+
 if (preview) {
   document.documentElement.classList.add('preview');
   let drawn = false;
@@ -404,11 +376,7 @@ if (preview) {
     .finally(() => clearTimeout(timer));
   new ResizeObserver(() => requestAnimationFrame(fitPreview)).observe(root);
 } else {
-  fetch('/api/dialogs/live')
-    .then((r) => r.json())
-    .then((d) => {
-      apply(d);
-      connect();
-    })
-    .catch(() => connect());
+  // First paint is the poller's first tick: a page added mid-stream is correct after one read.
+  poller.start();
+  buildCheck.start();
 }

@@ -9,6 +9,8 @@
 // follows it on the same settings frame — live cards re-place, no reload.
 
 import { createPlayer, DEFAULT_NOTIFY_TONE } from '/mod/notifications/sound.mjs';
+import { createBuildCheck } from '/src/build-check.js';
+import { createLivePoll } from '/src/live-poll.js';
 
 // Preview panes mount this page in a small inert iframe (`?preview=1`). The page then draws one
 // sample toast through the real render path and never opens a stream or talks to the server, so
@@ -202,38 +204,14 @@ function apply(snap) {
       view.el.className = `toast ${CSS[entity.style] || 't-ios'} in`;
     }
   }
+  // A deferred deploy reload retries the moment the stack is empty, not up to 25 s later.
+  if (seen.size === 0) buildCheck.check();
 }
 
-/* ---------------------------------------------------------------- stage pointer */
-
-// The show preview POSTs its pointer; the hub re-broadcasts it on `pointer` with x/y normalized
-// to the preview surface. Draw it at the same relative spot here — this page is a different
-// size, so the fraction is the only coordinate that transfers. Above the toasts, never a click
-// target, invisible until the first frame arrives.
-const cursorEl = document.createElement('div');
-cursorEl.className = 'stage-pointer';
-cursorEl.innerHTML =
-  '<svg viewBox="0 0 20 26" width="22" height="28" aria-hidden="true">' +
-  '<path d="M0 0V22L5.8 16.6 9.6 24.9 13 23.4 9.2 15.2 17 14.9Z" fill="#fff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/>' +
-  '</svg>';
-document.body.appendChild(cursorEl);
-
-let cursorTimer = 0;
-
-function drawPointer(p) {
-  if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') return;
-  const dy = p.down ? 2 : 0;
-  cursorEl.style.transform = `translate3d(${p.x * window.innerWidth}px, ${p.y * window.innerHeight + dy}px, 0)`;
-  cursorEl.style.opacity = '1';
-  clearTimeout(cursorTimer);
-  cursorTimer = setTimeout(() => {
-    cursorEl.style.opacity = '0';
-  }, 1500);
-}
-
-/** This document's SSE identity (`?clientId=`), minted once and kept in `sessionStorage` so a
+/** This document's identity (`?clientId=`), minted once and kept in `sessionStorage` so a
  *  reload reuses it: the server ends the row that carried the same id (`core/events.mjs`
- *  `attach`), so a reload supersedes its own predecessor instead of stranding a socket. */
+ *  `attach`), so a reload supersedes its own predecessor instead of stranding a socket. It rides
+ *  the poll URL now that there is no socket; the census and the supersede key read the same id. */
 function eventClientId() {
   const key = 'shockbox.clientId.notify';
   let id = '';
@@ -260,56 +238,22 @@ function eventClientId() {
   return id;
 }
 
-function connect() {
-  // `role=` is this document's identity for the server's supersede rule (`core/events.mjs`):
-  // a reload ends its own predecessor's bus instead of leaving it in the six-per-origin pool.
-  // `clientId` is the reload-stable identity that rule matches on.
-  const es = new EventSource(`/events?channels=notifications,pointer&client=notify-overlay&role=/notify&clientId=${encodeURIComponent(eventClientId())}`);
-  // The hub sends every frame twice (typed event + `message`) and an EventSource here collapses
-  // them into `message` only, so the typed listeners are not what runs. Re-read on `message`:
-  // one HTTP read of the full record, applied once.
-  let pending = null;
-  es.addEventListener('message', (ev) => {
-    // A `pointer` frame also arrives as `message`; it is not a state change, so do not refetch.
-    try {
-      if (JSON.parse(ev.data).channel === 'pointer') return;
-    } catch {
-      /* not our record */
-    }
-    if (pending) return;
-    pending = fetch('/api/notifications/live')
-      .then((r) => r.json())
-      .then((d) => apply(d))
-      .catch(() => {})
-      .finally(() => {
-        pending = null;
-      });
-  });
-  es.addEventListener('snapshot', (ev) => {
-    try {
-      apply(JSON.parse(ev.data));
-    } catch (err) {
-      console.error('bad snapshot', err);
-    }
-  });
-  // The show preview's cursor. Flat payload from the hub: {x, y, down, module, t, channel, seq}.
-  es.addEventListener('pointer', (ev) => {
-    try {
-      drawPointer(JSON.parse(ev.data));
-    } catch {
-      /* malformed frame: leave the last one on screen until it fades */
-    }
-  });
-  es.addEventListener('reset', () => {
-    fetch('/api/notifications/live')
-      .then((r) => r.json())
-      .then((d) => apply(d))
-      .catch(() => {});
-  });
-  es.addEventListener('error', () => {
-    // EventSource reconnects on its own; nothing to do but keep the page alive.
-  });
-}
+/* ---------------------------------------------------------------- live poll */
+
+// A poll, not a socket. See public/src/live-poll.js: the origin has six HTTP/1.1 slots and this
+// document held one of them for days to learn about a toast every few minutes. One small GET per
+// second, closed as soon as it is read; `rev` decides whether anything is applied at all.
+//
+// `clientId` rides the poll URL: it is the identity the old held socket carried, kept in
+// `sessionStorage` so a reload reuses it. The supersede key and the census both read it.
+//
+// Latency, stated plainly: a toast appears at most one tick (1 s) plus one loopback round trip
+// after the server spawns it. A toast lives 4–6 s, so the worst case costs the end of it, never
+// the tone: the tone fires from `apply`, which only runs for ids the page has not drawn yet.
+const poller = createLivePoll({
+  url: () => `/api/notifications/live?clientId=${encodeURIComponent(eventClientId())}&role=${encodeURIComponent('/notify')}`,
+  apply,
+});
 
 /* ---------------------------------------------------------------- preview sample */
 
@@ -328,15 +272,29 @@ const PREVIEW_TOAST = {
   h: 108,
 };
 
+// A deploy reaches this document without a human pressing Refresh in OBS. The reload waits while
+// a toast is on air: the server holds the toast, so a reload would not drop it, but the entrance
+// animation would restart and the card would flicker on stream. The next poll (or the moment the
+// stack empties) replaces the document instead.
+const buildCheck = createBuildCheck({
+  url: '/api/notifications/build',
+  key: 'shockbox.build.notify',
+  storage: (() => {
+    try {
+      return sessionStorage;
+    } catch {
+      return null;
+    }
+  })(),
+  canReload: () => seen.size === 0,
+});
+
 if (preview) {
+  // A preview pane is a small iframe inside the control page; reloading it would blink the pane
+  // and it always runs whatever the parent just loaded. It never polls and never reconnects.
   apply({ ratio: '16:9', live: [PREVIEW_TOAST] });
 } else {
-  // First paint comes from HTTP so a page that is added mid-stream is already correct.
-  fetch('/api/notifications/live')
-    .then((r) => r.json())
-    .then((d) => {
-      apply(d);
-      connect();
-    })
-    .catch(() => connect());
+  // First paint is the poller's first tick: a page added mid-stream is correct after one read.
+  poller.start();
+  buildCheck.start();
 }
