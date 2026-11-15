@@ -155,6 +155,23 @@ check('5b. defaults are longer than the boot compile and bounded', () => {
   assert.equal(BEAT_HEAL_DEFAULTS.max, 3);
 });
 
+// The beat GET carries no role (`main.js` `beat()`), so a beat-only row — a preview, a pane, a second
+// document — is unclassifiable. Before the guard, `if (role && c.role && …)` let it through and a
+// stale-but-live preview could be reloaded. Unknown is now not a match.
+check('5c. eligible on every other count but no role -> no reload', () => {
+  const { h, fired } = healer();
+  const out = h.sweep([{ id: 'beat-only', beatAt: NOW - 60_000, lastAckAt: NOW - 60_000 }], NOW);
+  assert.deepEqual(out, []);
+  assert.equal(fired.length, 0);
+});
+
+check('5d. explicit on-air role with both signals quiet still reloads', () => {
+  const { h, fired } = healer();
+  const out = h.sweep([{ id: 'on-air', role: ROLE, beatAt: NOW - 60_000, lastAckAt: NOW - 60_000 }], NOW);
+  assert.equal(out.length, 1);
+  assert.deepEqual(fired.map((f) => f.id), ['on-air']);
+});
+
 /* ------------------------------------------ 6: a 503 relay leaves the page's own loops running */
 
 // A stub page: the two clocks `main.js` runs (the render loop's draw counter and the worker's ack

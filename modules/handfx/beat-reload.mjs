@@ -61,7 +61,10 @@ export function createBeatHealer({ reload, staleMs = BEAT_HEAL_DEFAULTS.staleMs,
     for (const c of rows || []) {
       if (!c || !c.id) continue;
       if (c.preview === true) continue;
-      if (role && c.role && c.role !== role) continue;
+      // Only a row that proves it is the on-air page is ever ours to reload, and that proof is its
+      // ack's `role` — the beat GET carries no role at all (main.js `beat()`), so a row that has only
+      // ever beaten is unclassifiable: a preview, a pane, a second document. Unknown is not a match.
+      if (!c.role || c.role !== role) continue;
       // The newer of the two signals, not the beat alone: `lastAckAt` is worker-driven and survives a
       // main-thread stall, so a busy page with a late beat is still heard from. Same row-liveness
       // rule as `clientAlive` in server.js; the window here is this healer's own.
