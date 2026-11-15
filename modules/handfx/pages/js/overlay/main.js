@@ -366,7 +366,8 @@ function setBadge(text, tone = 'idle') {
   badge.hidden = !text;
 }
 
-/** Record why a camera acquisition failed. `stage` is getUserMedia | track | timeout | exclusive. */
+/** Record why a camera acquisition failed. `stage` is getUserMedia | track | timeout | exclusive,
+ *  or `start` for a wrapper that caught a rejection with no stage of its own. */
 function setCameraError(stage, name, message) {
   state.cameraError = {
     at: Date.now(),
@@ -896,8 +897,9 @@ let booted = false;
 setInterval(() => {
   if (PREVIEW) return;
   if (document.visibilityState === 'hidden') return;
-  // One failing tick must not take the beat with it. Nothing here is awaited, so a throw from any
-  // of the four used to escape the interval body and kill this document's only recovery clock.
+  // One failing tick loses that tick and every check after it in the same body, and the reason with
+  // them. The interval survives either way, so the catch is here to keep the four checks independent
+  // of each other and to leave a line behind when one of them throws.
   try {
     // Not gated on `booted`: a boot that hangs on `loadStatus` (a server that is gone, a fetch that
     // never resolves) would otherwise freeze the page before its own recovery could start.
@@ -1003,8 +1005,12 @@ function camLog(msg) {
 function noteStartFailed(what) {
   return (err) => {
     if (!err) return;
-    setCameraError('track', err.name || 'Error', `${what}: ${err.message || String(err)}`);
     camLog(`${what} failed: ${err.name || 'Error'}: ${err.message || err}`);
+    // `startTracking` records the precise stage (getUserMedia / track / timeout) before it rejects,
+    // so this wrapper must never overwrite that with its generic one. Fill in only when nothing has
+    // been recorded — one error surface, and it keeps the more specific reason.
+    if (state.cameraError) return;
+    setCameraError('start', err.name || 'Error', `${what}: ${err.message || String(err)}`);
   };
 }
 

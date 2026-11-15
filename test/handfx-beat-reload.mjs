@@ -62,13 +62,41 @@ check('1. a stale beat reloads once, and names the reason', () => {
   const out = h.sweep([row('a', { beatAt: NOW - 20_000 })], NOW);
   assert.equal(out.length, 1);
   assert.deepEqual(fired.map((f) => f.id), ['a']);
-  assert.match(fired[0].reason, /beat-stale 20s \(attempt 1\/3\)/);
+  assert.match(fired[0].reason, /silent 20s \(attempt 1\/3\)/);
 });
 
 check('1b. a fresh beat reloads nothing', () => {
   const { h, fired } = healer();
   assert.deepEqual(h.sweep([row('a', { beatAt: NOW - 1000 })], NOW), []);
   assert.equal(fired.length, 0);
+});
+
+// The blocker: the beat is a main-thread `<img>` on a 1 s timer, the ack comes from the worker on
+// its own 500 ms timer. A model load or a GL compile silences the beat while the page is alive and
+// on air, so the *newer* of the two is the liveness signal — the beat alone would reload a live page.
+check('1c. stale beat + fresh ack (main thread stalled, worker acking) -> no reload', () => {
+  const { h, fired } = healer();
+  const out = h.sweep([row('a', { beatAt: NOW - 40_000, lastAckAt: NOW - 500 })], NOW);
+  assert.deepEqual(out, []);
+  assert.equal(fired.length, 0);
+});
+
+// The other direction, and the reason the rule is `max` rather than "ack only": a dead ack path with
+// the page still beating is a *mute* page (the server already calls it `page-mute`), not a dead one.
+// Reloading it would throw away a live document to fix a report — the same mistake as the beat-only
+// rule, mirrored. Only both signals going quiet is death.
+check('1d. stale ack + fresh beat (ack path dead, page beating) -> no reload', () => {
+  const { h, fired } = healer();
+  const out = h.sweep([row('a', { beatAt: NOW - 500, lastAckAt: NOW - 40_000 })], NOW);
+  assert.deepEqual(out, []);
+  assert.equal(fired.length, 0);
+});
+
+check('1e. both signals quiet -> reload', () => {
+  const { h, fired } = healer();
+  const out = h.sweep([row('a', { beatAt: NOW - 40_000, lastAckAt: NOW - 40_000 })], NOW);
+  assert.equal(out.length, 1);
+  assert.deepEqual(fired.map((f) => f.id), ['a']);
 });
 
 check('2. the gap is honoured: one reload, silence inside it, another after it', () => {
@@ -146,7 +174,12 @@ await checkAsync('6. rejected getUserMedia + 503 relay: no error state, draws an
   let fetches = 0;
   globalThis.fetch = async () => {
     fetches += 1;
-    return new Response('no camera frame yet', { status: 503 });
+    // The server's own 503 shape: `send(res, 503, { ok: false, error })`. `camera relay is off` and
+    // `no camera frame yet` must stay distinguishable in `relay.reason()`.
+    return new Response(JSON.stringify({ ok: false, error: 'camera relay is off' }), {
+      status: 503,
+      headers: { 'content-type': 'application/json' },
+    });
   };
 
   const { createRelay } = await import('../modules/handfx/pages/js/overlay/relay.js');
@@ -184,6 +217,8 @@ await checkAsync('6. rejected getUserMedia + 503 relay: no error state, draws an
   assert.ok(!states.includes('error'), `unexpected error state: ${states.join(',')}`);
   assert.ok(states.includes('idle'), `expected a quiet idle state: ${states.join(',')}`);
   assert.match(relay.reason() || '', /503/, `reason: ${relay.reason()}`);
+  // The body's own reason survives, so "relay off" never reads as "no frame yet".
+  assert.match(relay.reason() || '', /camera relay is off/, `reason: ${relay.reason()}`);
   const retry = events.find((e) => e.startsWith('retry-scheduled'));
   assert.ok(retry, `no backoff scheduled: ${events.join(' | ')}`);
 });

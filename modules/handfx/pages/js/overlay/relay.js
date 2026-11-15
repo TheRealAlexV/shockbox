@@ -413,9 +413,29 @@ export function createRelay({ url = '/api/handfx/camera/stream', onFrame, onStat
       // the ordinary backoff — surfacing them as `error` turned a normal boot into a red banner and
       // tore down a view that was working fine without the camera.
       if (res.status === 503) {
+        // The body says which of the two states this is — `camera relay is off` or `no camera frame
+        // yet` — and they are distinguishable to the operator, so it is kept rather than collapsed
+        // into the status. Read before closing (the abort ends the body) and bounded, because a
+        // reader that never ends would stall this acquisition, which is the only one there is.
+        let detail = '';
+        try {
+          detail = await Promise.race([
+            res.text().then((text) => {
+              try {
+                const body = JSON.parse(text);
+                return body && typeof body.error === 'string' ? body.error.slice(0, 120) : '';
+              } catch {
+                return '';
+              }
+            }),
+            new Promise((resolve) => setTimeout(() => resolve(''), 500)),
+          ]);
+        } catch {
+          detail = ''; // an unreadable body is still a 503: the status alone is the state
+        }
         if (ctrl === ac) close();
         live = false;
-        waiting = 'relay 503: no camera frame yet (or the relay is off)';
+        waiting = detail ? `relay 503: ${detail}` : 'relay 503: nothing to serve yet';
         error = null;
         note('waiting', `${waiting} — drawing synthetic, retrying`);
         emit('idle');
