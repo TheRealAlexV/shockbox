@@ -80,15 +80,25 @@ def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _replace_with_retry(tmp: str, path: Path, attempts: int = 12, pause: float = 0.02) -> None:
+# How long one status write fights a Windows reader before it stops trying to replace the file
+# and rewrites it in place instead. A reader holds status.json for the microseconds it takes to
+# read 700 bytes; a scanner (Defender, a backup agent) can hold it for hundreds of milliseconds,
+# and a second supervisor writing the same file holds it for longer. 6 x 0.2 s ~= 1.2 s covers
+# all three. The earlier 12 x 20 ms (240 ms) budget still lost 217 heartbeats on the rig.
+REPLACE_ATTEMPTS = 6
+REPLACE_PAUSE_S = 0.2
+
+
+def _replace_with_retry(
+    tmp: str, path: Path, attempts: int = REPLACE_ATTEMPTS, pause: float = REPLACE_PAUSE_S
+) -> None:
     """``os.replace`` retried across a transient Windows sharing violation.
 
-    A process that opened ``status.json`` through plain ``open()`` holds it for the
-    microseconds it takes to read 700 bytes, without FILE_SHARE_DELETE, so the replace fails
-    with WinError 5 "Access is denied". The TUI polls that file once a second, so this fired
-    207 times in two days on the rig, and each failure costs a whole heartbeat (status.json and
-    heartbeat are written as a pair): the panel read "(stale)" while node served fine. The
-    window is microseconds, so a few short retries land, and a permanent failure still raises.
+    A process that opened ``status.json`` through plain ``open()`` holds it without
+    FILE_SHARE_DELETE, so a rename over it fails with WinError 5 "Access is denied". The TUI
+    polls that file once a second and a second supervisor writes the same runtime dir, so this
+    fired 217 times over a few days on the rig. The last attempt still raises: the caller
+    decides what a permanent failure means, and it never means "drop the update".
     """
     for attempt in range(attempts):
         try:
@@ -100,22 +110,40 @@ def _replace_with_retry(tmp: str, path: Path, attempts: int = 12, pause: float =
             time.sleep(pause)
 
 
-def _atomic_write_json(path: Path, data: Any) -> None:
+def _atomic_write_text(path: Path, text: str) -> str | None:
+    """Write ``text`` atomically, falling back to an in-place rewrite.
+
+    Returns ``None`` when the file was replaced atomically, or one line naming why the replace
+    never won and the bytes went in place instead. Never returns ``None`` for an update it
+    dropped: there is no dropped path, only a degraded one, because a stale heartbeat is read
+    as "the supervisor is dead" and that is what spawned a duplicate.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write(text)
             # No fsync: readers are protected by the atomic replace below, not by durability
             # across a power cut (a runtime dir is rebuilt on the next start anyway), and the
             # fsync of a 700-byte heartbeat was 3.6 ms/s of the idle supervisor on the rig.
-        _replace_with_retry(tmp, path)
-    except BaseException:
+        try:
+            _replace_with_retry(tmp, path)
+            return None
+        except OSError as err:
+            # In place is safe exactly where the rename is not: Python's readers grant
+            # FILE_SHARE_WRITE (so a truncating write succeeds) but not FILE_SHARE_DELETE.
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            return f"replace {path.name} failed after {REPLACE_ATTEMPTS} attempts ({err}); wrote in place"
+    finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        raise
+
+
+def _atomic_write_json(path: Path, data: Any) -> str | None:
+    return _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def read_json(path: Path) -> dict:
@@ -490,11 +518,18 @@ def take_lock(path: Path):
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
-        import ctypes
         import msvcrt
 
         fh = open(path, "a+b")
         try:
+            # msvcrt locks a range starting at the *current* position and an empty file has no
+            # byte 0, so make sure there is one and lock from the start. Every supervisor locks
+            # the same single byte, which is what makes the guard exclusive.
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             fh.close()
@@ -607,6 +642,10 @@ class Supervisor:
         self._client = apiclient.ApiClient(self.port, self.host, timeout=2.0)
         self._io_threads: list[threading.Thread] = []
         self._last_status_write = 0.0
+        # Why the last status/heartbeat write had to degrade, or None while both are atomic.
+        # Mirrored into `status` as statusWriteDegraded so a file that could not be replaced is
+        # recognisable rather than trusted.
+        self._degraded: str | None = None
 
     # ---- status ------------------------------------------------------------------
     def _set_state(self, state: str, **extra: Any) -> None:
@@ -647,15 +686,49 @@ class Supervisor:
             next_at = None
         self.status["next_restart_at"] = next_at
         self._heartbeat_seq = getattr(self, "_heartbeat_seq", 0) + 1
-        try:
-            # status.json changes only when something changes, so it is not evidence of life.
-            # The heartbeat file is: a counter plus a fresh mtime, rewritten every interval even
-            # when status.json is byte-identical. The UI reads it to tell "alive" from "wedged".
-            _atomic_write_json(self.paths.status_file, self.status)
-            self.paths.heartbeat_file.write_text(f"{self._heartbeat_seq} {now_iso()}\n", encoding="ascii")
-        except OSError as err:  # a full disk must not take the supervisor down
-            self.note(f"heartbeat failed (status.json/heartbeat not written): {err}")
+        # status.json changes only when something changes, so it is not evidence of life.
+        # The heartbeat file is: a counter plus a fresh mtime, rewritten every interval even
+        # when status.json is byte-identical. The UI reads it to tell "alive" from "wedged".
+        # They are written independently, each with its own degradation ladder: one file held
+        # by a reader must not cost the other its update, which is how one failed status.json
+        # used to take the heartbeat down with it and leave the panel "(stale)".
+        degraded = self._flush_status_files()
+        if degraded != self._degraded:
+            # Logged on the transition only: the rig logged 217 identical "heartbeat failed"
+            # lines, which buried the start of the failure instead of showing it once.
+            self._degraded = degraded
+            if degraded:
+                # Whatever the files say, this is the state; and the file now says so too, so a
+                # reader that finds status.json can tell it may be behind rather than trust it.
+                self.status["statusWriteDegraded"] = degraded
+                self.note(f"status write degraded: {degraded}")
+                self._flush_status_files()  # once, so the flag reaches the on-disk document
+            else:
+                self.status.pop("statusWriteDegraded", None)
+                self.note("status write recovered: status.json and heartbeat are atomic again")
         self.flush_log()  # status is current → the log lines behind it are on disk too
+
+    def _flush_status_files(self) -> str | None:
+        """Write status.json and the heartbeat; return why it degraded, or None.
+
+        Never raises: a full disk or a hostile reader must not take the supervisor down, and a
+        write that had to degrade still lands (see :func:`_atomic_write_text`), so no outcome
+        leaves a stale file claiming a state the supervisor is no longer in.
+        """
+        reasons = []
+        for label, path, text in (
+            ("status.json", self.paths.status_file, None),
+            ("heartbeat", self.paths.heartbeat_file, f"{self._heartbeat_seq} {now_iso()}\n"),
+        ):
+            try:
+                reason = (
+                    _atomic_write_json(path, self.status) if text is None else _atomic_write_text(path, text)
+                )
+            except OSError as err:  # the replace and the in-place fallback both lost
+                reason = f"{label}: {type(err).__name__}: {err}"
+            if reason:
+                reasons.append(reason)
+        return "; ".join(reasons) or None
 
     def note(self, message: str) -> None:
         """Supervisor line, in the same dated log as the app (prefix `launcher:`, like run.cmd).
@@ -1179,7 +1252,11 @@ def main(argv: list[str] | None = None) -> int:
     lock = take_lock(paths.lock_file)
     if lock is None:
         life_note(life, f"start refused: supervisor.lock is held; previous={'none' if not prev else 'pid ' + str(prev)}; exiting 3")
-        print(f"shockbox supervisor: another supervisor already holds {paths.lock_file} — exiting", file=sys.stderr)
+        print(
+            f"shockbox supervisor: another supervisor already holds {paths.lock_file} "
+            f"(port {args.port}, app-dir {paths.app_dir}) — exiting",
+            file=sys.stderr,
+        )
         return 3
     life_note(life, f"start port={args.port} app={paths.app_dir} previous supervisor={prior} argv={sys.argv[1:]}")
 

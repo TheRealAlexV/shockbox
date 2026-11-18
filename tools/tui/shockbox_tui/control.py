@@ -34,6 +34,7 @@ from .apiclient import ApiClient, ApiError, ApiUnreachable
 from .logtail import tail as _tail
 from .paths import DEFAULT_PORT, HEARTBEAT_STALE_S, Paths
 from .settings import Settings, read_config
+from .supervisor import take_lock
 
 NO_SUPERVISOR = "no-supervisor"
 # A supervisor rewrites its heartbeat at least every 2s; 12s of silence means wedged or dead.
@@ -243,26 +244,25 @@ class Control:
         return self._wait(lambda: self.supervisor_pid() is not None and self.supervisor_responding(), timeout)
 
     def _clear_stale_lock(self) -> bool:
-        """Remove ``supervisor.lock`` when the pid it belongs to is provably gone.
+        """Drop a dead owner's lock *file*; never a live owner's.
 
-        The OS drops a held lock when its process dies, so this is belt and braces for a lock
-        file left behind on a platform that cannot (Windows). It must never remove a lock of a
-        live supervisor: that would let two run at once.
+        The OS drops a held lock when its process dies, so the file left behind is harmless:
+        locking it again just works. Unlinking it is the one way to break the guard — a live
+        supervisor keeps its flock on an unlinked inode, a newcomer creates a fresh file and
+        locks it, and two supervisors end up writing the same runtime dir. So take the lock
+        first: succeeding *is* the proof that no process holds it. Then the file may go.
         """
-        owner = self.supervisor_pid()
-        if owner is None:
-            try:
-                owner = int(self.paths.supervisor_pid_file.read_text(encoding="ascii").strip() or "0") or None
-            except (OSError, ValueError):
-                owner = None
-        if owner is None or _alive(owner):
-            # No named owner: the lock may be held by a live process we cannot name. Leave it.
+        handle = take_lock(self.paths.lock_file)
+        if handle is None:
+            # A live supervisor owns it. Its lock is the guard; remove nothing.
             return False
         try:
             self.paths.lock_file.unlink()
             return True
         except OSError:
-            return False
+            return False  # Windows refuses to unlink a file we hold; the leftover is harmless
+        finally:
+            handle.close()
 
     def _life_note(self, message: str) -> None:
         """One timestamped line in ``runtime/supervisor.log`` — the file the supervisor writes too."""
