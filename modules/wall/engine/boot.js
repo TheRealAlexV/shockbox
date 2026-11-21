@@ -190,6 +190,18 @@
   // key the operator set back to its default must land too, or the page keeps the old one.
   var applyLook = function (d) {
     if (!d) return false;
+    // Which revision of the document this page is rendering. A reconnect re-read compares its
+    // own rev against this one, and the preset latch compares a frame's rev against the rev the
+    // write started from, so both facts have to be recorded here — this is the only place a
+    // document reaches the engine.
+    // A frame older than the document already held here is stale, and applying it puts an older
+    // look back on the wall. Server write order is what has kept that from happening; this makes
+    // it a property instead of an assumption. A frame with no rev (the initial state, older
+    // emitters) carries no ordering fact and must still apply, and an equal rev is not older — it
+    // is the same document, so it keeps applying in full. Checked before the record below, so a
+    // stale frame can never overwrite the rev this page is rendering.
+    if (typeof d.rev === 'number' && typeof inst.docRev === 'number' && d.rev < inst.docRev) return false;
+    if (typeof d.rev === 'number') inst.docRev = d.rev;
     var applied = false;
     // Saved presets arrive with every snapshot: the page must know a preset by name before a
     // `preset.set` for it can land, and a missed frame must not leave the wall unable to
@@ -203,6 +215,15 @@
     // pre-load values straight back, so a load marks the window and the look is skipped until it
     // closes — by then the document carries the preset and its own frame is the one applied.
     var loadingPreset = inst.presetLoadingUntil && Date.now() < inst.presetLoadingUntil;
+    // ...but the frame the write itself produces must land, or the document's new look is never
+    // applied. The frame being guarded against carries the revision the page had when the write
+    // started; the write's snapshot carries a newer one. So a newer frame closes the window early
+    // instead of being dropped with the stale one.
+    if (loadingPreset && typeof inst.presetLoadRev === 'number'
+        && typeof d.rev === 'number' && d.rev > inst.presetLoadRev) {
+      loadingPreset = false;
+      inst.presetLoadingUntil = 0;
+    }
     // The picture's geometry is the server's (it read the file's real dimensions): the engine
     // needs it to draw the picture at its own proportions, and it arrives on every state frame,
     // so a placement restored from a preset has the same aspect as a fresh upload. Assigned
@@ -244,10 +265,24 @@
   }
   // Re-apply the server's look on demand: the same path a `state.snapshot` frame takes. The
   // picture probe steps frames by hand, so the SSE handler cannot run between two writes.
-  inst.reapplyServerLook = function () {
+  //
+  // `minRev` is the revision this page was showing when the caller decided to re-read. A document
+  // at that same revision carries nothing new — applying it would only race a frame already on
+  // its way — so it is skipped. Anything else is news: state frames are `events.emit`, which the
+  // hub's ring does not hold, so a frame that lands while the stream is down is gone and this
+  // re-read is the only repair. Never a reload: a reload blanks the OBS wall source.
+  inst.reapplyServerLook = function (minRev) {
     return fetch('/api/wall/render' + previewQ(), { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (body) { applyLook(body && body.settings); return true; });
+      .then(function (body) {
+        var d = body && body.settings;
+        if (d && typeof d.rev === 'number' && typeof minRev === 'number' && d.rev === minRev) return false;
+        var applied = applyLook(d);
+        if (applied && typeof inst.docRev === 'number' && inst.agent && inst.agent.lastRev !== undefined) {
+          inst.agent.lastRev = inst.docRev;
+        }
+        return applied;
+      });
   };
   // A preview page follows the preview document, which no broadcast carries (it is memory-only
   // and must never reach the OBS source). The pane pokes its own iframe after every edit; the

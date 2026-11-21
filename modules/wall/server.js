@@ -343,6 +343,18 @@ export default {
         }
         if (raw.lastSnapshot && typeof raw.lastSnapshot === 'object') this.lastSnapshot = raw.lastSnapshot;
         if (raw.ratioState && typeof raw.ratioState === 'object') this.ratioState = raw.ratioState;
+        // Saved presets travel in the same document as the four keys above so the look list and
+        // the look it applied cannot disagree after a restart. Absent (an older state.json) is
+        // simply an empty bank; a malformed entry is dropped rather than refused, because a bad
+        // preset must not stop the module coming up.
+        const presets = raw.presets;
+        if (presets && typeof presets === 'object' && !Array.isArray(presets)) {
+          for (const n of Object.keys(presets)) {
+            const look = presets[n];
+            if (!n || SHIPPED_PRESETS.indexOf(n) >= 0) continue; // shipped names are code, not data
+            if (look && typeof look === 'object' && !Array.isArray(look)) this.savedPresets[n] = look;
+          }
+        }
       }
     } catch (err) {
       if (err.code !== 'ENOENT') this.log.warn(`wall: cannot read state (${err.message})`);
@@ -364,7 +376,15 @@ export default {
         fs.writeFileSync(
           tmp,
           JSON.stringify(
-            { gates: this.gates, views: this.views, lastSnapshot: this.lastSnapshot || null, ratioState: this.ratioState || null },
+            // One document, one atomic rename: the saved preset bank is written with the rest, so
+            // a `preset.save` that lands mid-write cannot tear the other keys (or itself) apart.
+            {
+              gates: this.gates,
+              views: this.views,
+              lastSnapshot: this.lastSnapshot || null,
+              ratioState: this.ratioState || null,
+              presets: this.savedPresets || {},
+            },
             null,
             1,
           ),
@@ -727,6 +747,9 @@ export default {
     // round trip), and the saved preset has to survive an OBS reload. Reading it off a page
     // would capture whatever that page happened to have applied last, and lose it on reload.
     if (cmd === 'preset.save') return this._savePreset(args || {});
+    // `preset.delete` is also answered here: only the server holds the saved bank, and a shipped
+    // preset cannot be deleted at all (see `_deletePreset`).
+    if (cmd === 'preset.delete') return this._deletePreset(args || {});
     const { rec, view: scope } = validateCommand(cmd, args, view);
     // Ratio commands are answered by the server, not the page: the ratio is persisted here and
     // a forcing scene must win over the key (a17).
@@ -831,6 +854,13 @@ export default {
     if (!/^[A-Za-z0-9 ._:-]{1,64}$/.test(name)) {
       throw new HttpError(400, 'preset.save: name must be 1..64 chars of [A-Za-z0-9 ._:-]');
     }
+    // A shipped name is code (`SHIPPED_PRESETS`), not a saved record: `presetsForPage()` drops
+    // shipped names from the saved bank, so storing one would be invisible and would not survive
+    // the next restart. Refuse it with the same shape `_deletePreset` uses.
+    const refuse = (note) => ({ seq: this.seq, delivered: 0, ok: false, note });
+    if (SHIPPED_PRESETS.indexOf(name) >= 0) {
+      return refuse(`refused: "${name}" ships with the engine and cannot be overwritten`);
+    }
     const S = this.ctx.settings;
     const look = {};
     for (const f of PRESET_DIMS) {
@@ -842,6 +872,7 @@ export default {
     // write the pane's dropdown makes.
     look.preset = name;
     this.savedPresets[name] = look;
+    this.save();
     S.patch(look);
     this._bumpRender();
     const { look: lk, ratio, fence } = this.renderSettings();
@@ -852,9 +883,39 @@ export default {
     return { seq: this.seq, delivered: 0, ok: true, note: 'preset saved', preset: name, presets };
   },
 
+  /**
+   * Remove an operator-saved preset from the bank.
+   *
+   * A shipped preset is code in `engine/presets/presets.js`, loaded through a `vm` sandbox and
+   * listed by `SHIPPED_PRESETS`; there is no record to remove, so deleting one is refused with a
+   * note rather than pretending to work. The shipped list is the catalogue, not saved data.
+   *
+   * The live look is untouched: this deletes the saved record, and the wall keeps rendering
+   * whatever it is rendering. An open pane drops the name from its dropdown on the next snapshot.
+   */
+  _deletePreset(args) {
+    const name = typeof args.name === 'string' ? args.name.trim() : '';
+    if (!name) throw new HttpError(400, 'preset.delete: name is required');
+    if (!/^[A-Za-z0-9 ._:-]{1,64}$/.test(name)) {
+      throw new HttpError(400, 'preset.delete: name must be 1..64 chars of [A-Za-z0-9 ._:-]');
+    }
+    const refuse = (note) => ({ seq: this.seq, delivered: 0, ok: false, note });
+    if (SHIPPED_PRESETS.indexOf(name) >= 0) {
+      return refuse(`refused: "${name}" ships with the engine and cannot be deleted`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(this.savedPresets, name)) {
+      return refuse(`refused: no saved preset "${name}"`);
+    }
+    delete this.savedPresets[name];
+    this.save();
+    const presets = this.presetsForPage();
+    this.pushState();
+    this.log.info(`wall preset deleted: ${name}`);
+    return { seq: this.seq, delivered: 0, ok: true, note: 'preset deleted', preset: name, presets };
+  },
+
   // Put it back to 16:9 whatever happened: the pane's escape hatch.
-  _ratioForce() {
-    // Inside a forcing scene the wall is already 16:9, and `sync` would overwrite the ratio the
+  _ratioForce() {    // Inside a forcing scene the wall is already 16:9, and `sync` would overwrite the ratio the
     // operator will get back on leaving: "force 16:9" must not eat the remembered 9:16.
     if (this.ratio && this.ratio.state.forcing) {
       return { seq: this.seq, ok: true, note: 'already forced by the active scene', ratio: '16:9' };
@@ -941,6 +1002,10 @@ export default {
             render: mod.renderSettings(),
             image: mod.image ? { ...mod.image, limit: MAX_BYTES } : null,
             snapshot: mod.lastSnapshot || null,
+            // Each page's own state post, including `lastCmd` — the only place a command an
+            // engine refused (`ignored: …`) can be read back, since the /cmd answer was
+            // written before any page saw the frame.
+            views: { ...mod.views },
           };
         },
       },

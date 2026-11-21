@@ -39,9 +39,100 @@ const BARE = new Set([
 /** Numeric nudge commands: presets/pattern banks move by {delta} or {set}. */
 const NUMERIC = new Set(['preset.index', 'pattern.index']);
 
-export const COMMANDS = [...BARE, 'preset.set', 'preset.save', 'look.palette', 'look.pattern',
+export const COMMANDS = [...BARE, 'preset.set', 'preset.save', 'preset.delete', 'look.palette', 'look.pattern',
   'wall.image.set', 'wall.image.clear',
-  'text.send', 'text.enabled', 'settings.patch', ...NUMERIC].sort();
+  'text.send', 'text.enabled', 'text.style', 'text.align', 'settings.patch', ...NUMERIC].sort();
+
+// The renderer's real per-run size allowlist (sim.js SIZE_STEPS): glyph heights are whole
+// cells, so these four are the only heights that land on the grid. `config.js` advertises a
+// 0.1..2 range for the same key, which is a lie the validator refuses to honour.
+const SIZE_STEPS = [0.8, 1, 1.25, 1.5];
+// `config.js` `text.fonts` key -> CSS stack. A raw CSS family is also accepted (sim.js
+// `String(st.font)`), so these are names, not the whole vocabulary.
+const FONT_KEYS = new Set(['mono', 'cond', 'black', 'impact', 'serif', 'sans']);
+const COLOUR_HEX_RE = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i;
+const ALIGNS = new Set(['left', 'center', 'right']);
+const STYLE_KEYS = new Set(['size', 'font', 'tracking', 'uppercase', 'scroll', 'reveal',
+  'colour', 'fit', 'cellThreshold']);
+
+// The look the operator approved on the `sign` preset, and the default `text.send` carries when
+// the caller sends no style: size 1 (the preset's 0.92 snaps to 1 in sim.js `sizeFor`), the
+// preset's Arial stack, tracking .06, upper case, palette colour. It is a DEFAULT, not an
+// override — an explicit style still wins key by key — and it goes through `stylePatch` on
+// every send so it cannot drift out of the renderer's ranges.
+const TEXT_SEND_STYLE = Object.freeze({
+  size: 1,
+  font: '"Arial", "Helvetica Neue", sans-serif',
+  tracking: 0.06,
+  uppercase: true,
+  scroll: 0,
+  reveal: 0,
+  colour: 'palette',
+});
+
+/** A number inside the range the renderer actually draws, named so a bad field says which. */
+function numRange(cmd, name, v, lo, hi) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < lo || n > hi) {
+    throw new HttpError(400, `${cmd}: ${name} must be a number ${lo}..${hi}`);
+  }
+  return n;
+}
+
+/**
+ * Validate a `text.style` patch. Every key is one the renderer reads (sim.js raster, 577-690);
+ * a key it does not read would be a control with no wire behind it, so unknown keys are a 400
+ * rather than dropped — a typo has to be visible.
+ */
+function stylePatch(raw) {
+  if (!isObj(raw)) throw new HttpError(400, 'text.style: style must be an object');
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!STYLE_KEYS.has(k)) {
+      throw new HttpError(400, `text.style: unknown key "${k}" — use ${[...STYLE_KEYS].join(', ')}`);
+    }
+    switch (k) {
+      case 'size': {
+        const n = Number(v);
+        if (!SIZE_STEPS.includes(n)) {
+          throw new HttpError(400, `text.style: size must be one of ${SIZE_STEPS.join(', ')} (whole-cell glyph heights)`);
+        }
+        out.size = n;
+        break;
+      }
+      case 'font': {
+        if (typeof v !== 'string' || !v.trim() || v.length > 120) {
+          throw new HttpError(400, 'text.style: font must be a key (mono, cond, black, impact, serif, sans) or a CSS family string up to 120 chars');
+        }
+        out.font = FONT_KEYS.has(v) ? v : v.trim();
+        break;
+      }
+      case 'tracking': out.tracking = numRange('text.style', 'tracking', v, -0.2, 1); break;
+      case 'scroll': out.scroll = numRange('text.style', 'scroll', v, -600, 600); break;
+      case 'reveal': out.reveal = numRange('text.style', 'reveal', v, 0, 4000); break;
+      case 'cellThreshold': out.cellThreshold = numRange('text.style', 'cellThreshold', v, 0, 1); break;
+      case 'uppercase':
+        if (typeof v !== 'boolean') throw new HttpError(400, 'text.style: uppercase must be a boolean');
+        out.uppercase = v;
+        break;
+      case 'fit':
+        if (v !== 'auto' && v !== 'none') throw new HttpError(400, 'text.style: fit must be "auto" or "none"');
+        out.fit = v;
+        break;
+      case 'colour':
+        // 'palette' is the sentinel that makes glyph cells adopt the wall's own ramp and
+        // pattern (sim.js COLOUR_PALETTE); any hex is snapped to the nearest palette sample.
+        if (v !== 'palette' && !(typeof v === 'string' && COLOUR_HEX_RE.test(v))) {
+          throw new HttpError(400, 'text.style: colour must be "palette" or a #rgb/#rrggbb hex');
+        }
+        out.colour = v === 'palette' ? 'palette' : v.toLowerCase();
+        break;
+      default: break;
+    }
+  }
+  if (!Object.keys(out).length) throw new HttpError(400, 'text.style: style patch is empty');
+  return out;
+}
 
 function isObj(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -97,12 +188,12 @@ export function validateCommand(cmd, args = {}, topView = null) {
     return { rec: { delta: step }, view };
   }
 
-  if (cmd === 'preset.save') {
+  if (cmd === 'preset.save' || cmd === 'preset.delete') {
     if (typeof args.name !== 'string' || !args.name.trim()) {
-      throw new HttpError(400, 'preset.save: name is required');
+      throw new HttpError(400, `${cmd}: name is required`);
     }
     if (!NAME_RE.test(args.name)) {
-      throw new HttpError(400, 'preset.save: name must be 1..64 chars of [A-Za-z0-9 ._:-]');
+      throw new HttpError(400, `${cmd}: name must be 1..64 chars of [A-Za-z0-9 ._:-]`);
     }
     return { rec: { name: args.name }, view };
   }
@@ -164,8 +255,24 @@ export function validateCommand(cmd, args = {}, topView = null) {
     // bare `poolId`/`slot` through the module, but the engine's text.send only consumes
     // `item`, so that path was accepted and then silently ignored — removed, not kept.
     let rec;
-    if (typeof args.text === 'string') rec = { text: args.text };
-    else if (args.item !== undefined) {
+    if (typeof args.text === 'string') {
+      // A typed message is built into the same `item` shape `resolvePoolArgs` produces for a
+      // pool message (server.js: `{title, paras:[{align, runs:[{t}]}]}`), because the engine's
+      // `text.send` reads nothing but `item.paras`. Handing it `{text}` here is what made Quick
+      // Send answer 200 and put nothing on the wall (verified 2026-11-19).
+      const align = ALIGNS.has(args.align) ? args.align : 'center';
+      rec = { item: {
+        title: typeof args.title === 'string' ? args.title : '',
+        paras: [{ align, runs: [{ t: args.text }] }],
+      } };
+      // A style bag rides with the send so a message carries the operator's current card
+      // values even if no `text.style` was sent first (engine merges `item.style` over the
+      // text object's own style). Absent style = the sign look, not the renderer's bare
+      // defaults, so a script, deck key or scheduled send lands on the same look the operator
+      // approved; an explicit style still wins per key over that default.
+      const explicit = args.style === undefined ? {} : stylePatch(args.style);
+      rec.item.style = stylePatch({ ...TEXT_SEND_STYLE, ...explicit });
+    } else if (args.item !== undefined) {
       if (!isObj(args.item)) throw new HttpError(400, 'text.send item must be an object');
       rec = { item: args.item };
     } else throw new HttpError(400, 'text.send needs text or item (poolId/slot are resolved upstream)');
@@ -182,6 +289,22 @@ export function validateCommand(cmd, args = {}, topView = null) {
   if (cmd === 'text.enabled') {
     if (typeof args.on !== 'boolean') throw new HttpError(400, 'text.enabled: on must be a boolean');
     return { rec: { view: viewArg(), on: args.on }, view };
+  }
+
+  if (cmd === 'text.style') {
+    // The engine merges this onto the live text object's `style`, so a partial patch is the
+    // normal shape: one control, one key. It applies to the message on the wall now and to
+    // every later send, which is what makes the card a style, not a one-shot.
+    const tv = viewArg();
+    return { rec: { style: stylePatch(args.style), view: tv }, view };
+  }
+
+  if (cmd === 'text.align') {
+    // Per-paragraph align is the only layout knob there is (sim.js `alignF`: left/center/right).
+    // One control sets every paragraph of the live text; a send carries its own from `text.send`.
+    const tv = viewArg();
+    if (!ALIGNS.has(args.align)) throw new HttpError(400, 'text.align: align must be left | center | right');
+    return { rec: { align: args.align, view: tv }, view };
   }
 
   if (cmd === 'settings.patch') {

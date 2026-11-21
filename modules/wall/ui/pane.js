@@ -331,9 +331,17 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   fillPalettes();
   fillPatterns();
 
-  presetSelect.addEventListener('change', () => {
+  presetSelect.addEventListener('change', async () => {
     const name = presetSelect.value;
+    // a different name is a different decision: the delete button must not stay armed
+    if (delArmed) { delArmed = ''; clearTimeout(delTimer); paintDeleteBtn(); }
     if (!name) return;
+    // The document is written first, on purpose. The command makes the OBS source apply the
+    // preset and write the whole look back, so this write is only about the document agreeing:
+    // `broadcastState` ships the document's look, and until `preset` is in it a snapshot puts the
+    // old name back. Ordering matters — the PATCH's broadcast carries the look the wall is
+    // already running, so the command that follows is the only visible change.
+    await patchSettings({ preset: name }, { force: true });
     cmd('preset.set', { name }).then((out) => {
       if (out && out.ok !== false) synth = { ...synth, preset: name };
       paintQuick();
@@ -349,11 +357,16 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     paintQuick();
     cmd('look.palette', { name }).then((out) => onLookCmdAnswer(out, 'palette', name));
   });
-  patternSelect.addEventListener('change', () => {
+  patternSelect.addEventListener('change', async () => {
     const name = patternSelect.value;
     if (!name) return;
     setLookField('pattern', name);
     paintQuick();
+    // `pattern` is a document key (module.json), so it is written there as well as commanded:
+    // the command only reaches the page, and `broadcastState` always ships the whole document
+    // look, so a command-only pick is undone at the next frame. Written before the command, the
+    // broadcast carries the pick the operator made and the command has nothing left to change.
+    await patchSettings({ pattern: name }, { force: true });
     cmd('look.pattern', { name }).then((out) => onLookCmdAnswer(out, 'pattern', name));
   });
 
@@ -367,6 +380,13 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   const saveCancelBtn = el('button', { type: 'button', class: 'btn btn-sm btn-icon wall-save-cancel', text: '×', 'aria-label': 'Cancel saving a look', title: 'Cancel' });
   const saveNote = el('span', { class: 'wall-save-note mono', role: 'status', 'aria-live': 'polite' });
   const saveForm = el('div', { class: 'wall-save', hidden: true }, saveNameInput, saveOkBtn, saveCancelBtn, saveNote);
+  // Deleting is a server-side record change, so it sits beside the bar that creates the record.
+  // Two clicks on the same name: the OBS browser source has no dialog surface, so the confirm is
+  // the button itself rather than a native prompt.
+  const delBtn = el('button', { type: 'button', class: 'btn btn-sm wall-delete-btn', text: 'Delete preset', title: 'Delete the saved preset selected above (shipped presets cannot be deleted)' });
+  let delArmed = '';
+  let delTimer = null;
+  timers.push(() => clearTimeout(delTimer));
   let saveNoteTimer = null;
   timers.push(() => clearTimeout(saveNoteTimer));
 
@@ -462,8 +482,47 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     }
   }
 
-  function adoptPresets(presets) {
-    if (!presets || !Array.isArray(presets.order)) return;
+  function paintDeleteBtn() {
+    delBtn.textContent = 'Delete preset';
+    delete delBtn.dataset.armed;
+    delBtn.removeAttribute('aria-label');
+  }
+
+  async function submitDelete() {
+    if (signal.aborted) return;
+    const name = presetSelect.value;
+    if (!name) {
+      setSaveNote('pick a preset to delete', 'bad');
+      return;
+    }
+    if (delArmed !== name) {
+      delArmed = name;
+      clearTimeout(delTimer);
+      delTimer = setTimeout(() => { delArmed = ''; paintDeleteBtn(); }, 4000);
+      delBtn.textContent = `Delete “${name}”?`;
+      delBtn.dataset.armed = 'true';
+      delBtn.setAttribute('aria-label', `Delete the saved preset ${name}`);
+      setSaveNote(`click again to delete “${name}”`, 'bad');
+      return;
+    }
+    delArmed = '';
+    clearTimeout(delTimer);
+    paintDeleteBtn();
+    // Not gated on Auto Apply: deleting a saved record never touches the wall.
+    const out = await cmd('preset.delete', { name }, { force: true });
+    if (!out || out.ok === false) {
+      // cmd() has already toasted the server's words; the bar keeps them next to the button
+      setSaveNote(out && out.note ? out.note : 'not deleted', 'bad');
+      return;
+    }
+    if (out.presets) adoptPresets(out.presets);
+    setSaveNote(`deleted “${name}”`, 'ok', 2400);
+    paintQuick();
+  }
+
+  delBtn.addEventListener('click', () => { void submitDelete(); });
+
+  function adoptPresets(presets) {    if (!presets || !Array.isArray(presets.order)) return;
     // a bank that has not changed is not refilled: replacing the options under an open dropdown
     // closes it, and every snapshot carries the bank
     const key = presets.order.join('\u0000') + '\u0001' + Object.keys(presets.saved || {}).join('\u0000');
@@ -495,7 +554,7 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
       patternSelect,
     ),
     // the save flow sits beside the Preset field it writes into
-    saveBtn, saveForm,
+    saveBtn, saveForm, delBtn,
     el('span', { class: 'look-sep' }),
     blackoutBtn, blackoutBadge,
     el('span', { class: 'control-spacer' }),
@@ -628,6 +687,100 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   const textClearBtn = actionButton({ label: 'Clear', variant: '', run: () => cmd('text.clear'), onError: (e) => toast(`clear: ${e.message}`, 'error') });
   const textRevealBtn = actionButton({ label: 'Reveal', variant: '', run: () => cmd('text.reveal'), onError: (e) => toast(`reveal: ${e.message}`, 'error') });
 
+  // ── style ────────────────────────────────────────────────────────────────
+  // Every one of these is a key the renderer already reads (sim.js raster); the card is the
+  // missing write path, not a new capability. `colour:'palette'` is the sentinel that makes
+  // glyph cells take the wall's own ramp and pattern (COLOUR_PALETTE) — the look the operator
+  // liked on the sign preset, and a property of any text block rather than of a preset.
+  // tracking .06 + uppercase is that look, so those are the seed a fresh send carries.
+  // The sign preset's family, verbatim: `sim.js` resolves a raw CSS family at block level, so
+  // this is not a key it has to know. It is listed in TEXT_FONT_KEYS so the select can show it
+  // instead of silently sitting on the first key ('mono') while the send carries Arial.
+  const SIGN_FONT = '"Arial", "Helvetica Neue", sans-serif';
+  const TEXT_SEED = { size: 1, font: SIGN_FONT, tracking: 0.06, uppercase: true, scroll: 0, reveal: 0, colour: 'palette' };
+  const TEXT_FONT_KEYS = ['mono', 'cond', 'black', 'impact', 'serif', 'sans', SIGN_FONT];
+  let textStyle = { ...TEXT_SEED };
+  let textAlign = 'center';
+  let textStyleSeeded = false;
+
+  const opt = (value, label) => el('option', { value, text: label });
+  const tSize = el('select', { class: 'input', id: 'wall-text-size', 'aria-label': 'Text size' },
+    // the renderer's whole allowlist: glyph heights are whole cells, so these four are all there is
+    opt('0.8', '0.8×'), opt('1', '1×'), opt('1.25', '1.25×'), opt('1.5', '1.5×'));
+  const tFont = el('select', { class: 'input', id: 'wall-text-font', 'aria-label': 'Text font' },
+    ...TEXT_FONT_KEYS.map((k) => opt(k, k === SIGN_FONT ? 'Arial' : k)));
+  const tAlign = el('select', { class: 'input', id: 'wall-text-align', 'aria-label': 'Text align' },
+    opt('left', 'left'), opt('center', 'centre'), opt('right', 'right'));
+  const tPalette = el('input', { type: 'checkbox', class: 'input', id: 'wall-text-palette', 'aria-label': 'Use the wall palette' });
+  const tColour = el('input', { type: 'color', class: 'input', id: 'wall-text-colour', value: '#ffffff', 'aria-label': 'Text colour' });
+  const tColourWrap = el('span', { class: 'wall-text-colour' }, tPalette, tColour);
+  const tTracking = el('input', { type: 'number', class: 'input input-num', id: 'wall-text-tracking', min: '-0.2', max: '1', step: '0.01', 'aria-label': 'Letter tracking' });
+  const tUpper = el('input', { type: 'checkbox', class: 'input', id: 'wall-text-upper', 'aria-label': 'Upper case' });
+  const tScroll = el('input', { type: 'number', class: 'input input-num', id: 'wall-text-scroll', min: '-600', max: '600', step: '5', 'aria-label': 'Marquee speed in px per second' });
+  const tReveal = el('input', { type: 'number', class: 'input input-num', id: 'wall-text-reveal', min: '0', max: '4000', step: '50', 'aria-label': 'Reveal time in ms' });
+
+  /** One field, in the fence card's own shape: a label with a mono key and its control. */
+  // The label wraps its control rather than pointing at it with `for`: the colour field holds
+  // two controls, and a `for` on the checkbox would let a click on the swatch toggle it.
+  const tf = (key, control) => el('label', { class: 'wall-field' }, el('span', { class: 'mono dim', text: key }), control);
+
+  /** Push one style key to the live text; the next send carries the whole bag as well. */
+  async function setTextStyle(patch) {
+    Object.assign(textStyle, patch);
+    paintTextStyle();
+    await cmd('text.style', { style: patch });
+  }
+
+  // Values only, never a `change` event: a paint must not send the command it is describing.
+  function paintTextStyle() {
+    const size = String(textStyle.size);
+    if ([...tSize.options].some((o) => o.value === size)) tSize.value = size;
+    if (TEXT_FONT_KEYS.includes(textStyle.font)) tFont.value = textStyle.font;
+    tAlign.value = textAlign;
+    const pal = textStyle.colour === 'palette';
+    tPalette.checked = pal;
+    tColour.disabled = pal;
+    if (!pal && /^#([0-9a-f]{6})$/i.test(String(textStyle.colour))) tColour.value = textStyle.colour;
+    tTracking.value = String(textStyle.tracking);
+    tUpper.checked = !!textStyle.uppercase;
+    tScroll.value = String(textStyle.scroll);
+    tReveal.value = String(textStyle.reveal);
+  }
+
+  // Adopt the wall's own style once, so the card never claims a style the wall is not showing.
+  // An untouched text object (engine defaults: .8, no tracking, lower case) is not a style an
+  // operator chose, so the house seed wins there — that is what makes a fresh send look right.
+  function adoptTextStyle() {
+    if (textStyleSeeded) return;
+    const s = lookValue('text');
+    const st = s && typeof s === 'object' ? s.style : null;
+    if (!st || typeof st !== 'object') return;
+    const untouched = Number(st.size) === 0.8 && Number(st.tracking) === 0 && !st.uppercase;
+    if (!untouched) {
+      for (const k of ['size', 'font', 'tracking', 'uppercase', 'scroll', 'reveal', 'colour']) {
+        if (st[k] !== undefined) textStyle[k] = st[k];
+      }
+      const p0 = Array.isArray(s.paras) ? s.paras[0] : null;
+      if (p0 && ['left', 'center', 'right'].includes(p0.align)) textAlign = p0.align;
+    }
+    textStyleSeeded = true;
+    paintTextStyle();
+  }
+
+  tSize.addEventListener('change', () => setTextStyle({ size: Number(tSize.value) }));
+  tFont.addEventListener('change', () => setTextStyle({ font: tFont.value }));
+  tTracking.addEventListener('change', () => setTextStyle({ tracking: Number(tTracking.value) }));
+  tUpper.addEventListener('change', () => setTextStyle({ uppercase: tUpper.checked }));
+  tScroll.addEventListener('change', () => setTextStyle({ scroll: Number(tScroll.value) }));
+  tReveal.addEventListener('change', () => setTextStyle({ reveal: Number(tReveal.value) }));
+  tColour.addEventListener('input', () => { if (!tPalette.checked) setTextStyle({ colour: tColour.value }); });
+  tPalette.addEventListener('change', () =>
+    setTextStyle({ colour: tPalette.checked ? 'palette' : tColour.value }));
+  tAlign.addEventListener('change', async () => {
+    textAlign = tAlign.value;
+    await cmd('text.align', { align: textAlign });
+  });
+
   const textPanel = el('section', { class: 'panel wall-text-panel' },
     el('div', { class: 'panel-head' },
       el('span', { class: 'panel-title', text: 'Text' }),
@@ -636,6 +789,18 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     el('div', { class: 'wall-text-body' },
       // the message itself comes from the quick-send box above; this row only drives the layer
       textToggle, textClearBtn, textRevealBtn,
+    ),
+    el('div', { class: 'wall-text-body wall-text-style' },
+      el('div', { class: 'wall-fields' },
+        tf('size', tSize),
+        tf('font', tFont),
+        tf('align', tAlign),
+        tf('colour', tColourWrap),
+        tf('tracking', tTracking),
+        tf('upper', tUpper),
+        tf('scroll', tScroll),
+        tf('reveal', tReveal),
+      ),
     ),
   );
   function paintTextToggle() {
@@ -1110,12 +1275,17 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     poolId: 'wall',
     kinds: ['wall'],
     placeholder: 'Message to the wall — text, or pick from the pool…',
-    onSend: (p) => cmd('text.send',
-      p.text ? { text: p.text, ...(p.title ? { title: p.title } : {}) } : { poolId: p.poolId }),
+    // The message carries the card's style and align, so a send is styled even when it is the
+    // first thing the operator does (the engine merges `item.style` over the text object's own).
+    onSend: (p) => cmd('text.send', p.text
+      ? { text: p.text, ...(p.title ? { title: p.title } : {}), align: textAlign, style: { ...textStyle } }
+      : { poolId: p.poolId }),
     onSchedule: (p) => api.post('/api/schedules', {
       module: 'wall',
       at: p.at,
-      payload: p.text ? { text: p.text } : { poolId: p.poolId },
+      payload: p.text
+        ? { text: p.text, align: textAlign, style: { ...textStyle } }
+        : { poolId: p.poolId },
     }),
     onSave: (p) => api.post('/api/pool/wall/messages', { text: p.text, title: p.title || undefined, kind: 'wall' }),
     signal,
@@ -1193,9 +1363,29 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     }
   }
 
+  // A command the server accepted can still be refused by the page that had to apply it
+  // (`ignored: …`). The /cmd answer is written before any page sees the frame, so that note
+  // comes back on the page's own state post (`views[view].lastCmd`) and is shown here, once.
+  let lastIgnoredNote = '';
+  function reportIgnored(data) {
+    const views = data && data.views;
+    if (!views || typeof views !== 'object') return;
+    for (const viewName of ['landscape', 'portrait']) {
+      const lc = views[viewName] && views[viewName].lastCmd;
+      if (!lc || typeof lc.note !== 'string' || !lc.note.startsWith('ignored')) continue;
+      const key = `${viewName}:${lc.seq}:${lc.note}`;
+      if (key === lastIgnoredNote) continue;
+      lastIgnoredNote = key;
+      // 'error', not 'warn': a warning next to a green "sent" reads as "it worked". The page
+      // refused the command, so it reads as a failure.
+      toast(`${viewName} ${lc.cmd || 'command'}: ${lc.note}`, 'error');
+    }
+  }
+
   function applyLive(data) {
     if (!data) return;
     live = data;
+    reportIgnored(data);
     seq = Number(data.seq) || seq;
     if (data.online) online = { landscape: !!data.online.landscape, portrait: !!data.online.portrait };
     if (Array.isArray(data.history)) history = data.history;
@@ -1226,6 +1416,8 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     paintStrip();
     paintStream();
     paintTextToggle();
+    adoptTextStyle();
+    paintTextStyle();
     paintImage();
   }
 

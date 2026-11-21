@@ -81,6 +81,13 @@
 /* ---- save look: the button, then the field it opens ---------------------------------- */
 .wall-save-btn { flex: 0 0 auto; white-space: nowrap; }
 
+/* delete sits beside the save bar and is never the default action: outlined until armed */
+.wall-delete-btn { flex: 0 0 auto; white-space: nowrap; }
+.wall-delete-btn[data-armed='true'] {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
 .wall-save {
   display: inline-flex;
   align-items: center;
@@ -295,6 +302,18 @@
   padding: 8px 12px;
 }
 .wall-text-body .input { flex: 1 1 220px; min-width: 140px; height: 28px; }
+
+/* The style row is the fence card's field shape, but its labels are words, not one letter,
+   so the compact label width and the 220px flex both have to be undone here. */
+.wall-text-style { padding-top: 0; align-items: flex-end; }
+.wall-text-style .wall-fields { flex: 1 1 100%; }
+.wall-text-style .wall-field > .mono { width: auto; }
+.wall-text-style .wall-field .input { flex: none; height: 26px; min-width: 0; width: auto; }
+.wall-text-style .wall-field input[type="checkbox"] { height: auto; }
+.wall-text-style .wall-field select { min-width: 84px; }
+.wall-text-style .wall-field .input-num { width: 76px; }
+.wall-text-colour { display: inline-flex; align-items: center; gap: 6px; }
+.wall-text-colour input[type="color"] { width: 34px; padding: 0 2px; }
 
 /* The pool picker is its own row: a long message must not squeeze the free-text input. */
 .wall-pool-row {

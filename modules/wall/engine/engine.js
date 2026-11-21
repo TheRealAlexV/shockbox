@@ -1346,8 +1346,8 @@
     // LOOK-key change: the deck must be able to restyle without clearing text.
     //
     // That rule has to hold for the *live* text too, not just for the block's
-    // continued existence: a preset that carries `views` (e.g. `sign`) would
-    // deep-merge its own `text` over the notice that is on air, and both the
+    // continued existence: a preset that carries `views` would deep-merge its own
+    // `text` over the notice that is on air, and both the
     // rebuilt `mode` and the preset's `views.*.mode` would take the page out of
     // text mode.  Capture the on-air text and the mode flags before the rebuild
     // and put them back after it, so a look change only ever changes look.
@@ -2401,10 +2401,10 @@
 
   // ── Command bus (agent → page) ────────────────────────────────────────────
 
-  // Deck cycling order. `sign` was a text behaviour bolted onto the preset bank and is gone:
-  // it carried no look of its own, so `preset.next` landed on a preset that did not exist and
-  // the wall flickered through an empty look. Operator-saved presets are appended after these.
-  var PRESET_ORDER = ['neonwave', 'arctic', 'chase', 'bassline', 'ember', 'sign'];
+  // Deck cycling order. Each name here must also exist in the catalogue (`presets.js`): the list is
+  // filtered by `PRESETS[n]` below, so a name without a definition is silently skipped instead of
+  // cycling to an empty look. Operator-saved presets are appended after these.
+  var PRESET_ORDER = ['neonwave', 'arctic', 'chase', 'bassline', 'ember'];
 
   /**
    * One command, from the deck through services/ledwall-agent.  Returns
@@ -2481,7 +2481,11 @@
               out.preset = setName;
               // Keep the page's own view of the document quiet until this write lands: the
               // snapshot it triggers is the one that must win, not one already in flight.
+              // The frame to hold back carries the revision this page was showing when the
+              // write started; the write's own snapshot carries a newer one. Recording that
+              // revision is what lets boot.js tell the two apart instead of dropping both.
               var self2 = this;
+              this.presetLoadRev = typeof this.docRev === 'number' ? this.docRev : null;
               this.presetLoadingUntil = Date.now() + 1500;
               this._persistLook(out).then(function (ok) {
                 // Once the document has the preset, the page may follow frames again.
@@ -2651,6 +2655,31 @@
           this.restartReveal();
           changed = true;
           break;
+
+        // The style bag lives on the text object, so a patch styles the message on the wall
+        // now *and* every later send (text.send merges `item.style` over this same object).
+        // Validation is the command layer's job (commands.mjs stylePatch); this only guards
+        // against a page or a script that bypasses it.
+        case 'text.style': {
+          if (!a.style || typeof a.style !== 'object') { note = 'ignored: no style'; break; }
+          this._setViewTextStyle(a.style);
+          this.restartReveal();
+          changed = true;
+          break;
+        }
+        // Align is per paragraph and has no block-level field, so this rewrites every
+        // paragraph of the live text. A later send carries its own align (`text.send`).
+        case 'text.align': {
+          if (a.align !== 'left' && a.align !== 'center' && a.align !== 'right') {
+            note = 'ignored: bad align'; break;
+          }
+          var tal = JSON.parse(JSON.stringify(this.textObject() || {}));
+          var tps = tal.paras || [];
+          for (var tai = 0; tai < tps.length; tai++) tps[tai].align = a.align;
+          this._setViewField('text', tal);
+          changed = true;
+          break;
+        }
 
         case 'speed': bump('speed', a.delta, 0.1, 4, 1); break;
         case 'brightness': bump('exposure', a.delta, 0.05, 4, 1); break;
@@ -2960,6 +2989,8 @@
       self.backoff = 1000;
       self.lastError = '';
       self.lastEventAt = Date.now();
+      // A stream that just re-opened may have missed document frames while it was down.
+      self._resync();
     };
     es.onmessage = function (ev) {
       self.lastEventAt = Date.now();
@@ -3036,6 +3067,36 @@
     this.pushState();
   };
 
+  /**
+   * Repair a document frame that landed while the stream was down.
+   *
+   * State frames are `events.emit` (core/events.mjs): the hub's ring holds commands only, so a
+   * frame missed during a gap is lost for good. The hub closes every stream at SSE_MAX_MS too, so
+   * a gap is guaranteed every five minutes and the next change is not a reliable repair. On open,
+   * re-read the document in place and apply it when its revision moved. The first open is skipped
+   * because boot's own read is in flight. In place, always: the OBS source is never reloaded — a
+   * reload blanks the wall.
+   */
+  AgentClient.prototype._resync = function () {
+    var self = this;
+    var page = this.inst;
+    if (!page || typeof page.reapplyServerLook !== 'function') return;
+    // The first open is boot's own read, already in flight. Every open after it is a reconnect:
+    // the stream was down, and anything published meanwhile was never queued for this page.
+    if (!this._opened) { this._opened = true; return; }
+    if (this._resyncing) return;
+    this._resyncing = true;
+    var seen = typeof page.docRev === 'number' ? page.docRev : this.lastRev;
+    Promise.resolve(page.reapplyServerLook(seen)).then(function () {
+      self._resyncing = false;
+      self.pushState();
+    }, function (err) {
+      // Not fatal: the page keeps its last look and the next open tries again.
+      self._resyncing = false;
+      self.lastError = 'resync: ' + (err && err.message ? err.message : String(err));
+    });
+  };
+
   AgentClient.prototype._scheduleRetry = function (why) {
     var self = this;
     if (this.closed || this.retryTimer) return;
@@ -3051,7 +3112,21 @@
   AgentClient.prototype.pushState = function () {
     if (this.closed) return;
     var body;
-    try { body = JSON.stringify({ view: this.inst.view, state: this.inst.state() }); }
+    try {
+      // The state post is the only channel a refusal has back to the operator: the command
+      // itself was answered by the server before any page saw it, so `lastCmd` (what this page
+      // did with the frame) rides along and the pane can show an `ignored:` note.
+      var st = this.inst.state();
+      if (this.lastCmd) {
+        st.lastCmd = {
+          seq: this.seq,
+          cmd: this.lastCmd.cmd,
+          ok: !!(this.lastCmd.res && this.lastCmd.res.ok),
+          note: (this.lastCmd.res && this.lastCmd.res.note) || null,
+        };
+      }
+      body = JSON.stringify({ view: this.inst.view, state: st });
+    }
     catch (e) {
       // Swallowing this was a silent heartbeat killer: `state()` throws once
       // (bad paras, a throw inside a provider) and every later beat dies with
