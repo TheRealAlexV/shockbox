@@ -66,7 +66,7 @@
       "default": "off",
       "values": ["off", "raw", "effects"],
       "label": "Publish a second camera: off | raw | effects",
-      "help": "Feeds the 'ShockBox Virtual Camera' slot in WebcamSwitcher. raw sends the camera picture, effects sends the camera with the effects burned in; both are written to the frame pipe at the size format.ini advertises (1280x720 NV12 by default) and only while the overlay page is open. off opens no pipe and converts nothing, which leaves that camera slot black.",
+      "help": "Feeds the 'ShockBox Virtual Camera' slot in ShutterBox. raw sends the camera picture, effects sends the camera with the effects burned in; both are written to the frame pipe at the size format.ini advertises (1280x720 NV12 by default) and only while the overlay page is open. off opens no pipe and converts nothing, which leaves that camera slot black.",
       "group": "general"
     },
     "cameraRelay": {
@@ -79,10 +79,10 @@
     },
     "cameraRelaySource": {
       "type": "string",
-      "default": "WebcamSwitcher Virtual Camera (Windows Virtual Camera)",
+      "default": "ShutterBox Virtual Camera (Windows Virtual Camera)",
       "maxLength": 200,
       "label": "Camera relay source (ffmpeg dshow device name)",
-      "help": "The DirectShow friendly name ffmpeg opens, exactly as dshow lists it. Used only by the dshow capture path; the pipe path reads WebcamSwitcher's frame pipe instead.",
+      "help": "The DirectShow friendly name ffmpeg opens, exactly as dshow lists it. Used only by the dshow capture path; the pipe path reads ShutterBox's frame pipe instead.",
       "group": "general"
     },
     "cameraRelayCapture": {
@@ -90,7 +90,7 @@
       "default": "auto",
       "values": ["auto", "pipe", "dshow"],
       "label": "Camera relay capture: auto | pipe | dshow",
-      "help": "auto reads WebcamSwitcher's frame pipe first and falls back to the dshow device only after a pipe attempt fails, recording both the mode in use and why the pipe was abandoned on /api/handfx/status. pipe and dshow force one path. The pipe path is the one that works when the Media Foundation virtual device delivers no packets.",
+      "help": "auto reads ShutterBox's frame pipe first and falls back to the dshow device only after a pipe attempt fails, recording both the mode in use and why the pipe was abandoned on /api/handfx/status. pipe and dshow force one path. The pipe path is the one that works when the Media Foundation virtual device delivers no packets.",
       "group": "general"
     },
     "cameraRelayFps": {

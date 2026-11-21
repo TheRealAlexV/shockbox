@@ -181,9 +181,16 @@ output over multipart. There are two input paths, chosen by the `cameraRelayCapt
 | `pipe` | use the pipe only; a failure is an error and is retried with the same 1 s → 10 s backoff |
 | `dshow` | use `ffmpeg -f dshow -i video="<cameraRelaySource>"` only (the original path) |
 
-Pipe mode reads `\\.\pipe\WebcamSwitcher.Frames.v1` (per-device variants add `.p<slot>`), the
-publisher documented in WebcamSwitcher's `WebcamSwitcherProtocol.h`. `#pragma pack(1)`, little-endian,
+Pipe mode reads `\\.\pipe\ShutterBox.Frames.v1` (per-device variants add `.p<slot>`), the
+publisher documented in ShutterBox's `ShutterBoxProtocol.h`. `#pragma pack(1)`, little-endian,
 no subscribe handshake: connect and the server pushes a config message, then frames.
+
+The same pipe runs in the other direction, and this is the integration that was never written down:
+`publish: raw|effects` makes ShockBox a **server** on `\\.\pipe\ShutterBox.Frames.v1.shockbox` (the
+per-consumer variant), so a ShutterBox passthrough slot named `ShockBox Virtual Camera` shows the
+ShockBox picture with no virtual-camera device in the path. ShockBox advertises the geometry it reads
+from `C:\ProgramData\ShutterBox\format.ini` and then writes NV12 frames; the slot stays black when
+`publish` is `off` or the overlay page is closed.
 
 | message | payload |
 |---|---|

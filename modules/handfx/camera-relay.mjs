@@ -1,16 +1,16 @@
 // ShockFX camera relay — ffmpeg is the page's camera.
 //
-// Why this exists: on the streaming rig every physical camera is held by WebcamSwitcher, and a
+// Why this exists: on the streaming rig every physical camera is held by ShutterBox, and a
 // browser cannot name a virtual device until a permission grant succeeds, so the overlay page can
 // never open a camera itself. ffmpeg reads the camera and this relay pushes the JPEG frames to the
 // page over one multipart response.
 //
 // Two capture paths, and the rig decides which one works:
-//   pipe   read WebcamSwitcher's own frame pipe (`\\.\pipe\WebcamSwitcher.Frames.v1`, the publisher
-//          documented in WebcamSwitcherProtocol.h) and feed its NV12 payloads to ffmpeg's stdin.
+//   pipe   read ShutterBox's own frame pipe (`\\.\pipe\ShutterBox.Frames.v1`, the publisher
+//          documented in ShutterBoxProtocol.h) and feed its NV12 payloads to ffmpeg's stdin.
 //          The app has a client list and no singleton, so this is a legitimate second reader. It
 //          is the path that works when the Media Foundation virtual device delivers zero packets.
-//   dshow  `ffmpeg -f dshow -i video="WebcamSwitcher Virtual Camera"` (the original path).
+//   dshow  `ffmpeg -f dshow -i video="ShutterBox Virtual Camera"` (the original path).
 // `cameraRelayCapture` picks: `auto` tries pipe first and falls back to dshow only after a pipe
 // attempt fails, recording both the mode actually in use and why the pipe was abandoned; `pipe`
 // and `dshow` force one. Never a silent switch: /status carries `capture.mode` and
@@ -78,12 +78,12 @@ const MAX_BACKOFF = 10000;
 const SIZES = ['640x360', '960x540', '1280x720'];
 
 /**
- * WebcamSwitcher's frame publisher (src/WebcamSwitcher.Shared/WebcamSwitcherProtocol.h, mirrored by
+ * ShutterBox's frame publisher (src/ShutterBox.Shared/ShutterBoxProtocol.h, mirrored by
  * publish-pipe.mjs, which writes this same wire format in the other direction). `#pragma pack(1)`,
  * little-endian: a 12-byte header then the payload. No subscribe handshake — connect and the server
  * pushes config, then frames. Frames are never queued for a slow reader; it is dropped instead.
  */
-export const DEFAULT_PIPE = '\\\\.\\pipe\\WebcamSwitcher.Frames.v1';
+export const DEFAULT_PIPE = '\\\\.\\pipe\\ShutterBox.Frames.v1';
 const WS_MAGIC = 0x57564353;
 const WS_VERSION = 1;
 const WS_TYPE_CONFIG = 1;
@@ -116,7 +116,7 @@ export function normalizeConfig(raw) {
     enabled: c.enabled !== false,
     // The exact DirectShow friendly name: dshow rejects the short form with "Could not find
     // video device", so the fallback must be the same string the setting ships.
-    source: String(c.source || 'WebcamSwitcher Virtual Camera (Windows Virtual Camera)'),
+    source: String(c.source || 'ShutterBox Virtual Camera (Windows Virtual Camera)'),
     fps: Number.isFinite(fps) ? Math.min(60, Math.max(1, fps)) : 30,
     size: SIZES.includes(c.size) ? c.size : '960x540',
     ffmpegPath: String(c.ffmpegPath || 'ffmpeg'),

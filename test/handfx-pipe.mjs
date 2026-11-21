@@ -1,6 +1,6 @@
 // The relay's pipe capture path, without the camera and without a browser.
 //
-// A fake WebcamSwitcher publisher writes the documented wire format (WebcamSwitcherProtocol.h) to a
+// A fake ShutterBox publisher writes the documented wire format (ShutterBoxProtocol.h) to a
 // local socket/pipe and the real relay reads it, so this proves the whole path end to end with real
 // ffmpeg:
 //   · config then N NV12 frames → capture.mode is `pipe`, the negotiated geometry is reported and

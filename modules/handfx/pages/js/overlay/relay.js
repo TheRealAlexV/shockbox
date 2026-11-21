@@ -1,8 +1,8 @@
 // The overlay's camera, relayed.
 //
-// On the rig every physical camera is held by WebcamSwitcher, and Chromium hands out no usable
+// On the rig every physical camera is held by ShutterBox, and Chromium hands out no usable
 // `deviceId` before a successful grant, so `getUserMedia` on this page always fails with
-// NotReadableError. The server therefore runs ffmpeg on the `WebcamSwitcher Virtual Camera` and
+// NotReadableError. The server therefore runs ffmpeg on the `ShutterBox Virtual Camera` and
 // serves the result as multipart MJPEG; the page reads that stream instead of fighting for the
 // device.
 //

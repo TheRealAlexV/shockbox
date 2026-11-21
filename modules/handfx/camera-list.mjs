@@ -1,7 +1,7 @@
 // DirectShow camera inventory: what ffmpeg can open on this machine.
 //
 // SIDE EFFECT, and the reason this file is shaped the way it is: enumerating DirectShow launches the
-// virtual-camera client DLLs (WebcamSwitcher, OBS, …) so they register their device. That is real
+// virtual-camera client DLLs (ShutterBox, OBS, …) so they register their device. That is real
 // work in other people's processes, so enumeration NEVER runs on a timer and NEVER runs from a
 // status poll. It happens only when an explicit call asks for it, and the answer is then cached for
 // 30 s so a UI that re-renders does not re-trigger it. `list()` is the only entry point that can
@@ -9,7 +9,7 @@
 //
 // The listing is ffmpeg stderr prose, not structured output (the `[in#0 @ ...]` tag is this build's;
 // older builds print `[dshow @ ...]`, so the parser accepts any bracketed tag):
-//   [in#0 @ 000001...] "WebcamSwitcher Virtual Camera (Windows Virtual Camera)" (video)
+//   [in#0 @ 000001...] "ShutterBox Virtual Camera (Windows Virtual Camera)" (video)
 //   [in#0 @ 000001...]   Alternative name "@device_sw_vid_..."
 //   [in#0 @ 000001...] "Streamfog VirtualCam" (none)
 // Only `(video)` entries can be opened by `-f dshow -i video="…"`; every other marked entry is
@@ -86,7 +86,7 @@ function isVirtual(name) {
 
 /**
  * Turn ffmpeg's stderr into `{ devices, nonVideo }`. `devices` is virtual-first, then physical;
- * first occurrence of an exact friendly name wins so `X (WebcamSwitcher)` and a raw `X` both
+ * first occurrence of an exact friendly name wins so `X (ShutterBox)` and a raw `X` both
  * survive as distinct entries.
  */
 export function parseListing(text) {

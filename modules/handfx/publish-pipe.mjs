@@ -1,9 +1,9 @@
-// ShockBox serves the WebcamSwitcher frame pipe — the "ShockBox Virtual Camera" slot.
+// ShockBox serves the ShutterBox frame pipe — the "ShockBox Virtual Camera" slot.
 //
-// Protocol, from src/WebcamSwitcher.Shared/WebcamSwitcherProtocol.h (the C# mirror is
-// WebcamSwitcherProtocol.cs; the reader is src/WebcamSwitcher.Source/PipeFrameClient.cpp):
+// Protocol, from src/ShutterBox.Shared/ShutterBoxProtocol.h (the C# mirror is
+// ShutterBoxProtocol.cs; the reader is src/ShutterBox.Source/PipeFrameClient.cpp):
 //
-//   pipe     \\.\pipe\WebcamSwitcher.Frames.v1.shockbox   — we listen, the Frame Server connects
+//   pipe     \\.\pipe\ShutterBox.Frames.v1.shockbox   — we listen, the Frame Server connects
 //   stream   [WsMsgHeader][payload], both little-endian, header 12 bytes:
 //              magic 'WCVS' (0x57564353) | version 1 | type | payloadLen
 //   type 1   Config, 24-byte payload: width height stride format fpsNum fpsDen (format 1 = NV12)
@@ -16,7 +16,7 @@
 // NEVER scales or converts: MediaStream copies min(payload, sampleSize) bytes straight into an
 // NV12 sample and fills the rest with black, so a frame of the wrong size shows up as a picture
 // in the corner of a black sample. The sample size is fixed by the media type the source
-// advertises, which comes from C:\ProgramData\WebcamSwitcher\format.ini — so this file reads that
+// advertises, which comes from C:\ProgramData\ShutterBox\format.ini — so this file reads that
 // same file and refuses frames that do not match it.
 //
 // Cadence: the client keeps the newest frame and its media stream pulls at its own 30 fps, so a
@@ -32,8 +32,8 @@ import { nv12Into } from './pages/js/nv12.js';
 
 export { nv12Into };
 
-export const PIPE_NAME = '\\\\.\\pipe\\WebcamSwitcher.Frames.v1.shockbox';
-export const FORMAT_INI = 'C:\\ProgramData\\WebcamSwitcher\\format.ini';
+export const PIPE_NAME = '\\\\.\\pipe\\ShutterBox.Frames.v1.shockbox';
+export const FORMAT_INI = 'C:\\ProgramData\\ShutterBox\\format.ini';
 
 const MAGIC = 0x57564353;
 const VERSION = 1;

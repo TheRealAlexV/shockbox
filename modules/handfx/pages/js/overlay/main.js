@@ -198,8 +198,8 @@ const tracker = new Tracker({
   // recovered from a deploy-time 500 is otherwise indistinguishable from one that never failed.
   log: (msg) => reportRelayEvent('model', msg),
 });
-// The relayed camera: the server's ffmpeg feed of the WebcamSwitcher virtual camera. The page
-// cannot open that device itself (WebcamSwitcher holds it), so it reads the MJPEG stream instead
+// The relayed camera: the server's ffmpeg feed of the ShutterBox virtual camera. The page
+// cannot open that device itself (ShutterBox holds it), so it reads the MJPEG stream instead
 // and feeds each decoded frame to the tracker's own detect path.
 const relayEventQueue = [];
 let relayEventTimer = 0;
@@ -1113,7 +1113,7 @@ async function autoCamera() {
 
 /**
  * The relayed camera, tried before the device: the one camera on this machine belongs to
- * WebcamSwitcher, and getUserMedia here only ever fails. `true` means either relay frames are
+ * ShutterBox, and getUserMedia here only ever fails. `true` means either relay frames are
  * tracking, or the relay is up and its failure is the model's — a device attempt cannot help
  * with either, so the caller must not make one.
  */
