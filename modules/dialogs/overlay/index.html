@@ -13,9 +13,9 @@
   </head>
   <body>
     <div id="desk">
-      <div id="stage">
-        <div class="stage-scrim" aria-hidden="true"></div>
-      </div>
+      <!-- No full-bleed layer lives here: the page is transparent by construction, so OBS
+           composites only the alerts. Each skin's .dialog carries its own shadow. -->
+      <div id="stage"></div>
     </div>
     <script type="module" src="/dialogs/app.js"></script>
   </body>

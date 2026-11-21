@@ -26,6 +26,8 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
   let backoff = 500;
   let wantOpen = false;
   let lastScene = null;
+  // Deadline for one connect attempt: Hello then Identified, or the attempt is over.
+  let handshakeTimer = null;
   // Diagnostics the pane and /api/core/obs report: 'connecting' forever is not a verdict.
   let lastError = null;
   let lastErrorAt = null;
@@ -61,6 +63,38 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
       return;
     }
     ws = sock;
+    // Node's WebSocket gives no 'close' after a failed handshake: a refused port fires only
+    // 'error', and a peer that accepts TCP but never answers fires nothing at all. With no
+    // teardown, `ws` stayed set and `state` stayed 'connecting' for the life of the process,
+    // and connect()'s own guard then returned early on every retry — a permanent, silent
+    // "connecting". One idempotent teardown per socket makes every failure path end in
+    // 'closed' plus a retry, and `lastError` records why.
+    let settled = false;
+    const teardown = (reason) => {
+      if (settled) return;
+      settled = true;
+      if (handshakeTimer) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
+      const wasReady = identified;
+      if (!wasReady) noteError(reason);
+      identified = false;
+      state = 'closed';
+      if (ws === sock) ws = null;
+      try {
+        sock.close();
+      } catch {
+        /* already gone */
+      }
+      for (const [, p] of pending) p.reject(new Error('obs connection closed'));
+      pending.clear();
+      log.warn(`obs ${reason}`);
+      if (wantOpen) scheduleReconnect();
+    };
+    // A socket that opens but never speaks Hello must not sit here forever either.
+    handshakeTimer = setTimeout(() => teardown('no Hello/Identified within 10s'), 10_000);
+    handshakeTimer.unref?.();
     sock.addEventListener('open', () => {
       /* wait for Hello */
     });
@@ -77,17 +111,11 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
       const wasReady = identified;
       // Close before Identify means the server refused us (bad password) or never spoke; after
       // Identify it is a dropped link. Neither is visible from the outside without this.
-      if (!wasReady) noteError(`closed before identify (code ${ev?.code ?? '?'})`);
-      identified = false;
-      state = 'closed';
-      ws = null;
-      for (const [, p] of pending) p.reject(new Error('obs connection closed'));
-      pending.clear();
-      if (wasReady) log.warn('obs connection closed');
-      if (wantOpen) scheduleReconnect();
+      teardown(wasReady ? 'connection closed' : `closed before identify (code ${ev?.code ?? '?'})`);
     });
     sock.addEventListener('error', () => {
-      /* close follows */
+      // A failed handshake reports here and never fires 'close' — this is the only signal.
+      teardown(`socket error (code ${sock.readyState === 0 ? 'handshake refused' : 'connection'})`);
     });
   }
 
@@ -119,7 +147,12 @@ export function createObsClient({ url = 'ws://127.0.0.1:4455', password = '', lo
         state = 'ready';
         backoff = 500;
         lastError = null;
+        lastErrorAt = null;
         attempts = 0;
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
         log.info(`obs identified (rpcVersion ${msg.d?.negotiatedRpcVersion})`);
         for (const fn of subs) {
           try {

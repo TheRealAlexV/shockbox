@@ -906,12 +906,24 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     if (!wantsProducer()) scheduleStop();
   }
 
+  /**
+   * The stop check must land *after* the client grace, never inside it: armed at `STOP_AFTER_MS`
+   * (5 s) behind a 10 s grace, the one shot fired while `wantsProducer()` was still true, declined
+   * to stop, and never rescheduled — so the producer encoded on with no reader for good.
+   */
   function scheduleStop() {
     clearStop();
+    const delay = Math.max(STOP_AFTER_MS, CLIENT_GRACE_MS + 250);
     stopTimer = setTimeout(() => {
       stopTimer = null;
-      if (!wantsProducer()) stopChild();
-    }, STOP_AFTER_MS);
+      if (!wantsProducer()) {
+        stopChild();
+        return;
+      }
+      // Re-arm only while the demand can still lapse: nothing attached, keep-warm off, a client
+      // having left. A live reader or keep-warm is "run forever" and must not leave a poll behind.
+      if (!clients.size && !cfg.keepWarm && lastClientAt > 0) scheduleStop();
+    }, delay);
     stopTimer.unref?.();
   }
 
@@ -927,6 +939,9 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
         /* already gone */
       }
     }
+    // Same arming as removeClient: these rows are gone without a `close` of their own, so a
+    // producer can be left holding nothing and, without this, no timer either.
+    if (!wantsProducer()) scheduleStop();
   }
 
   function stopChild() {
