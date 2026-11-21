@@ -123,17 +123,31 @@ def _atomic_write_text(path: Path, text: str) -> str | None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
-            # No fsync: readers are protected by the atomic replace below, not by durability
-            # across a power cut (a runtime dir is rebuilt on the next start anyway), and the
-            # fsync of a 700-byte heartbeat was 3.6 ms/s of the idle supervisor on the rig.
+            # fsync before the rename publishes the name, so os.replace can only ever expose
+            # bytes that are already on the disk. The rig lost power on 2026-11-18 and came back
+            # to a status.json of exactly the healthy length, all 0x00: NTFS had journaled the
+            # rename and the size, never the data pages. Only this file pays the fsync.
+            fh.flush()
+            os.fsync(fh.fileno())
         try:
             _replace_with_retry(tmp, path)
             return None
         except OSError as err:
             # In place is safe exactly where the rename is not: Python's readers grant
             # FILE_SHARE_WRITE (so a truncating write succeeds) but not FILE_SHARE_DELETE.
-            with open(path, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
+            # r+b and truncate last: the bytes are durable before the file is shortened, so a
+            # cut leaves the old bytes with a longer tail, never a zeroed file.
+            try:
+                fh = open(path, "r+b")
+            except FileNotFoundError:
+                fh = open(path, "wb")
+            data = text.encode("utf-8")
+            with fh:
+                fh.seek(0)
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+                fh.truncate(len(data))
             return f"replace {path.name} failed after {REPLACE_ATTEMPTS} attempts ({err}); wrote in place"
     finally:
         try:

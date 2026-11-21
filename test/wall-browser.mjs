@@ -454,15 +454,21 @@ async function main() {
     ok('preset.set accepts the saved name', appliedByName && appliedByName.ok === true, JSON.stringify(appliedByName));
     const backToSaved = await waitFor(c, 'window.LEDWALL_INSTANCE.s.palette !== "lava"', 4000);
     ok('applying the saved preset restores its palette', Boolean(backToSaved), String(await evaluate(c, 'window.LEDWALL_INSTANCE.s.palette')));
-    // `sign` was retired from the deck's preset cycle; a next/prev must land on a real preset.
+    // A next/prev must land on a real preset, not on a name the catalogue does not define
+    // (the deck cycles the catalogue, so a cycled label has to be in the bank the pane lists).
     const cyc = await fetch(`${srv.url}/api/wall/cmd`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ cmd: 'preset.next' }),
     }).then((r) => r.json());
     ok('preset.next answers', cyc && cyc.ok === true, JSON.stringify(cyc));
-    const maybeSign = await evaluate(c, 'window.LEDWALL_INSTANCE.label');
-    ok('preset.next never lands on the retired "sign"', maybeSign !== 'sign', `label=${maybeSign}`);
+    const landed = await evaluate(c, 'window.LEDWALL_INSTANCE.label');
+    const bank = await fetch(`${srv.url}/api/wall/render`)
+      .then((r) => r.json())
+      .then((j) => (j.settings && j.settings.presets && j.settings.presets.order) || [])
+      .catch(() => []);
+    ok('preset.next lands on a preset in the bank',
+      bank.length > 0 && bank.indexOf(landed) >= 0, `label=${landed} order=${JSON.stringify(bank)}`);
 
     // 6. No page errors. The engine logs to console on a broken script.
     const errors = c.events

@@ -318,8 +318,25 @@ export function mountQuickSend(container, opts) {
         schedToggle.dataset.on = '';
         sendBtn.textContent = 'Send now';
       } else {
-        await opts.onSend(body2);
-        toast(`${opts.title.toLowerCase()} sent`, 'ok');
+        const res = await opts.onSend(body2);
+        // The answer is in hand, so the toast reports it instead of assuming it: a refusal
+        // (ok:false), a send held back by auto-apply, and a send no render page was listening
+        // for are three different outcomes and none of them is "sent".
+        const said = res && typeof res === 'object' ? res : null;
+        const label = opts.title.toLowerCase();
+        if (said && said.ok === false) {
+          toast(`${label}: ${said.note || 'refused'}`, 'error');
+          return;
+        }
+        if (said && said.queued) {
+          toast(`${label} queued — press Apply to send it`, 'ok');
+          return;
+        }
+        if (said && said.delivered === 0 && said.seq !== undefined) {
+          toast(`${label}: no render page connected — nothing is on the wall`, 'warn');
+          return;
+        }
+        toast(`${label} sent`, 'ok');
       }
       if (keepBox.checked && body2.text && opts.onSave) {
         try {

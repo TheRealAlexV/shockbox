@@ -511,8 +511,13 @@ class ShockBoxApp(App):
         obs_state = str(obs.get("state") or "unknown")
         tone = "green" if obs_state in ("connected", "ok", "ready", "running") else "red"
         scene = obs.get("scene") or "—"
+        # A bare state word cannot tell a slow start from a refusal; carry the client's reason.
+        obs_why = obs.get("lastError")
+        obs_line = f"OBS [{tone}]{obs_state}[/] · scene {scene}"
+        if obs_why and obs_state not in ("connected", "ok", "ready", "running"):
+            obs_line += f"\n[red]{_short(obs_why, 70)}[/]"
         health_mods = ", ".join(f"{k}:{v}" for k, v in list(modules.items())[:6]) or "—"
-        self._set_text("#overview-obs", f"OBS [{tone}]{obs_state}[/] · scene {scene}\n[dim]{health_mods}[/dim]")
+        self._set_text("#overview-obs", f"{obs_line}\n[dim]{health_mods}[/dim]")
 
         table = self.query_one("#modules-table", DataTable)
         rows = data.get("modules")

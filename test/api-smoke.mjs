@@ -186,8 +186,18 @@ for (const p of ['/dialogs', '/notify']) {
   const text = await r.text();
   ok(r.status === 200 && /<script[^>]+type="module"/.test(text), `page ${p} serves a module page`);
 }
-const overlayJs = await fetch(base + '/mod/dialogs/overlay/app.js');
-ok(overlayJs.status === 200 && /EventSource/.test(await overlayJs.text()), 'overlay module assets are served from the module dir');
+// The served bytes must be the module's real app, not a placeholder or a copy left behind by an
+// older build. The marker is the shared live-poll import *and* its call: both overlays were
+// rewritten off a held EventSource onto `/src/live-poll.js`, so this fails if the file is a stale
+// pre-rewrite copy and also if the import is ever dropped while the call remains.
+for (const mod of ['dialogs', 'notifications']) {
+  const r = await fetch(base + `/mod/${mod}/overlay/app.js`);
+  const text = await r.text();
+  ok(r.status === 200
+    && /from\s+['"]\/src\/live-poll\.js['"]/.test(text)
+    && /createLivePoll\s*\(/.test(text),
+    `${mod} overlay is served from the module dir and imports createLivePoll from the shared live-poll`);
+}
 
 // A page that names an asset relative to itself while it is served at a module prefix
 // (`href="style.css"` at /shockfx → /style.css → 404) fails silently: the document is 200, only the

@@ -139,6 +139,8 @@ function publisher(name, { count = 30, split = false, flags = 0, intervalMs = 33
       conns.clear();
       return new Promise((resolve) => server.close(() => resolve()));
     },
+    /** Live connections: 0 means the relay tore the pipe socket down. */
+    live: () => conns.size,
   };
 }
 
@@ -396,6 +398,53 @@ async function main() {
     );
     check('auto: default capture setting is auto', normalizeConfig({}).capture === 'auto');
     relay.dispose();
+  }
+
+  // ── 7. the last client leaving stops the producer once the grace expires ─────────────────────
+  {
+    const name = pipeName('stop');
+    // Frames keep flowing for the whole wait, so a stopped producer cannot be mistaken for a
+    // stalled one: 400 frames at 30 fps covers the child's own 10 s client grace.
+    const pub = publisher(name, { count: 400 });
+    await pub.listen();
+    const relay = relayFor(name, {
+      read: () => ({ enabled: true, size: '320x180', fps: 30, capture: 'pipe', keepWarm: false }),
+    });
+    const res = sink();
+    relay.addClient(res);
+    const live = await waitFor(
+      () => {
+        const s = relay.status();
+        return s.capture.mode === 'pipe' && jpegParts(res.collected()) >= 3 ? s : null;
+      },
+      10000,
+      'pipe producer live for the stop case',
+    ).catch(() => null);
+    check('stop: producer is live behind one client', Boolean(live), live ? '' : 'no pipe frames');
+    res.destroy();
+    // The stop check is armed after the client grace, so it lands at ~10.25 s, not at 5 s.
+    const stopped = await waitFor(
+      () => {
+        const s = relay.status();
+        return s.capture.mode === null && s.state === 'idle' ? s : null;
+      },
+      12500,
+      'producer stopped after the client grace',
+    ).catch(() => null);
+    const after = relay.status();
+    check(
+      `stop: producer stopped after the last client left (mode ${String(after.capture.mode)}, state ${after.state})`,
+      Boolean(stopped),
+    );
+    check(`stop: the pipe socket is gone (${pub.live()} live)`, pub.live() === 0, `${pub.live()} live`);
+    const framesAtStop = after.capture.inputFrames;
+    await sleep(1000);
+    check(
+      `stop: no frames keep arriving (${framesAtStop} → ${relay.status().capture.inputFrames})`,
+      relay.status().capture.inputFrames === framesAtStop,
+    );
+    relay.dispose();
+    await pub.stop();
   }
 
   console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
