@@ -901,9 +901,10 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
   function removeClient(client) {
     if (!clients.delete(client)) return;
     lastClientAt = Date.now();
-    // Keep-warm means the camera does not depend on a page being connected; a page's demand does
-    // the same for as long as its heartbeat keeps asking.
-    if (!wantsProducer()) scheduleStop();
+    // Arm it even though the grace still covers this departure — that is the point: the check is
+    // what waits the grace out. Gating on `wantsProducer()` here armed nothing at all, because the
+    // `lastClientAt` set above makes it true for the whole window.
+    if (!clients.size) scheduleStop();
   }
 
   /**
@@ -941,7 +942,7 @@ export function createCameraRelay({ read = () => ({}), spawn = spawnProcess, log
     }
     // Same arming as removeClient: these rows are gone without a `close` of their own, so a
     // producer can be left holding nothing and, without this, no timer either.
-    if (!wantsProducer()) scheduleStop();
+    if (!clients.size) scheduleStop();
   }
 
   function stopChild() {
