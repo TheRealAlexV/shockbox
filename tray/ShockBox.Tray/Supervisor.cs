@@ -22,7 +22,11 @@ internal static class AppPaths
 
     public static string RuntimeDir { get; } = ResolveRuntimeDir();
 
-    public static string PythonExe => Path.Combine(AppDir, ".tui-venv", "Scripts", "python.exe");
+    // pythonw.exe, not python.exe: the supervisor must never own a console. python.exe is a
+    // console-subsystem image, and on Windows 11 the console it allocates is hosted by Windows
+    // Terminal as a visible tab titled with this path — SW_HIDE does not suppress that. pythonw
+    // is the GUI-subsystem twin the venv already ships, so no console is created at all.
+    public static string PythonExe => Path.Combine(AppDir, ".tui-venv", "Scripts", "pythonw.exe");
 
     public static string StatusFile => Path.Combine(RuntimeDir, "status.json");
 

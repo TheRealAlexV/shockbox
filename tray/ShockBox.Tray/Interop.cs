@@ -13,8 +13,10 @@ internal static class Interop
     internal const uint ProcessQueryLimitedInformation = 0x1000;
     internal const int ErrorAccessDenied = 5;
 
-    // subprocess.DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, and CREATE_NO_WINDOW only when
-    // SHOCKBOX_TUI_WINDOWED is set — the same three flags control.py:_detach_flags uses.
+    // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP. DETACHED_PROCESS is deliberately absent:
+    // Windows ignores CREATE_NO_WINDOW when it is combined with DETACHED_PROCESS — that is how a
+    // console got created and then merely hidden by SW_HIDE. Belt to the pythonw.exe braces in
+    // AppPaths.PythonExe: this flag, not the startup show state, is what stops a console existing.
     internal const uint DetachedProcess = 0x00000008;
     internal const uint CreateNewProcessGroup = 0x00000200;
     internal const uint CreateNoWindow = 0x08000000;
@@ -93,12 +95,8 @@ internal static class Interop
 
     internal static uint CreationFlags()
     {
-        uint flags = DetachedProcess | CreateNewProcessGroup;
-        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SHOCKBOX_TUI_WINDOWED")))
-        {
-            flags |= CreateNoWindow;
-        }
-        return flags;
+        // Unconditional: the supervisor must never own a console, whatever the environment says.
+        return CreateNewProcessGroup | CreateNoWindow;
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]

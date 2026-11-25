@@ -45,8 +45,10 @@ the existing window, not a second icon (`Program.cs:12-15`, `278-295`).
    Adoption is the normal path: the supervisor outlives every UI that talks to it, and a
    supervisor left running by an earlier tray, or started as SYSTEM, is adopted like one this
    account spawned. Log line: `adopt: supervisor pid N alive, heartbeat X.Xs old`.
-2. **Spawn** otherwise, through `.tui-venv\Scripts\python.exe -m shockbox_tui.supervisor`,
-   detached, writing to `runtime\supervisor.log`. Log line: `spawn: supervisor pid N alive,
+2. **Spawn** otherwise, through `.tui-venv\Scripts\pythonw.exe -m shockbox_tui.supervisor`,
+   windowless, writing to `runtime\supervisor.log`. `pythonw.exe`, not `python.exe`, is the whole
+   point: a console-subsystem interpreter gets a console, and Windows Terminal shows it as a
+   visible tab titled with the interpreter path. Log line: `spawn: supervisor pid N alive,
    heartbeat fresh`.
 
 Proof of life is never the pid file alone: `IsAlive` requires a live pid **and** a fresh
