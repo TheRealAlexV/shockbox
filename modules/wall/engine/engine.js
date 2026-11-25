@@ -2714,7 +2714,6 @@
         // writer; it only reports that it accepted the press.
         case 'ratio.toggle':
         case 'ratio.force16x9':
-        case 'fence.toggle':
           changed = true;
           break;
 

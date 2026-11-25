@@ -26,7 +26,6 @@ const BARE = new Set([
   // is a no-op there rather than a way to sneak portrait into Theater.
   'ratio.toggle',
   'ratio.force16x9',
-  'fence.toggle',
   // a4: the three lookup selectors the pane and the deck drive. `preset.save` snapshots the
   // look on the wall right now into a named preset; it never reads or writes a text-mode pool
   // record. `look.palette` is the ramp only; `look.pattern` is the animation only.

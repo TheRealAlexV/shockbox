@@ -70,7 +70,6 @@ module ring and publishes `{seq, channel:'wall', cmd, args, view}`.
 | `pattern.set` | `{name}` (same pattern) | page sets the pattern |
 | `pattern.index` | `{delta}` xor `{set}` | page moves the pattern index |
 | `blackout.on` / `blackout.off` / `blackout.toggle` | — | page blanks the wall |
-| `fence.toggle` | — | page shows/hides the 9:16 fence |
 | `reload` | — | page reloads |
 | `text.send` | one of `{text}`, `{item}`, `{poolId}`, `{slot≥1}`; optional `{duration: 0..600}`, `{view: landscape\|portrait\|both}` | page shows text in its slots |
 | `text.clear` | — | page clears the text |
