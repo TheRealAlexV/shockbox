@@ -22,7 +22,7 @@ registry, Task Scheduler) it is marked **external** and the repo-side evidence f
 │                                  ▲                                     │
 │                          python shockbox_tui.supervisor                │
 │                                  ▲ cmd.json / status.json / heartbeat  │
-│                          python -m shockbox_tui (Textual)              │
+│                          ShockBox.Tray.exe (WinForms)                  │
 │                                                                        │
 ├──────────────────────────── same hardware ─────────────────────────────┤
 │  WSL (mirrored networking): loopback shared with Windows               │

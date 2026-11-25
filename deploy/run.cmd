@@ -2,15 +2,17 @@
 rem ===========================================================================
 rem  ShockBox launcher - MANUAL / LEGACY ONLY.
 rem
-rem  The supported way to run ShockBox is the TUI supervisor: start it from the
-rem  desktop shortcut "ShockBox" (deploy\ShockBox-TUI.cmd). Nothing starts
-rem  ShockBox at logon any more, and no scheduled task runs this file.
+rem  The supported way to run ShockBox is the tray app: start it from the desktop
+rem  shortcut "ShockBox" (ShockBox.Tray.exe), which adopts or spawns the python
+rem  supervisor. Nothing starts ShockBox at logon any more, and no scheduled task
+rem  runs this file.
 rem
 rem  This script used to be what the "\ShockBox-Server" scheduled task ran. It is
 rem  kept because install.ps1's stop logic and the old task XML reference it, and
-rem  because it is the way to run the server in a visible console when the TUI is
-rem  not installed. The supervisor applies the same log rotation rules but does
-rem  not go through this file.
+rem  because it is the way to run the server in a visible console when the tray app
+rem  is not installed. It must not launch the tray app: its own restart loop would
+rem  then fight the supervisor for the port. The supervisor applies the same log
+rem  rotation rules but does not go through this file.
 rem
 rem  This script owns the restart loop: node exits for any reason, cmd waits, and
 rem  node comes back. Run it from the app folder (C:\OBS\ShockBox):

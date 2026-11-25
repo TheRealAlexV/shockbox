@@ -13,10 +13,10 @@ ShockBox from the desktop shortcut` (`deploy/install.ps1:534`).
 
 | piece | what it is |
 |---|---|
-| `Desktop\ShockBox.lnk` | the entry point; created by the installer (`deploy/install.ps1:510-531`) |
-| `deploy\ShockBox-TUI.cmd` | runs `<app>\.tui-venv\Scripts\python.exe -m shockbox_tui` with the console in UTF-8 (`deploy/ShockBox-TUI.cmd:18`, `24`, `32`) |
-| `.tui-venv\` (app folder) | the TUI's virtualenv, provisioned by `install.ps1` (`deploy/install.ps1:344-384`) |
-| the supervisor (`python -m shockbox_tui.supervisor`) | starts node, restarts it, survives the TUI window (`docs/TUI.md`, `supervisor.py:1-40`) |
+| `Desktop\ShockBox.lnk` | the entry point; created by the installer (`deploy/install.ps1:883-904`) |
+| `ShockBox.Tray.exe` (app folder) | the tray app: icon, window, watchdog, and the adopt-or-spawn of the supervisor (`docs/TRAY.md`) |
+| `.tui-venv\` (app folder) | the supervisor's virtualenv, provisioned by `install.ps1` (`deploy/install.ps1:717-760`) |
+| the supervisor (`python -m shockbox_tui.supervisor`) | starts node, restarts it, survives the tray's window (`docs/TRAY.md`, `supervisor.py:1-40`) |
 | `node server.mjs` | all modules in one process (`server.mjs:189-194`) |
 | `deploy\run.cmd` | **manual / legacy only** — a visible console with its own restart loop (`deploy/run.cmd:3-17`) |
 
@@ -56,23 +56,24 @@ The server itself resolves every flag as **CLI > env > `config.json` > default**
 
 ```
 C:\OBS\ShockBox\                  the installed tree (copy of the repo, minus what §6 excludes)
-C:\OBS\ShockBox\.tui-venv\        the TUI's virtualenv
+C:\OBS\ShockBox\.tui-venv\        the supervisor's virtualenv
 C:\OBS\ShockBox\config.json       port, host, stateDir, logDir, soundsDir, obs{url,password,enabled}
 C:\OBS\ShockBox\state\            core/, wall/, notifications/, dialogs/, handfx/, pool.json
 C:\OBS\ShockBox\logs\             shockbox-YYYY-MM-DD.log (+ .1 to .3); launcher-*.log from run.cmd only
-%PROGRAMDATA%\ShockBox\runtime\    supervisor.lock, status.json, heartbeat, cmd.json, supervisor.pid, supervisor.log
+%PROGRAMDATA%\ShockBox\runtime\    supervisor.lock, status.json, heartbeat, cmd.json, supervisor.pid,
+                                  supervisor.log, tray.log
 ```
 
 The runtime dir is **per machine, not per account**. `%LOCALAPPDATA%` is per-account, and the
 supervisor is routinely owned by a different account from the one running the installer or the
-TUI on the rig (SYSTEM, session 0), so a command written there is never read. The app creates
+tray app on the rig (SYSTEM, session 0), so a command written there is never read. The app creates
 `%PROGRAMDATA%\ShockBox\runtime` with an ACL that lets both accounts write it; `install.ps1` and
 `uninstall.ps1` create the directory if it is missing and **leave an existing ACL alone**.
 
 State and logs live under the install tree: `Paths.logs_dir`/`state_dir` are
 `<app_dir>/logs` and `<app_dir>/state` (`paths.py:88-94`), and the runtime dir is the one thing
 kept outside, precisely so the installer's copy cannot rotate the lock away (`paths.py:11-13`).
-Every runtime file and field is documented in `docs/TUI.md` §3–§4.
+Every runtime file and field is documented in `docs/TRAY.md` §6–§7.
 
 The date in a log file name is the **local** day, from `localDay()` in `server.mjs`
 (`server.mjs:72-77`); `run.cmd` asks PowerShell for the same day rather than slicing `%date%`
@@ -87,12 +88,14 @@ so the two writers of one file agree (`tools/tui/shockbox_tui/logtail.py:1-17`,
 
 ## 4. Start and stop
 
-- **Start:** double-click **ShockBox** on the desktop. The TUI opens and — by default —
-  `app.main` calls `control.start()` before showing the window (`app.py:1290-1294`).
-- **Close the window:** node keeps running; the supervisor is detached (`docs/TUI.md` §1).
-- **Stop node only:** the TUI's Stop button, or F10 (`app.py:274-281`, `887-892`).
-- **Stop everything:** the TUI's **Shut down supervisor** button, behind a confirmation modal
-  (`app.py:918-927`) — see `docs/TUI.md` §2.
+- **Start:** double-click **ShockBox** on the desktop. The tray icon appears and adopts a running
+  supervisor or spawns one (`tray/ShockBox.Tray/Supervisor.cs:225-270`).
+- **Close the window:** node keeps running. The window is a WebView2 shell; closing it hides it,
+  and the supervisor is detached (`docs/TRAY.md` §1–§2).
+- **Stop node only:** the tray menu's **Stop**, or `ShockBox.Tray.exe --send stop`. The watchdog
+  deliberately keeps watching, so a crashed node comes back.
+- **Stop everything:** the tray menu's **Shut down…** (confirmed), or `--send shutdown` — see
+  `docs/TRAY.md` §3–§4.
 - **Take it down for good:** `deploy\uninstall.ps1` (`deploy/uninstall.ps1`, §10 below).
 
 ## 5. Restart policy
@@ -114,7 +117,7 @@ A crash loop is visible in `logs\shockbox-*.log` as `startup failed:` lines (wri
 ## 6. Install and upgrade
 
 Prerequisites: Node at `C:\Program Files\nodejs\node.exe` (a missing one is a warning, not a
-failure), and **Python 3.11+** for the TUI. No admin is needed to write the tree or register
+failure), and **Python 3.11+** for the supervisor. No admin is needed to write the tree or register
 anything — the installer registers no task.
 
 **One elevated action is needed when the running stack belongs to another account** (on the rig:
@@ -135,7 +138,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install.ps1 -WhatIf
 What `install.ps1` does, in order (line ranges in `deploy/install.ps1`):
 
 1. **Stop what it is about to replace — the app first, the process table only as a fallback:**
-   - the **TUI supervisor** is asked to shut down over its own control channel:
+   - the **supervisor** is asked to shut down over its own control channel:
      `install.ps1` writes `{"id":…,"action":"shutdown",…}` to
      `<ProgramData>\ShockBox\runtime\cmd.json` (the file `supervisor.py` polls every tick), then
      waits for the heartbeat counter to advance and the heartbeat to go stale (12 s) or the
@@ -156,18 +159,19 @@ What `install.ps1` does, in order (line ranges in `deploy/install.ps1`):
    (`256-283`). Exit codes 0–7 are success, ≥8 is a failure (`278`).
 4. **Migrate off the scheduled task**: end and unregister `\ShockBox-Server` if present; idempotent
    (`285-304`). `ErrorPopups-Server` and `LedWallAgent` are not touched (`289`).
-5. **Provision the TUI**: find `py -3` / `python3` / `python` at 3.11+ (`309-342`), create
-   `<target>\.tui-venv` if missing (`355-370`), then
-   `pip install --no-input --disable-pip-version-check -e <target>\tools\tui` (`375-381`). No
-   Python → a loud warning and the exact re-run command; the app itself still works (`349-352`).
+5. **Provision the supervisor**: find `py -3` / `python3` / `python` at 3.11+ (`681-715`), create
+   `<target>\.tui-venv` if missing (`717-760`), then
+   `pip install --no-input --disable-pip-version-check -e <target>\tools\tui` (`748-753`). No
+   Python → a loud warning and the exact re-run command; the app itself still works (`723-726`).
 6. **Icon**: copy `deploy\shockbox.ico` or the repo-root `shockbox.ico`, else generate a
-   deterministic 16/32/48/256 LED-grid `.ico` with System.Drawing (`386-505`).
-7. **Shortcut**: `Desktop\ShockBox.lnk` → `deploy\ShockBox-TUI.cmd`, working dir the app folder,
-   `WindowStyle = 7` (minimised) (`507-531`).
+   deterministic 16/32/48/256 LED-grid `.ico` with System.Drawing (`763-876`).
+7. **Shortcut**: `Desktop\ShockBox.lnk` → `ShockBox.Tray.exe` in the app folder, description
+   `ShockBox - tray app`, `WindowStyle = 1` (normal), working dir the app folder (`883-904`). A
+   missing exe warns and creates no shortcut.
 
 **Upgrade from here (WSL/dev box):** `git pull` in the checkout, then run `install.ps1` on the
 host. The copy *is* the upgrade — no build step, no `npm install`. The venv is reused; the editable
-install picks up new `tools\tui` code (`375-381`).
+install picks up new `tools\tui` code (`748-753`).
 
 Then start from the shortcut and check `http://127.0.0.1:8972/health` and `C:\OBS\ShockBox\logs\`.
 
@@ -203,8 +207,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install.ps1
 ```
 
 The install stops the running supervisor and server (step 1) before copying, so a rollback starts
-from a clean process state. A checkout from before the TUI has no `tools\tui`: the installer warns
-and leaves the venv empty (`372-374`), and `run.cmd` is the way to run that version.
+from a clean process state. A checkout without `tools\tui` has no supervisor: the installer warns
+and leaves the venv empty (`744-746`), and `run.cmd` is the way to run that version.
 
 State is not versioned by the install. If a bad version wrote a bad setting, fix it in
 `state\core\settings.json` or the module's own document — each is JSON, and `state\<module>\` is
@@ -250,15 +254,16 @@ at 8972 through a restart. This is the old page's procedure, unchanged
 | symptom | check |
 |---|---|
 | nothing on 8972 | is the supervisor running? `runtime\status.json` and `runtime\heartbeat` (fresh mtime), then `logs\shockbox-*.log` and `runtime\supervisor.log` |
-| the shortcut opens and closes at once | `.tui-venv` is missing — the window prints the pip commands and waits (`deploy/ShockBox-TUI.cmd:36-48`) |
+| the shortcut does nothing, or the tray icon never appears | `ShockBox.Tray.exe` is missing from the app folder — `install.ps1` warns and creates no shortcut. Watch `runtime\tray.log` for `adopt:` / `spawn:` / `watchdog:` lines |
+| tray icon is grey/dark and node never starts | `.tui-venv` is missing: `install.ps1` warned at step 5. Re-run it after installing Python 3.11+; `tray.log` records the spawn failure |
 | `EADDRINUSE` | something else owns 8972 — `Get-NetTCPConnection -LocalPort 8972 -State Listen`. `install.ps1` stops it only if it runs *this* `server.mjs`; if the port is still held it now **exits 1** and names the pid and owner, rather than warning and claiming success. The supervisor likewise refuses to adopt a stranger (`supervisor.py:712-719`) |
 | installer exits 1: `a process we cannot inspect holds the port; it was not stopped` | the stack belongs to another account (SYSTEM, session 0). Nothing was copied. From an **elevated** PowerShell: `taskkill /F /PID <pid>` (the pid is in the message), then re-run the installer. `taskkill` without elevation fails with "Access is denied" |
 | a WSL `node server.mjs` answers on 8972 | WSL shares loopback (see `docs/WIRING.md` §3). Compare `/health`'s `pid` with `Get-Process` on Windows |
 | two servers fighting | a leftover `\ShockBox-Server` task — `Get-ScheduledTask ShockBox-Server`; `install.ps1` removes it (`deploy/install.ps1:285-304`) |
 | pages load but no state | the `--state` path exists and is writable (`server.mjs:64`) |
-| tones silent | `C:\OBS\Sounds\SoundBoard` exists; the TUI's tone list shows what the server sees (`app.py:592-602`, `410-411`) |
+| tones silent | `C:\OBS\Sounds\SoundBoard` exists: that is `soundsDir`, the one list the server serves to the module page (`config.json`) |
 | server exits at once | run `deploy\run.cmd` in a console on the host: the same command line, visible (`deploy/run.cmd:74`) |
-| supervisor "stale" in the TUI | heartbeat older than 12 s (`control.py:41`, `224-225`); `runtime\supervisor.log` and the dated log hold the last words |
+| tray icon orange ("stale") | heartbeat older than 12 s (`Supervisor.cs:105-112`); `runtime\tray.log` names the last watchdog decision, `runtime\supervisor.log` and the dated log hold the last words |
 
 ## 11. Test-suite notes (2026-10-31)
 

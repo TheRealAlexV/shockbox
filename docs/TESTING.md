@@ -82,10 +82,12 @@ CHROME=/path/to/chrome npm test
 CHROME_PATH=/path/to/chrome node test/handfx-visual.mjs --strict
 ```
 
-## The TUI suite
+## The supervisor suite
 
-The TUI (`tools/tui/`, Python) has its own pytest suite; it is not part of `npm test` and needs
-no Chrome. Run it from `tools/tui/` with the project virtualenv:
+The supervisor (`tools/tui/`, Python) has its own pytest suite; it is not part of `npm test` and
+needs no Chrome. The Textual UI and its `test_app.py` / `test_watchdog.py` were retired with the
+tray app, so the suite is smaller than it was. Run it from `tools/tui/` with the project
+virtualenv:
 
 ```bash
 tools/tui/.venv/bin/python -m pytest -p no:randomly    # deterministic order
@@ -98,9 +100,11 @@ one of the two modes has an order-dependent bug (shared temp directory, a leaked
 mutated module global), and only one of the modes will show it. If the virtualenv does not exist,
 create it as `deploy\install.ps1` does: `python -m venv tools/tui/.venv && tools/tui/.venv/bin/python -m pip install --no-input -e tools/tui[dev]`.
 
-**Baseline (2026-10-31):** 52 tests, ~145 s, green in both modes. A run that is materially slower
-is usually a leaked `server.mjs` child: every test starts real subprocesses and
-`pyproject.toml:31` sets a 300 s per-test timeout so a hang fails the suite instead of hanging CI.
+**Baseline (2026-11-25, TUI retired):** 35 tests passing with
+`--ignore=tests/test_control.py`; `test_control.py` hangs in its `rig` fixture teardown and is a
+known pre-existing fault. A run that is materially slower is usually a leaked `server.mjs` child:
+every test starts real subprocesses and `pyproject.toml` sets a 300 s per-test timeout so a hang
+fails the suite instead of hanging CI.
 
 ## Quick checklist before a push
 

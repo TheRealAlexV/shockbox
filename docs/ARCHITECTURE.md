@@ -65,13 +65,15 @@ There is no other core knowledge of a module: no route greps, no per-module cond
 
 ### Who owns the process
 
-`server.mjs` is not started by hand on the rig. The owner is the **TUI supervisor**
-(`tools/tui/`, Python): the desktop shortcut runs `deploy\ShockBox-TUI.cmd`, which opens the TUI;
-the TUI starts `node server.mjs` detached, holds the port, restarts node with 2/4/8/16/30/60 s
-backoff, and keeps running after its window closes. A run that stays up `HEALTHY_S` (300 s) resets
-the sequence (`tools/tui/shockbox_tui/supervisor.py:62-65`). There is no autostart at logon — the
-old `ShockBox-Server` scheduled task was retired (`deploy/install.ps1:285-304`). Supervisor
-internals, settings and controls: [`docs/TUI.md`](TUI.md); install/start/stop: `deploy/README.md`.
+`server.mjs` is not started by hand on the rig. The owner is the **supervisor**
+(`tools/tui/`, Python): the desktop shortcut runs `ShockBox.Tray.exe`, which adopts a supervisor
+that is already running or spawns one detached; the supervisor starts `node server.mjs`, holds the
+port, restarts node with 2/4/8/16/30/60 s backoff, and keeps running after the tray's window
+closes. A run that stays up `HEALTHY_S` (300 s) resets the sequence
+(`tools/tui/shockbox_tui/supervisor.py:62-65`). The tray's 10 s watchdog respawns a supervisor that
+is absent or stale. There is no autostart at logon — the old `ShockBox-Server` scheduled task was
+retired (`deploy/install.ps1:285-304`). Tray internals, settings and controls:
+[`docs/TRAY.md`](TRAY.md); install/start/stop: `deploy/README.md`.
 
 ## 2. The registry contract
 

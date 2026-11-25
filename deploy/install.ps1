@@ -6,13 +6,15 @@
 .DESCRIPTION
   Idempotent: run it as often as you like. It stops what it replaces, copies the
   tree over the target (never deleting state or logs), removes the old
-  "\ShockBox-Server" scheduled task if it is still registered, provisions the TUI
+  "\ShockBox-Server" scheduled task if it is still registered, provisions the
   supervisor's virtualenv, and puts "ShockBox.lnk" on the desktop.
 
-  ShockBox is no longer started by a scheduled task or at logon. The TUI
-  supervisor (tools\tui) owns the server process: it starts it, restarts it and
-  stops it, and it keeps running after the TUI window is closed. The desktop
-  shortcut is the way in. There is deliberately no auto-start at logon.
+  ShockBox is no longer started by a scheduled task or at logon. The tray app
+  (tray\ShockBox.Tray, launched by the shortcut) adopts or spawns the python
+  supervisor (tools\tui) that owns the server process: it starts it, restarts it
+  and stops it, and the supervisor keeps running after the tray's window is
+  closed. The desktop shortcut is the way in. There is deliberately no
+  auto-start at logon.
 
   It does not touch any other task, any other folder, and no running process it
   did not start itself. The old ErrorPopups-Server and LedWallAgent tasks are
@@ -29,7 +31,7 @@
   provider-qualified form with exit 16.
 
 .PARAMETER PythonExe
-  Interpreter used to create the TUI virtualenv. Default: auto-detect py -3, then
+  Interpreter used to create the supervisor virtualenv. Default: auto-detect py -3, then
   python3/python, requiring 3.11 or newer.
 
 .PARAMETER WhatIf
@@ -117,7 +119,7 @@ Step 'ShockBox install'
 Note "source  $Source"
 Note "target  $Target"
 Note "node    $NodeExe"
-Note "mode    TUI supervisor, desktop shortcut, no scheduled task, no logon start"
+Note "mode    tray app, python supervisor, desktop shortcut, no scheduled task, no logon start"
 
 if (-not (Test-Path -LiteralPath $NodeExe)) {
     # Not fatal: run.cmd falls back to `node` on PATH. Say so rather than fail install.
@@ -127,11 +129,11 @@ if (-not (Test-Path -LiteralPath $NodeExe)) {
 # ---- 0. stop what this install is about to replace ---------------------------
 # A copy over a live tree does not affect the running node (it already read its
 # files), so the new code only takes effect after a restart. Restarting is the
-# TUI's job now, but a stop still belongs here, before the copy: the tree must
+# tray app's job now, but a stop still belongs here, before the copy: the tree must
 # not be rewritten under a live server.
 #
 # Four things can be running the old code, and each is found by evidence:
-#   1. the TUI supervisor, by its published state: a live `supervisor.pid` (or the
+#   1. the supervisor, by its published state: a live `supervisor.pid` (or the
 #      `supervisor_pid` in status.json) plus a heartbeat younger than 10s. It is asked to shut
 #      down FIRST, through `cmd.json` in the machine-wide runtime dir - the only channel it
 #      reads, and one that works when the stack belongs to another account (SYSTEM, session 0).
@@ -307,7 +309,7 @@ function Get-SupervisorState([string]$AppDir, $Table) {
     #      heartbeat after its writer is gone.
     # A command line that does not name this app dir is *not* evidence of absence - that is the
     # bug this replaces. A wrapper, a relaunch, `python -m`, a renamed exe and a venv path all
-    # miss it, and an install once printed "no TUI supervisor running" over a live supervisor.
+    # miss it, and an install once printed "no supervisor running" over a live supervisor.
     $runtime = Get-RuntimeDir
     $live = @{}
     # pid -> command line. A pid alone is not proof: pids are reused, and a stale
@@ -346,8 +348,8 @@ function Get-SupervisorState([string]$AppDir, $Table) {
         return @{ Alive = $true; Pid = [int]$c; Age = $age; Why = "published pid $c is alive and is a shockbox_tui process" }
     }
     if ($null -ne $age -and $age -le 10) {
-        # No pid on file but something is breathing. Find it: the supervisor, not the TUI that
-        # watches it (both import shockbox_tui). A Windows venv launcher runs python twice
+        # No pid on file but something is breathing. Find it by command line. A Windows venv
+        # launcher runs python twice
         # (stub -> real interpreter) and both match; the inner one holds the lock.
         $hits = @(foreach ($p in $Table) {
             if ($p.ProcessId -eq $PID -or -not $p.CommandLine) { continue }
@@ -416,7 +418,7 @@ $runtime = Get-RuntimeDir
 # is why the survey is out here instead of inside the guard.
 $table = Get-ProcessTable
 
-# 1. the TUI supervisor: ask, then insist. The evidence is its published state (live pid,
+# 1. the supervisor: ask, then insist. The evidence is its published state (live pid,
 #    fresh heartbeat); a command line is used only to reject a pid that was reused, never to
 #    require one - see Get-SupervisorState.
 $state = Get-SupervisorState $AppDir $table
@@ -424,12 +426,12 @@ $sup = @()
 if ($state.Alive -and $state.Pid -gt 0) { $sup += $state.Pid }
 if ($state.Alive) {
     if ($sup.Count -gt 0) {
-        Note ("TUI supervisor running as pid " + ($sup -join ', ') + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
+        Note ("supervisor running as pid " + ($sup -join ', ') + " (" + $state.Why + ", heartbeat $($state.Age)s old)")
     } else {
-        Note ("TUI supervisor running but its pid is not published (" + $state.Why + ", heartbeat $($state.Age)s old)")
+        Note ("supervisor running but its pid is not published (" + $state.Why + ", heartbeat $($state.Age)s old)")
     }
 } else {
-    Note ("no TUI supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
+    Note ("no supervisor running (" + $state.Why + ", heartbeat $($state.Age)s old)")
 }
 
 # 2. the legacy launcher loop (cmd.exe) survives its parent, and its child
@@ -465,7 +467,7 @@ $nodes = @(Get-NodeProcess $AppDir $Port $table)
 foreach ($n in $nodes) { Note ("node.exe pid " + $n.ProcessId + ": " + $n.CommandLine) }
 if ($nodes.Count -eq 0) { Note "no node.exe names $AppDir or --port $Port" }
 
-if ($PSCmdlet.ShouldProcess($AppDir, 'stop the TUI supervisor, the run.cmd launcher loop and the node serving the port')) {
+if ($PSCmdlet.ShouldProcess($AppDir, 'stop the supervisor, the run.cmd launcher loop and the node serving the port')) {
     New-Item -ItemType Directory -Force -Path $runtime | Out-Null
 
     # 1. the app first, over the only channel it reads, and only that. Cross-account safe: the
@@ -656,7 +658,7 @@ if ($PSCmdlet.ShouldProcess($Target, 'copy the tree (excluding .git state-dev no
 # ---- 3. migrate off the scheduled task ---------------------------------------
 # ShockBox used to be started by a logon task. It is not any more, and an old
 # registration left behind would start a second server at the next logon and
-# fight the TUI for the port. Ended, then unregistered; idempotent.
+# fight the tray's supervisor for the port. Ended, then unregistered; idempotent.
 # Scoped by name on purpose: ErrorPopups-Server and LedWallAgent stay untouched.
 $LegacyTask = 'ShockBox-Server'
 Step "task (migrate)"
@@ -674,9 +676,9 @@ if ($legacy) {
     Note "migrated: no $LegacyTask task registered (nothing to remove)"
 }
 
-# ---- 4. the TUI supervisor's virtualenv --------------------------------------
-# The app runs without Python; only the TUI needs it. So a missing interpreter is
-# a loud warning, never a failed install.
+# ---- 4. the supervisor's virtualenv -----------------------------------------
+# The app runs without Python; only the supervisor needs it. So a missing
+# interpreter is a loud warning, never a failed install.
 function Find-Python {
     param([string]$Explicit)
     $candidates = @()
@@ -706,27 +708,27 @@ function Find-Python {
         $major = [int]$Matches[1]
         $minor = [int]$Matches[2]
         if ($major -lt 3) { continue }
-        if ($major -eq 3 -and $minor -lt 11) { Write-Warning "$exe is Python $major.$minor; the TUI needs 3.11 or newer"; continue }
+        if ($major -eq 3 -and $minor -lt 11) { Write-Warning "$exe is Python $major.$minor; the supervisor needs 3.11 or newer"; continue }
         return [pscustomobject]@{ Exe = $exe; Prefix = $pre; Version = "$major.$minor" }
     }
     return $null
 }
 
-Step 'python (TUI)'
+Step 'python (supervisor)'
 $Venv = Join-Path $Target '.tui-venv'
 $TuiDir = Join-Path $Target 'tools\tui'
 $Reinstall = 'pwsh -NoProfile -Command "deploy\install.ps1" (or: powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install.ps1)'
 $pyFound = Find-Python -Explicit $PythonExe
 if (-not $pyFound) {
-    Write-Warning 'no Python 3.11+ found (py -3, python3, python) - the TUI is unavailable, the ShockBox app itself is unaffected'
-    Note 'to get the TUI: install Python 3.11+ (winget install --id Python.Python.3.12 -e), then re-run:'
+    Write-Warning 'no Python 3.11+ found (py -3, python3, python) - the supervisor is unavailable, the ShockBox app itself is unaffected'
+    Note 'to get the supervisor: install Python 3.11+ (winget install --id Python.Python.3.12 -e), then re-run:'
     Note "  $Reinstall"
 } else {
     Note ("python  $($pyFound.Exe) $($pyFound.Version)")
     $venvPy = Join-Path $Venv 'Scripts\python.exe'
     $created = $false
     if (-not (Test-Path -LiteralPath $venvPy)) {
-        if ($PSCmdlet.ShouldProcess($Venv, 'create the TUI virtualenv')) {
+        if ($PSCmdlet.ShouldProcess($Venv, 'create the supervisor virtualenv')) {
             & $pyFound.Exe @($pyFound.Prefix) -m venv $Venv | Out-Null
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $venvPy)) {
                 throw "venv creation failed with exit code $LASTEXITCODE ($Venv)"
@@ -741,11 +743,11 @@ if (-not $pyFound) {
     }
 
     if (-not (Test-Path -LiteralPath $TuiDir)) {
-        Write-Warning "TUI sources not found: $TuiDir - the venv is ready but shockbox_tui is not installed"
+        Write-Warning "supervisor sources not found: $TuiDir - the venv is ready but shockbox_tui is not installed"
         Note "re-run this installer once tools\tui exists: $Reinstall"
-    } elseif ($PSCmdlet.ShouldProcess($TuiDir, 'pip install -e tools\tui into the TUI virtualenv')) {
+    } elseif ($PSCmdlet.ShouldProcess($TuiDir, 'pip install -e tools\tui into the supervisor virtualenv')) {
         & $venvPy -m pip install --no-input --disable-pip-version-check -e $TuiDir
-        if ($LASTEXITCODE -ne 0) { Write-Warning "pip install -e tools\tui failed with exit code $LASTEXITCODE - the TUI may not start" }
+        if ($LASTEXITCODE -ne 0) { Write-Warning "pip install -e tools\tui failed with exit code $LASTEXITCODE - the supervisor may not start" }
         else { Note "installed shockbox_tui (editable) into $Venv" }
     } else {
         Note "`"$venvPy`" -m pip install --no-input --disable-pip-version-check -e $TuiDir"
@@ -881,7 +883,7 @@ if ($iconSource) {
 Step 'shortcut'
 $DesktopDir = [Environment]::GetFolderPath('Desktop')
 $LnkPath = Join-Path $DesktopDir 'ShockBox.lnk'
-$Launcher = Join-Path $Target 'deploy\ShockBox-TUI.cmd'
+$Launcher = Join-Path $Target 'ShockBox.Tray.exe'
 if (Test-Path -LiteralPath $Launcher) {
     if ($PSCmdlet.ShouldProcess($LnkPath, 'create the desktop shortcut (WScript.Shell)')) {
         $shell = New-Object -ComObject WScript.Shell
@@ -889,7 +891,7 @@ if (Test-Path -LiteralPath $Launcher) {
         $lnk.TargetPath = $Launcher
         $lnk.WorkingDirectory = $Target
         $lnk.IconLocation = $IconTarget
-        $lnk.Description = 'ShockBox - TUI supervisor'
+        $lnk.Description = 'ShockBox - tray app'
         $lnk.WindowStyle = 1
         $lnk.Save()
         Note "created $LnkPath"
@@ -898,11 +900,11 @@ if (Test-Path -LiteralPath $Launcher) {
         Note "`$s = New-Object -ComObject WScript.Shell; `$l = `$s.CreateShortcut('$LnkPath'); `$l.TargetPath='$Launcher'; `$l.WorkingDirectory='$Target'; `$l.IconLocation='$IconTarget'; `$l.WindowStyle=1; `$l.Save()"
     }
 } else {
-    Write-Warning "launcher not found: $Launcher - no shortcut created; re-run the installer from a checkout that has deploy\ShockBox-TUI.cmd"
+    Write-Warning "launcher not found: $Launcher - no shortcut created; build the tray app (tray\ShockBox.Tray) and place ShockBox.Tray.exe in the install root"
 }
 
 Step 'done'
 Note 'no auto-start at logon: start ShockBox from the desktop shortcut "ShockBox"'
 Note "logs:   $Target\logs"
 Note "state:  $Target\state"
-Note 'no scheduled task is registered; the TUI supervisor owns the server process'
+Note 'no scheduled task is registered; the python supervisor owns the server process'

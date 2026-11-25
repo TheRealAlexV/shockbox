@@ -48,7 +48,7 @@ server and its own headless Chrome on free ports, so it is safe while the live s
 CI (`.github/workflows/test.yml`, on `push` **and** `pull_request`) runs `npm test` **and**
 `npm run test:handfx-visual:strict` as two separate jobs. `npm run test:ci` approximates that
 locally, but it runs the visual proof in **report mode** — a local convenience, not what CI runs.
-`node test/glsl-check.mjs` is not part of `npm test`. Full detail, including the TUI's pytest
+`node test/glsl-check.mjs` is not part of `npm test`. Full detail, including the supervisor's pytest
 suite: [`docs/TESTING.md`](docs/TESTING.md).
 
 | gate | proves |
@@ -91,14 +91,15 @@ Per-module API contracts: `docs/CONTRACT-{wall,notifications,dialogs,handfx}.md`
 On the rig: `C:\OBS\ShockBox`. Start it by double-clicking the **ShockBox** desktop shortcut; the
 chain from there is
 
-`ShockBox.lnk` → `deploy\ShockBox-TUI.cmd` → `.tui-venv\Scripts\python.exe -m shockbox_tui`
-→ the TUI's detached supervisor → `node server.mjs`, listening on port 8972.
+`ShockBox.lnk` → `ShockBox.Tray.exe` → the python supervisor (`python -m shockbox_tui.supervisor`)
+→ `node server.mjs`, listening on port 8972.
 
 The supervisor is the process owner: it owns the port, restarts node with backoff, and survives
-closing the TUI window. Nothing starts ShockBox at logon or after a reboot — the scheduled task
-`ShockBox-Server` was retired (`deploy/install.ps1:285-304` ends and unregisters it), and no
-`ShockBox.cmd` exists. If you want it running at logon, put the shortcut in your Startup folder;
-see `deploy/README.md:63-72`. TUI detail: [`docs/TUI.md`](docs/TUI.md).
+closing the tray's window. The tray adopts a supervisor that is already running, or spawns one, and
+its watchdog restarts a missing one. Nothing starts ShockBox at logon or after a reboot — the
+scheduled task `ShockBox-Server` was retired (`deploy/install.ps1:285-304` ends and unregisters
+it), and no `ShockBox.cmd` exists. If you want it running at logon, put the shortcut in your
+Startup folder; see `deploy/README.md:63-72`. Tray detail: [`docs/TRAY.md`](docs/TRAY.md).
 
 ## Licence
 

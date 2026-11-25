@@ -5,18 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "shockbox-tui"
 version = "0.1.0"
-description = "Windows TUI controller for ShockBox: supervises server.mjs, edits settings, reads /health"
+description = "Core for the ShockBox supervisor: owns server.mjs, restarts it, edits settings, reads /health"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "PolyForm-Noncommercial-1.0.0"
-dependencies = [
-  # The UI half. Core modules (supervisor, control, settings, apiclient, paths, logtail) import
-  # nothing outside the standard library, so the supervisor works on a box where Textual is broken.
-  "textual>=8,<9",
-]
-
-[project.scripts]
-shockbox = "shockbox_tui.__main__:main"
+dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-timeout>=2", "pytest-randomly>=3"]
