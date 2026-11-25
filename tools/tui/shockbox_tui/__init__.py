@@ -1,7 +1,8 @@
-"""ShockBox TUI — non-UI core.
+"""ShockBox core — supervisor and control plane, no UI.
 
-The Textual UI lives in ``shockbox_tui.app`` and is built on top of :class:`Control`
-(``shockbox_tui.control``): every module in this package is import-safe without Textual.
+The detached supervisor (``shockbox_tui.supervisor``) and the control surface built on
+:class:`Control` (``shockbox_tui.control``) live here: every module in this package is
+import-safe without a terminal, and the tray app is the entry point.
 
 Layout of the running system::
 
