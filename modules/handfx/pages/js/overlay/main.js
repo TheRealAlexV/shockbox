@@ -969,7 +969,7 @@ function fallBackToSynthetic() {
   if (trackingClaimLive()) return false; // another camera session owns the view
   const drew = ensureSyntheticAnchors();
   if (drew) {
-    setBanner(state.error ? `${state.error} — drawing on synthetic hands` : 'No camera — drawing on synthetic hands', 'warn');
+    setBanner(state.error ? `${state.error} — synthetic hands` : 'Synthetic hands', 'idle');
     ack();
   }
   return drew;

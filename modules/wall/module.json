@@ -36,6 +36,16 @@
       "default": "wave",
       "group": "look"
     },
+    "blackout": {
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 1,
+      "step": 1,
+      "group": "look",
+      "label": "Blackout",
+      "note": "Kill switch: 1 blacks the LEDs and the background. Page-local commands set it too; the document is what the merged show preview reads"
+    },
     "preset": {
       "type": "string",
       "default": "default",

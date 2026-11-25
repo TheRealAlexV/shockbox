@@ -33,6 +33,18 @@
   var qs = new URLSearchParams(location.search);
   // Every preview request carries `?preview=1`. Classic script, so this is a plain helper.
   function previewQ() { return qs.get('preview') === '1' ? '?preview=1' : ''; }
+  /**
+   * A document names a preset; it never carries the look that name expands into. A panel running
+   * `agent=off` never sees the `preset.set` command either, so the page resolves the name against
+   * the catalogue it already loads (PRESETS plus the saved bank every frame ships), and only when
+   * the document names a preset this page is not already running. Empty means "leave the page
+   * alone", which is what an older document without the key must do.
+   * `test/wall-preview-sync.mjs` extracts this function the way server.js extracts PRESET_DIMS.
+   */
+  function presetToApply(documentPreset, runningLabel) {
+    var name = typeof documentPreset === 'string' ? documentPreset.trim() : '';
+    return name && name !== runningLabel ? name : '';
+  }
   var DEFAULTS = window.LEDWALL_DEFAULTS || {};
   var PRESETS = window.LEDWALL_PRESETS || {};
 
@@ -242,6 +254,16 @@
     if (d.look && typeof d.look === 'object' && !loadingPreset) {
       inst.setSettings(d.look, { source: 'server' });
       applied = true;
+    }
+    // Preview pages only: the OBS sources are driven by the command bus, and their look must not
+    // start changing on a document word they never needed. `applyPreset` reads only the catalogue
+    // and the instance's own settings — `agent=off` gates the bus, not this.
+    if (previewQ() && d.look && typeof d.look === 'object' && !loadingPreset && inst.applyPreset) {
+      var wantPreset = presetToApply(d.look.preset, inst.label);
+      if (wantPreset) {
+        inst.applyPreset(wantPreset);
+        applied = true;
+      }
     }
     // `fence` is a whole-cell window from the server, or null when the wall is whole. Both
     // cases are handed over: a null is how the pane turns the window off.

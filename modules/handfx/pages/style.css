@@ -108,6 +108,12 @@ body[data-clean='true'] #diag {
   border-color: rgba(255, 93, 106, 0.6);
   color: #ff8b94;
 }
+/* A mode, not a fault: the synthetic-hands pill names what is drawing and must not read as an
+ * error line on the OBS source. Neutral grey, no accent. */
+#banner[data-tone='idle'] {
+  border-color: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.72);
+}
 
 #controls {
   position: fixed;

@@ -536,7 +536,18 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
   const blackoutBtn = el('button', { type: 'button', class: 'btn btn-sm wall-blackout', title: 'Kill switch: LEDs and background go black' });
   const blackoutLabel = el('span', { class: 'btn-label', text: 'Blackout' });
   blackoutBtn.append(blackoutLabel);
-  blackoutBtn.addEventListener('click', () => cmd(blackout ? 'blackout.off' : 'blackout.on'));
+  blackoutBtn.addEventListener('click', () => {
+    // The document is the only channel the merged show preview has (`agent=off`), so blackout is
+    // written there as well as commanded — palette and pattern already behave this way. Reading
+    // it back from the document is what makes this a real off switch, and what keeps it across a
+    // page reload; the command alone was page-local and never survived either.
+    const next = blackout ? 0 : 1;
+    blackout = next > 0;
+    look = { ...look, blackout: next };
+    paintQuick();
+    void patchSettings({ blackout: next }, { force: true });
+    void cmd(next ? 'blackout.on' : 'blackout.off');
+  });
 
   const quick = el('div', { class: 'look-bar wall-quick' },
     el('label', { class: 'wall-look-field', for: 'wall-look-preset' },
@@ -1662,6 +1673,8 @@ const blackoutBadge = el('span', { class: 'badge', 'data-tone': 'idle', text: 'l
     if (cleanLookName(synth.palette)) doc.look.palette = synth.palette;
     if (cleanLookName(synth.pattern)) doc.look.pattern = synth.pattern;
     if (cleanLookName(synth.preset)) doc.look.preset = synth.preset;
+    // blackout is a document key now, and the panel is the one reader that gets nothing else
+    doc.look.blackout = Number(lookValue('blackout') ?? 0) > 0 ? 1 : 0;
     if (ratioSelection === '16:9' || ratioSelection === '9:16' || ratioSelection === 'both') doc.ratio = ratioSelection;
     return doc;
   }
