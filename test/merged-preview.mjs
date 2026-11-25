@@ -13,10 +13,11 @@
 //   node test/merged-preview.mjs
 
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { launchChrome, startServer, CHROME } from './lib/chrome.mjs';
 import { mountDiagnostics } from './lib/diagnostics.mjs';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 if (!CHROME) {
   console.error('merged-preview: no chrome/chromium found (set CHROME=)');

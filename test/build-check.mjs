@@ -10,6 +10,9 @@
 //   node test/build-check.mjs
 // Exits non-zero on the first failed check.
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createBuildCheck } from '../public/src/build-check.js';
 
 let failures = 0;
@@ -135,6 +138,23 @@ function harness({ storage = memoryStorage(), served = 'aaa', healthy = true, ca
   check('the deferred reload happens once it is safe', now === 'reload' && page.reloads.length === 1, now);
   await c.check();
   check('and not twice', page.reloads.length === 1, page.reloads.join(','));
+}
+
+// 5. No gate derives its root from URL.pathname: on Windows it keeps the leading slash
+// (/C:/OBS/...), so path.dirname() builds C:\C:\OBS\... and the gate dies with ENOENT.
+{
+  // Assembled so this file does not trip its own check.
+  const NEEDLE = ['new URL(', 'import.meta.url', ').pathname'].join('');
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const offenders = [];
+  for (const name of fs.readdirSync(here, { recursive: true })) {
+    if (!name.endsWith('.mjs')) continue;
+    const lines = fs.readFileSync(path.join(here, name), 'utf8').split('\n');
+    lines.forEach((line, i) => {
+      if (line.includes(NEEDLE)) offenders.push(`${name}:${i + 1}`);
+    });
+  }
+  check('no test gate derives its root from URL.pathname', offenders.length === 0, offenders.join(', '));
 }
 
 if (failures) {
