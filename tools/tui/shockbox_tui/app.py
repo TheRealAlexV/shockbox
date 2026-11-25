@@ -47,7 +47,7 @@ from textual.widgets import (
 )
 
 from . import tasks
-from .control import Control, ControlError
+from .control import NO_SUPERVISOR, Control, ControlError
 from .paths import DEFAULT_PORT, Paths
 from .settings import ConfigError, parse_when
 
@@ -72,6 +72,10 @@ STATE_WORD = {
 
 # Log colouring by substring, applied as Rich markup *around* the untouched line text.
 LOG_MARKUP = (("error", "bold red"), ("fail", "bold red"), ("warn", "yellow"), ("launcher:", "cyan"))
+
+# How often the poll may try to respawn a supervisor that died without logging (42512,
+# 2026-11-25). The poll itself ticks every second; this only bounds spawn attempts.
+WATCHDOG_INTERVAL_S = 10.0
 
 TAB_IDS = (
     "tab-overview",
@@ -301,6 +305,10 @@ class ShockBoxApp(App):
         self._handfx_skin = "projectile"
         self._sounds: list[str] = []
         self._log_dirty = False
+        # Survives until Start/Restart: a deliberate "Shut down supervisor" must not be
+        # undone by the watchdog ten seconds later. Do not delete as dead state.
+        self._userStopped = False
+        self._watchdog_next = 0.0
 
     # ---- layout ---------------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -388,6 +396,36 @@ class ShockBoxApp(App):
     def _poll_now(self) -> None:
         self._poll_bg()
 
+    def _watchdog(self, status: dict) -> None:
+        """Start a supervisor the poll has seen die, rate-limited and muted after a shutdown.
+
+        A supervisor SIGKILLed without ``atexit`` leaves no ``exit pid`` line and a
+        ``status.json`` still saying ``running``; only the stale heartbeat says so, and nothing
+        else in the TUI looks (42512, 2026-11-25). ``ensure_supervisor`` is already idempotent
+        and already refuses a fresh heartbeat, so the gate here only bounds call rate.
+        """
+        if self._userStopped:
+            return
+        if status.get("__error__") or not (
+            status.get("stale") or status.get("state") == NO_SUPERVISOR
+        ):
+            return
+        now = time.monotonic()
+        if now < self._watchdog_next:
+            return
+        self._watchdog_next = now + WATCHDOG_INTERVAL_S
+        age = status.get("age_s")
+        where = (
+            "supervisor absent"
+            if age is None
+            else f"supervisor absent or heartbeat stale (age {age:g}s)"
+        )
+        print(f"shockbox_tui.app: watchdog: {where}, starting", file=sys.stderr)
+        try:
+            self.control.ensure_supervisor()
+        except Exception as err:  # noqa: BLE001 - a watchdog must never kill the TUI
+            print(f"shockbox_tui.app: watchdog: ensure_supervisor failed: {err}", file=sys.stderr)
+
     @work(thread=True, exclusive=True, group="poll", exit_on_error=True)
     def _poll_bg(self) -> None:
         """The one reader. Every call is independently guarded: one dead route must not blank
@@ -402,6 +440,9 @@ class ShockBoxApp(App):
                 data[name] = {"__error__": str(err) or err.__class__.__name__}
 
         attempt("status", ctl.status)
+        status = data.get("status")
+        if isinstance(status, dict):
+            self._watchdog(status)
         attempt("health", ctl.health)
         attempt("modules", ctl.modules)
         attempt("wall", ctl.wall_live)
@@ -887,6 +928,7 @@ class ShockBoxApp(App):
 
     def _do_start(self) -> dict:
         status = self.control.start()
+        self._userStopped = False
         return {"state": status.get("state", "?")}
 
     def _btn_stop(self) -> None:
@@ -901,6 +943,7 @@ class ShockBoxApp(App):
 
     def _do_restart(self) -> dict:
         status = self.control.restart()
+        self._userStopped = False
         restarts = status.get("restarts")
         word = f"running, {restarts} restarts" if restarts is not None else f"running ({status.get('state', '?')})"
         return {"state": word}
@@ -929,6 +972,7 @@ class ShockBoxApp(App):
 
     def _do_shutdown(self) -> dict:
         status = self.control.shutdown()
+        self._userStopped = True
         return {"state": status.get("state", "stopped")}
 
     _BUTTONS = {
