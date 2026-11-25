@@ -65,7 +65,10 @@ internal sealed class TrayContext : ApplicationContext
             ContextMenuStrip = _menu,
             Visible = true,
         };
-        _icon.MouseClick += OnIconMouseClick;
+        _icon.MouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left) ShowWindow();
+        };
 
         _menu.Opening += (_, _) => BuildMenu();
 
@@ -268,9 +271,7 @@ internal sealed class TrayContext : ApplicationContext
         }
         catch (InvalidOperationException)
         {
-        }
-        catch (ObjectDisposedException)
-        {
+            // Also covers ObjectDisposedException: a disposed sink has no handle to marshal to.
         }
     }
 
@@ -296,9 +297,7 @@ internal sealed class TrayContext : ApplicationContext
         }
         catch (InvalidOperationException)
         {
-        }
-        catch (ObjectDisposedException)
-        {
+            // Also covers ObjectDisposedException: a disposed sink has no handle to marshal to.
         }
     }
 
@@ -335,18 +334,40 @@ internal sealed class TrayContext : ApplicationContext
     private void BuildMenu()
     {
         _menu.Items.Clear();
-        _menu.Items.Add(new ToolStripMenuItem(StatusLine()) { Enabled = false });
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(MenuItem("Start", () => RunAction("start")));
-        _menu.Items.Add(MenuItem("Stop", () => RunAction("stop")));
-        _menu.Items.Add(MenuItem("Restart", () => RunAction("restart")));
-        _menu.Items.Add(MenuItem("Shut down\u2026", ConfirmShutdown));
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(MenuItem("Open window", ShowWindow));
-        _menu.Items.Add(MenuItem("Open in browser", OpenInBrowser));
-        _menu.Items.Add(MenuItem("Open log folder", OpenLogFolder));
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(MenuItem("Quit", Quit));
+        foreach (ToolStripItem item in BuildMenuItems(StatusLine(), RunAction, ConfirmShutdown, ShowWindow, OpenInBrowser, OpenLogFolder, Quit))
+        {
+            _menu.Items.Add(item);
+        }
+    }
+
+    /// <summary>
+    /// The one menu definition: the tray renders it and --menu prints it, so the CLI cannot drift
+    /// from what the shell would show.
+    /// </summary>
+    internal static List<ToolStripItem> BuildMenuItems(
+        string statusLine,
+        Action<string> runAction,
+        Action shutdown,
+        Action openWindow,
+        Action openBrowser,
+        Action openLogFolder,
+        Action quit)
+    {
+        return new List<ToolStripItem>
+        {
+            new ToolStripMenuItem(statusLine) { Enabled = false },
+            new ToolStripSeparator(),
+            MenuItem("Start", () => runAction("start")),
+            MenuItem("Stop", () => runAction("stop")),
+            MenuItem("Restart", () => runAction("restart")),
+            MenuItem("Shut down\u2026", shutdown),
+            new ToolStripSeparator(),
+            MenuItem("Open window", openWindow),
+            MenuItem("Open in browser", openBrowser),
+            MenuItem("Open log folder", openLogFolder),
+            new ToolStripSeparator(),
+            MenuItem("Quit", quit),
+        };
     }
 
     private static ToolStripMenuItem MenuItem(string text, Action action)

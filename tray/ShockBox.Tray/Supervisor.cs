@@ -189,7 +189,7 @@ internal sealed class Supervisor
     /// flushed to disk, then moved into place, so the supervisor never reads a half-written
     /// {id, action, at} document.
     /// </summary>
-    public void Send(string verb)
+    public string Send(string verb)
     {
         if (verb is not ("start" or "stop" or "restart" or "shutdown"))
         {
@@ -219,6 +219,7 @@ internal sealed class Supervisor
             throw new IOException("cannot write " + AppPaths.CmdFile, ex);
         }
         TrayLog.Write("send: " + verb);
+        return json;
     }
 
     private bool EnsureSupervisorCore()
@@ -237,7 +238,7 @@ internal sealed class Supervisor
                 CultureInfo.InvariantCulture,
                 "adopt: supervisor pid {0} alive, heartbeat {1:0.0}s old",
                 livePid,
-                age.Value.TotalSeconds));
+                age.GetValueOrDefault().TotalSeconds));
             return true;
         }
 
